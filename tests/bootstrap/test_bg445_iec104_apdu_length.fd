@@ -1,0 +1,74 @@
+// BG445 (docs/roadmap/bugs-roadmap.md): iec104_parse rejects an APDU length
+// outside 4..253 (IEC 60870-5-104 §5) instead of decoding the control field
+// from the next frame's bytes, requires S- and U-frames to be exactly 4
+// control octets, and rejects a U-frame with more than one function bit.
+//
+// Expected output:
+// len0: ok=false
+// len3: ok=false
+// len254: ok=false
+// len253 I: ok=true format=0 ns=0 nr=0 asdu=249 total=255
+// S with length 6: ok=false
+// U with length 5: ok=false
+// U with two function bits: ok=false
+// U startdt act: ok=true format=3 func=7 total=6
+// S nr 5: ok=true format=1 nr=5 total=6
+// I then S in one buffer: ok=true format=0 ns=3 nr=1 asdu=2 total=8
+// U testfr con: ok=true format=3 func=131 total=6
+use iec104;
+
+fn show(name: str, b: &Vec<i64>) {
+    val f: Iec104Frame = iec104_parse(b);
+    if !f.ok {
+        println(name + ": ok=false");
+    } else if f.format == APCI_I {
+        println(name + ": ok=true format=0 ns=" + int_to_str(f.ns) + " nr=" + int_to_str(f.nr) + " asdu=" + int_to_str(f.asdu.len()) + " total=" + int_to_str(f.total_len));
+    } else if f.format == APCI_S {
+        println(name + ": ok=true format=1 nr=" + int_to_str(f.nr) + " total=" + int_to_str(f.total_len));
+    } else {
+        println(name + ": ok=true format=3 func=" + int_to_str(f.ufunc) + " total=" + int_to_str(f.total_len));
+    }
+}
+
+fn frame(length: i64, c0: i64, c1: i64, c2: i64, c3: i64, extra: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    b.push(0x68);
+    b.push(length);
+    b.push(c0);
+    b.push(c1);
+    b.push(c2);
+    b.push(c3);
+    var i: i64 = 0;
+    while i < extra {
+        b.push(i & 255);
+        i = i + 1;
+    }
+    return b;
+}
+
+fn main() {
+    // the entry's trigger: 68 00 then the next frame 68 04 07 00 00 00
+    var t: Vec<i64> = Vec::new();
+    t.push(0x68); t.push(0x00); t.push(0x68); t.push(0x04); t.push(0x07); t.push(0x00); t.push(0x00); t.push(0x00);
+    show("len0", &t);
+    show("len3", &frame(3, 0, 0, 0, 0, 2));
+    show("len254", &frame(254, 0, 0, 0, 0, 250));
+    show("len253 I", &frame(253, 0, 0, 0, 0, 249));
+    show("S with length 6", &frame(6, 0x01, 0, 0x0A, 0, 2));
+    show("U with length 5", &frame(5, 0x07, 0, 0, 0, 1));
+    show("U with two function bits", &frame(4, 0x0F, 0, 0, 0, 0));
+    show("U startdt act", &iec104_u_frame(U_STARTDT_ACT));
+    show("S nr 5", &iec104_s_frame(5));
+    var a: Vec<i64> = Vec::new();
+    a.push(1);
+    a.push(1);
+    var both: Vec<i64> = iec104_i_frame(3, 1, &a);
+    val sf: Vec<i64> = iec104_s_frame(4);
+    var i: i64 = 0;
+    while i < sf.len() {
+        both.push(sf.get(i));
+        i = i + 1;
+    }
+    show("I then S in one buffer", &both);
+    show("U testfr con", &iec104_u_frame(U_TESTFR_CON));
+}

@@ -108,7 +108,18 @@ struct YP {
     flow: bool,
     anames: Vec<str>,
     apaths: Vec<str>,
+    // entries aliases have copied so far (BG319)
+    acopied: i64,
 }
+
+/// What aliases may copy in one document: YAML_ALIAS_FLOOR entries, plus
+/// YAML_ALIAS_RATIO for each entry the document writes itself. An alias
+/// that would copy more is an error in yaml_load ("aliases expand too
+/// far") and null in yaml_parse: nested anchors multiply ("billion
+/// laughs": six 30-byte lines made 67,182 entries; BG319), so without a
+/// bound a few hundred bytes exhaust memory.
+pub const YAML_ALIAS_FLOOR: i64 = 1000;
+pub const YAML_ALIAS_RATIO: i64 = 10;
 
 // ─── Scalar helpers ─────────────────────────────────────────────────────
 
@@ -1198,21 +1209,44 @@ fn yp_alias(p: &mut YP, path: str, name: str) {
     }
     var src: str = p.apaths.get(k);
     var n: i64 = p.entries.len();
+    // the entries the alias copies, counted before any is copied
+    var take: Vec<i64> = Vec::new();
     var i: i64 = 0;
-    var found: bool = false;
     while i < n {
-        var e: YamlEntry = p.entries.get(i);
+        var ep: str = p.entries.get(i).path;
+        if str_equal(ep, src) || str_starts_with(ep, src + ".") || str_equal(src, "") {
+            take.push(i);
+        }
+        i = i + 1;
+    }
+    var own: i64 = n - p.acopied;
+    if own < 0 {
+        own = 0;
+    }
+    if p.acopied + take.len() > YAML_ALIAS_FLOOR + YAML_ALIAS_RATIO * own {
+        // BG319: refuse the copy instead of multiplying entries without end
+        if yp_fail(p, "aliases expand too far: alias '*" + name + "' would copy " + int_to_str(take.len()) + " more entries, past the limit of " + int_to_str(YAML_ALIAS_FLOOR) + " + " + int_to_str(YAML_ALIAS_RATIO) + " per entry written (YAML_ALIAS_FLOOR, YAML_ALIAS_RATIO)") {
+            return;
+        }
+        yp_push(p, path, "null", "");
+        return;
+    }
+    p.acopied = p.acopied + take.len();
+    var found: bool = false;
+    var t: i64 = 0;
+    while t < take.len() {
+        var e: YamlEntry = p.entries.get(take.get(t));
         if str_equal(e.path, src) {
             yp_push(p, path, e.value.kind, e.value.sval);
             found = true;
-        } else if str_starts_with(e.path, src + ".") || str_equal(src, "") {
+        } else {
             var rest: str = e.path;
             if str_len(src) > 0 {
                 rest = str_slice(e.path, str_len(src) + 1, str_len(e.path));
             }
             yp_push(p, y_join(path, rest), e.value.kind, e.value.sval);
         }
-        i = i + 1;
+        t = t + 1;
     }
     if !found && str_len(src) > 0 {
         yp_push(p, path, "null", "");
@@ -1858,7 +1892,7 @@ fn y_marker(line: str, m: str) -> bool {
 
 fn y_parse_doc(lines: Vec<str>, base: i64, strict: bool, flow: bool) -> YamlDoc {
     var p: YP = YP {
-        lines: lines, li: 0, base: base, entries: Vec::new(), ok: true, error: "", strict: strict, flow: flow, anames: Vec::new(), apaths: Vec::new()
+        lines: lines, li: 0, base: base, entries: Vec::new(), ok: true, error: "", strict: strict, flow: flow, anames: Vec::new(), apaths: Vec::new(), acopied: 0
     };
     yp_skip_blank(&mut p);
     if p.li < p.lines.len() {

@@ -1,0 +1,121 @@
+// BG398 (docs/roadmap/bugs-roadmap.md): dnp3_objhdr_decode checks the
+// range/count bytes against the buffer (a header cut short after the
+// qualifier is ok=false, not a panic), rejects start > stop and unknown
+// qualifiers, and dnp3_link_parse rejects a LENGTH octet below 5
+// (IEEE 1815 §9.2.4.1.3: 5..255).
+//
+// Expected output:
+// q00 cut after qualifier: ok=false
+// q00 cut after start: ok=false
+// q00 0..2: ok=true count=3 next=5
+// q00 start>stop: ok=false
+// q01 cut: ok=false
+// q01 10..19: ok=true count=10 next=7
+// q07 cut: ok=false
+// q08 cut: ok=false
+// q08 300: ok=true count=300 next=5
+// q28 cut: ok=false
+// q17 4: ok=true count=4 next=4
+// q06 all: ok=true count=0 next=3
+// unknown qualifier: ok=false
+// at offset: ok=true count=1 next=7
+// link len0: ok=false
+// link len4: ok=false
+// link len5: ok=true func=4
+use dnp3;
+
+fn v(a: i64, b: i64, c: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    out.push(a);
+    out.push(b);
+    out.push(c);
+    return out;
+}
+
+fn show(name: str, b: &Vec<i64>, pos: i64) {
+    val h: Dnp3ObjHeaderAt = dnp3_objhdr_decode(b, pos);
+    if h.ok {
+        println(name + ": ok=true count=" + int_to_str(h.hdr.count) + " next=" + int_to_str(h.next));
+    } else {
+        println(name + ": ok=false");
+    }
+}
+
+fn link(length: i64) -> Vec<i64> {
+    var f: Vec<i64> = Vec::new();
+    f.push(0x05);
+    f.push(0x64);
+    f.push(length);
+    f.push(0xC4);
+    f.push(0x01);
+    f.push(0x00);
+    f.push(0x02);
+    f.push(0x00);
+    val c: i64 = dnp3_crc(&f, 0, 8);
+    f.push(c & 255);
+    f.push((c >> 8) & 255);
+    return f;
+}
+
+fn show_link(name: str, length: i64) {
+    val f: Vec<i64> = link(length);
+    val lp: Dnp3LinkFrame = dnp3_link_parse(&f);
+    if lp.ok {
+        println(name + ": ok=true func=" + int_to_str(lp.func));
+    } else {
+        println(name + ": ok=false");
+    }
+}
+
+fn main() {
+    // the entry's trigger: group 1 var 2, qualifier 0x00, nothing after it
+    var a: Vec<i64> = v(1, 2, 0x00);
+    show("q00 cut after qualifier", &a, 0);
+    a.push(0);
+    show("q00 cut after start", &a, 0);
+    a.push(2);
+    show("q00 0..2", &a, 0);
+    var b: Vec<i64> = v(1, 2, 0x00);
+    b.push(5);
+    b.push(3);
+    show("q00 start>stop", &b, 0);
+
+    var c: Vec<i64> = v(30, 1, 0x01);
+    c.push(10);
+    c.push(0);
+    c.push(19);
+    show("q01 cut", &c, 0);
+    c.push(0);
+    show("q01 10..19", &c, 0);
+
+    var d: Vec<i64> = v(1, 2, 0x07);
+    show("q07 cut", &d, 0);
+    var e: Vec<i64> = v(1, 2, 0x08);
+    e.push(0x2C);
+    show("q08 cut", &e, 0);
+    e.push(0x01);
+    show("q08 300", &e, 0);
+    var g: Vec<i64> = v(12, 1, 0x28);
+    show("q28 cut", &g, 0);
+    var h: Vec<i64> = v(12, 1, 0x17);
+    h.push(4);
+    show("q17 4", &h, 0);
+    var k: Vec<i64> = v(60, 1, 0x06);
+    show("q06 all", &k, 0);
+    var u: Vec<i64> = v(1, 2, 0x99);
+    u.push(0);
+    u.push(0);
+    u.push(0);
+    u.push(0);
+    show("unknown qualifier", &u, 0);
+    var w: Vec<i64> = v(60, 1, 0x06);
+    w.push(1);
+    w.push(2);
+    w.push(0x07);
+    w.push(1);
+    show("at offset", &w, 3);
+
+    show_link("link len0", 0);
+    show_link("link len4", 4);
+    show_link("link len5", 5);
+}

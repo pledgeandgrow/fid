@@ -274,9 +274,11 @@ pub struct BerTlv {
     pub next: i64,  // index just past this TLV
 }
 
-/// Read the TLV at `pos`.
+/// Read the TLV at `pos`. ok is false when the header is cut short, the
+/// length is indefinite (0x80) or wider than 4 bytes, or the content runs
+/// past the end of `b`; an ok TLV's content lies inside `b`.
 pub fn ber_read(b: &Vec<i64>, pos: i64) -> BerTlv {
-    if pos + 2 > b.len() {
+    if pos < 0 || pos + 2 > b.len() {
         return BerTlv {
             ok: false, tag: 0, length: 0, content: pos, next: pos
         };
@@ -290,6 +292,11 @@ pub fn ber_read(b: &Vec<i64>, pos: i64) -> BerTlv {
         length = l0;
     } else {
         val nbytes: i64 = l0 & 127;
+        if nbytes == 0 || nbytes > 4 || p + nbytes > b.len() {
+            return BerTlv {
+                ok: false, tag: tag, length: 0, content: pos, next: pos
+            };
+        }
         var i: i64 = 0;
         while i < nbytes {
             length = (length << 8) | b.get(p);
@@ -297,13 +304,22 @@ pub fn ber_read(b: &Vec<i64>, pos: i64) -> BerTlv {
             i = i + 1;
         }
     }
+    if p + length > b.len() {
+        return BerTlv {
+            ok: false, tag: tag, length: length, content: p, next: pos
+        };
+    }
     return BerTlv {
         ok: true, tag: tag, length: length, content: p, next: p + length
     };
 }
 
-/// Decode a big-endian unsigned integer from `len` bytes at `pos`.
+/// Decode a big-endian unsigned integer from `len` bytes at `pos`; 0 when
+/// the bytes are not all inside `b`.
 pub fn ber_get_uint(b: &Vec<i64>, pos: i64, len: i64) -> i64 {
+    if pos < 0 || len < 0 || pos + len > b.len() {
+        return 0;
+    }
     var v: i64 = 0;
     var i: i64 = 0;
     while i < len {
@@ -311,6 +327,23 @@ pub fn ber_get_uint(b: &Vec<i64>, pos: i64, len: i64) -> i64 {
         i = i + 1;
     }
     return v;
+}
+
+/// Read the TLV at `pos` as a member of a container ending at `endp`: ok is
+/// false when it does not fit inside the container.
+fn ber_member(b: &Vec<i64>, pos: i64, endp: i64) -> BerTlv {
+    val t: BerTlv = ber_read(b, pos);
+    if t.ok && t.next > endp {
+        return BerTlv {
+            ok: false, tag: t.tag, length: t.length, content: t.content, next: pos
+        };
+    }
+    return t;
+}
+
+/// An INTEGER member's content must be 1..8 bytes here (X.690 8.3.1).
+fn ber_int_len_ok(t: &BerTlv) -> bool {
+    return t.length >= 1 && t.length <= 8;
 }
 
 // ─── IEEE 754 single precision ───────────────────────────────────────────
@@ -451,61 +484,113 @@ fn ber_append(out: &mut Vec<i64>, src: &Vec<i64>) {
 fn ber_str(b: &Vec<i64>, pos: i64, len: i64) -> str {
     var s: str = "";
     var i: i64 = 0;
-    while i < len {
+    while i < len && pos + i < b.len() {
         s = s + char_to_str(b.get(pos + i));
         i = i + 1;
     }
     return s;
 }
 
-/// Decode a GOOSE PDU from an APPLICATION 1 SEQUENCE buffer.
+/// The result of goose_decode_checked: `pdu` holds what was decoded before
+/// an error.
+pub struct GooseDecode {
+    pub ok: bool,
+    pub error: str,
+    pub pdu: GoosePdu,
+}
+
+/// Decode a GOOSE PDU from an APPLICATION 1 SEQUENCE buffer. A buffer that
+/// is not a well-formed goosePdu gives the fields decoded before the error
+/// (goose_decode_checked says which error).
 pub fn goose_decode_pdu(b: &Vec<i64>) -> GoosePdu {
-    var p: GoosePdu = GoosePdu {
-        gocb_ref: "", time_allowed_to_live: 0, dat_set: "", go_id: "", t_seconds: 0, t_fraction: 0, t_quality: 0, st_num: 0, sq_num: 0, test: false, conf_rev: 0, nds_com: false, num_dataset_entries: 0, all_data: Vec::new(),
+    val r: GooseDecode = goose_decode_checked(b);
+    return r.pdu;
+}
+
+fn goose_fail(r: &mut GooseDecode, msg: str) {
+    r.ok = false;
+    r.error = msg;
+}
+
+/// Decode a GOOSE PDU, reporting a truncated or inconsistent one: ok is
+/// false when the outer TLV is not 0x61 or runs past the buffer, a member
+/// runs past the PDU, t is not 8 bytes, a boolean is not 1 byte or an
+/// integer is not 1..8 bytes.
+pub fn goose_decode_checked(b: &Vec<i64>) -> GooseDecode {
+    var r: GooseDecode = GooseDecode {
+        ok: true, error: "", pdu: GoosePdu {
+            gocb_ref: "", time_allowed_to_live: 0, dat_set: "", go_id: "", t_seconds: 0, t_fraction: 0, t_quality: 0, st_num: 0, sq_num: 0, test: false, conf_rev: 0, nds_com: false, num_dataset_entries: 0, all_data: Vec::new(),
+        },
     };
     val outer: BerTlv = ber_read(b, 0);
+    if !outer.ok {
+        goose_fail(&mut r, "truncated goosePdu");
+        return r;
+    }
+    if outer.tag != 0x61 {
+        goose_fail(&mut r, "not a goosePdu (tag 0x61)");
+        return r;
+    }
     var pos: i64 = outer.content;
     val endp: i64 = outer.next;
     while pos < endp {
-        val t: BerTlv = ber_read(b, pos);
+        val t: BerTlv = ber_member(b, pos, endp);
         if !t.ok {
-            break;
+            goose_fail(&mut r, "member runs past the goosePdu");
+            return r;
         }
         val tag: i64 = t.tag;
+        if tag == 0x81 || tag == 0x85 || tag == 0x86 || tag == 0x88 || tag == 0x8A {
+            if !ber_int_len_ok(&t) {
+                goose_fail(&mut r, "bad integer length");
+                return r;
+            }
+        }
+        if tag == 0x87 || tag == 0x89 {
+            if t.length != 1 {
+                goose_fail(&mut r, "bad boolean length");
+                return r;
+            }
+        }
         if tag == 0x80 {
-            p.gocb_ref = ber_str(b, t.content, t.length);
+            r.pdu.gocb_ref = ber_str(b, t.content, t.length);
         } else if tag == 0x81 {
-            p.time_allowed_to_live = ber_get_uint(b, t.content, t.length);
+            r.pdu.time_allowed_to_live = ber_get_uint(b, t.content, t.length);
         } else if tag == 0x82 {
-            p.dat_set = ber_str(b, t.content, t.length);
+            r.pdu.dat_set = ber_str(b, t.content, t.length);
         } else if tag == 0x83 {
-            p.go_id = ber_str(b, t.content, t.length);
+            r.pdu.go_id = ber_str(b, t.content, t.length);
         } else if tag == 0x84 {
-            p.t_seconds = ber_get_uint(b, t.content, 4);
-            p.t_fraction = ber_get_uint(b, t.content + 4, 3);
-            p.t_quality = b.get(t.content + 7);
+            // UtcTime: 4 bytes seconds, 3 bytes fraction, 1 byte quality
+            if t.length != 8 {
+                goose_fail(&mut r, "t is not 8 bytes");
+                return r;
+            }
+            r.pdu.t_seconds = ber_get_uint(b, t.content, 4);
+            r.pdu.t_fraction = ber_get_uint(b, t.content + 4, 3);
+            r.pdu.t_quality = b.get(t.content + 7);
         } else if tag == 0x85 {
-            p.st_num = ber_get_uint(b, t.content, t.length);
+            r.pdu.st_num = ber_get_uint(b, t.content, t.length);
         } else if tag == 0x86 {
-            p.sq_num = ber_get_uint(b, t.content, t.length);
+            r.pdu.sq_num = ber_get_uint(b, t.content, t.length);
         } else if tag == 0x87 {
-            p.test = b.get(t.content) != 0;
+            r.pdu.test = b.get(t.content) != 0;
         } else if tag == 0x88 {
-            p.conf_rev = ber_get_uint(b, t.content, t.length);
+            r.pdu.conf_rev = ber_get_uint(b, t.content, t.length);
         } else if tag == 0x89 {
-            p.nds_com = b.get(t.content) != 0;
+            r.pdu.nds_com = b.get(t.content) != 0;
         } else if tag == 0x8A {
-            p.num_dataset_entries = ber_get_uint(b, t.content, t.length);
+            r.pdu.num_dataset_entries = ber_get_uint(b, t.content, t.length);
         } else if tag == 0xAB {
             var j: i64 = t.content;
             while j < t.next {
-                p.all_data.push(b.get(j));
+                r.pdu.all_data.push(b.get(j));
                 j = j + 1;
             }
         }
         pos = t.next;
     }
-    return p;
+    return r;
 }
 
 /// The Ethernet GOOSE frame: 6-byte dest MAC, 6-byte src MAC, optional
@@ -585,39 +670,87 @@ pub fn sv_encode(a: &SvAsdu) -> Vec<i64> {
     return ber_tlv(0x62, &body);
 }
 
-/// Decode the first ASDU from a savPdu.
+/// The result of sv_decode_checked: `asdu` holds what was decoded before an
+/// error.
+pub struct SvDecode {
+    pub ok: bool,
+    pub error: str,
+    pub asdu: SvAsdu,
+}
+
+/// Decode the first ASDU from a savPdu. A buffer that is not a well-formed
+/// savPdu gives the fields decoded before the error (sv_decode_checked
+/// says which error).
 pub fn sv_decode(b: &Vec<i64>) -> SvAsdu {
-    var out: SvAsdu = SvAsdu {
-        sv_id: "", smp_cnt: 0, conf_rev: 0, smp_synch: 0, seq_data: Vec::new()
+    val r: SvDecode = sv_decode_checked(b);
+    return r.asdu;
+}
+
+fn sv_fail(r: &mut SvDecode, msg: str) {
+    r.ok = false;
+    r.error = msg;
+}
+
+/// Decode the first ASDU from a savPdu, reporting a truncated or
+/// inconsistent one: ok is false when the outer TLV is not 0x62 or runs past
+/// the buffer, a member runs past its container, the ASDU entry is not a
+/// SEQUENCE (0x30), there is no ASDU, or an integer is not 1..8 bytes.
+pub fn sv_decode_checked(b: &Vec<i64>) -> SvDecode {
+    var r: SvDecode = SvDecode {
+        ok: true, error: "", asdu: SvAsdu {
+            sv_id: "", smp_cnt: 0, conf_rev: 0, smp_synch: 0, seq_data: Vec::new()
+        },
     };
     val outer: BerTlv = ber_read(b, 0);  // savPdu (0x62)
+    if !outer.ok {
+        sv_fail(&mut r, "truncated savPdu");
+        return r;
+    }
+    if outer.tag != 0x62 {
+        sv_fail(&mut r, "not a savPdu (tag 0x62)");
+        return r;
+    }
+    var found: bool = false;
     var pos: i64 = outer.content;
     while pos < outer.next {
-        val t: BerTlv = ber_read(b, pos);
+        val t: BerTlv = ber_member(b, pos, outer.next);
         if !t.ok {
-            break;
+            sv_fail(&mut r, "member runs past the savPdu");
+            return r;
         }
-        if t.tag == 0xA2 {
+        if t.tag == 0xA2 && !found {
             // sequence of ASDU -> first SEQUENCE entry
-            val entry: BerTlv = ber_read(b, t.content);  // 0x30
+            val entry: BerTlv = ber_member(b, t.content, t.next);  // 0x30
+            if !entry.ok || entry.tag != 0x30 {
+                sv_fail(&mut r, "bad ASDU entry");
+                return r;
+            }
+            found = true;
             var ep: i64 = entry.content;
             while ep < entry.next {
-                val f: BerTlv = ber_read(b, ep);
+                val f: BerTlv = ber_member(b, ep, entry.next);
                 if !f.ok {
-                    break;
+                    sv_fail(&mut r, "member runs past the ASDU");
+                    return r;
+                }
+                if f.tag == 0x82 || f.tag == 0x83 || f.tag == 0x85 {
+                    if !ber_int_len_ok(&f) {
+                        sv_fail(&mut r, "bad integer length");
+                        return r;
+                    }
                 }
                 if f.tag == 0x80 {
-                    out.sv_id = ber_str(b, f.content, f.length);
+                    r.asdu.sv_id = ber_str(b, f.content, f.length);
                 } else if f.tag == 0x82 {
-                    out.smp_cnt = ber_get_uint(b, f.content, f.length);
+                    r.asdu.smp_cnt = ber_get_uint(b, f.content, f.length);
                 } else if f.tag == 0x83 {
-                    out.conf_rev = ber_get_uint(b, f.content, f.length);
+                    r.asdu.conf_rev = ber_get_uint(b, f.content, f.length);
                 } else if f.tag == 0x85 {
-                    out.smp_synch = ber_get_uint(b, f.content, f.length);
+                    r.asdu.smp_synch = ber_get_uint(b, f.content, f.length);
                 } else if f.tag == 0x87 {
                     var j: i64 = f.content;
                     while j < f.next {
-                        out.seq_data.push(b.get(j));
+                        r.asdu.seq_data.push(b.get(j));
                         j = j + 1;
                     }
                 }
@@ -626,5 +759,8 @@ pub fn sv_decode(b: &Vec<i64>) -> SvAsdu {
         }
         pos = t.next;
     }
-    return out;
+    if !found {
+        sv_fail(&mut r, "no ASDU");
+    }
+    return r;
 }

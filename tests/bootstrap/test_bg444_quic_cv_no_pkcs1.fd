@@ -1,0 +1,123 @@
+// BG444 (docs/roadmap/bugs-roadmap.md): the QUIC TLS 1.3 client refuses
+// a CertificateVerify signed with an RSASSA-PKCS1-v1_5 scheme (0x0401,
+// 0x0501, 0x0601) with alert illegal_parameter (47): RFC 8446 §4.4.3 "RSA
+// signatures MUST use an RSASSA-PSS algorithm", and §4.2.3 defines the
+// PKCS#1 code points for certificate signatures only. RSA-PSS (0x0804)
+// still verifies, and quic_tls_scheme_verify (the table also used for
+// certificate signatures) still accepts PKCS#1. The client is put at
+// QTS_WAIT_CV with an empty transcript, so the signed content is 64
+// spaces, "TLS 1.3, server CertificateVerify", 0, SHA-256(""); the RSA-2048
+// key and both signatures were made with openssl 3.5 (`openssl dgst
+// -sha256 -sign`, and with `-sigopt rsa_padding_mode:pss -sigopt
+// rsa_pss_saltlen:32`), and openssl verifies both.
+// Not on run: RSA-2048 verification takes minutes in the interpreter.
+//@ backends: ccompile,emit
+//
+// Expected output:
+// spki ok true
+// 0x0401 pkcs1: failed true, alert 47
+// 0x0501 pkcs1: failed true, alert 47
+// 0x0601 pkcs1: failed true, alert 47
+// 0x0804 pss: failed false, waiting for Finished true
+// 0x0804 with the pkcs1 signature: failed true, alert 51
+// scheme table 0x0401 (certificate use): true
+// scheme table 0x0804: true
+use quic_tls;
+use quic_frame;
+use pem;
+use encoding;
+use string;
+use crypto;
+
+fn rsa_spki() -> Vec<i64> {
+    return hex_decode_bytes("30820122300d06092a864886f70d01010105000382010f003082010a02820101" +
+        "00d0fe459a951355612394cb18109c3820067416ea2d278ac96b77847d28b919" +
+        "66f1b5c47578d414d67b7d5d44d5d0cebeb9cce3acec9f8abbf47cbe03e7e83a" +
+        "b090d8b2d0266fbfb0e98145f143a90d254dbfeafe2a2e1d770e3acd39391b5a" +
+        "e0f076387d03525a28ca97ce2b55be6fc65b6f75bad507ec9cdaa2a7652dbe9a" +
+        "9e888ded139e2df020290668bc4fdd13b347bd9159e681964a92412add47cfff" +
+        "8f132a54264dabe7ff35918295226dfec92c9f458933bf321285cbb46d6f5952" +
+        "85c0266bd2a51516a73dbc4885c4ca227523f11a61f18257014cf14d10dc57ad" +
+        "545d68c0b7fd509e083ba590b24b63ebdfb029cb219e745a7900ea817a3dbd54" +
+        "9d0203010001");
+}
+
+fn sig_pkcs1() -> Vec<i64> {
+    return hex_decode_bytes("c401f7abf5e1a85cfa875cfb1c625c794a19f9bd464c661ab45dbb8fdf61b17d" +
+        "40cbe4ba61a0e19b0215b74864fa357c08efdc0fbfd45763e3b9591cc2020b6e" +
+        "0bf2cbe75d5ef5978ffa29f6225f5fc1c2ff311ce6ce677a77335ac1b988d7dd" +
+        "0b4262d29e55460852b5cc7b5fed8c100261e6201d4d4c13d3712ca278537587" +
+        "713d9c0af53e2093c1b5df5de5871be797cfb406cfcfad10006166f509c88da9" +
+        "ea63c72b7297b34d0f5a56b1a8dcce8f7dd273c51b386d75a2d2fa47ec70d5cb" +
+        "8b6d3a801c728147fad03d468615433005107365170119a5d7bbe93b64c8143c" +
+        "c62927a5135e0b8dbae35bc22356dcd779ecd92e03ce5173ed21f6d47b098fc3");
+}
+
+fn sig_pss() -> Vec<i64> {
+    return hex_decode_bytes("c286b268ff699c0c092262f28dd4d6a235ada5217b17c0bd183c1aef40e2fc28" +
+        "c87995fbb742bd266223dd6c2438a8570c516a6ac9095ae76ad2d6e502a9c4d1" +
+        "6bef3f61f9e84afe5ed9dc5558cad77e82a7af8309116901a7b4466868546cf1" +
+        "5f45a6a8f755a533f29a5095ea3ef8ecc35cb3a3b545a0203f27b0e7b90b0ec2" +
+        "68e37f60d26faa4136d7fd0c8acd15f4a9f862f8468f5fb86ae73572c1ee5037" +
+        "7f3f92602092d803eea4003b3043a68fe263fd64f06769bf4bc40717808c9621" +
+        "497b8689ee32d99e199bb58169c96f503ac865e7429736226b416c15dc27c644" +
+        "786e30285eaeefa95553cd66b683634ec64bdb9c94e82cc33bba3d77b3f3d36e");
+}
+
+fn content() -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 64 {
+        m.push(32);
+        i = i + 1;
+    }
+    m.extend(str_bytes("TLS 1.3, server CertificateVerify"));
+    m.push(0);
+    var none: Vec<i64> = Vec::new();
+    m.extend(crypto_sha256_bytes(none));
+    return m;
+}
+
+fn try_cv(label: str, scheme: i64, sig: Vec<i64>) -> void {
+    var suites: Vec<i64> = Vec::new();
+    suites.push(4865);
+    var alpn: Vec<str> = Vec::new();
+    alpn.push("h3");
+    var t: QuicTls = quic_tls_new(false, suites, alpn, "example.test", Vec::new(), Vec::new(), Vec::new(), Vec::filled(32, 7), Vec::filled(32, 9), Vec::new());
+    t.state = QTS_WAIT_CV;
+    t.peer_spki = spki_parse(rsa_spki());
+    t.transcript = Vec::new();
+    val n: i64 = 4 + sig.len();
+    var msg: Vec<i64> = Vec::new();
+    msg.push(QT_CERTIFICATE_VERIFY);
+    msg.push(0);
+    msg.push((n >> 8) & 255);
+    msg.push(n & 255);
+    msg.push((scheme >> 8) & 255);
+    msg.push(scheme & 255);
+    msg.push((sig.len() >> 8) & 255);
+    msg.push(sig.len() & 255);
+    msg.extend(sig);
+    quic_tls_input(&mut t, QL_HANDSHAKE, msg);
+    if t.state == QTS_FAILED {
+        println(label + ": failed true, alert " + int_to_str(t.alert));
+    } else {
+        println(label + ": failed false, waiting for Finished " + bool_to_str(t.state == QTS_WAIT_FIN));
+    }
+}
+
+fn main() -> i64 {
+    val k: Spki = spki_parse(rsa_spki());
+    println("spki ok " + bool_to_str(k.ok));
+    // the entry's trigger: a valid PKCS#1 v1.5 signature under 0x0401
+    try_cv("0x0401 pkcs1", 0x0401, sig_pkcs1());
+    try_cv("0x0501 pkcs1", 0x0501, sig_pkcs1());
+    try_cv("0x0601 pkcs1", 0x0601, sig_pkcs1());
+    // RSA-PSS is what TLS 1.3 wants
+    try_cv("0x0804 pss", 0x0804, sig_pss());
+    try_cv("0x0804 with the pkcs1 signature", 0x0804, sig_pkcs1());
+    // the scheme table itself is unchanged (certificate signatures)
+    println("scheme table 0x0401 (certificate use): " + bool_to_str(quic_tls_scheme_verify(k, 0x0401, content(), sig_pkcs1())));
+    println("scheme table 0x0804: " + bool_to_str(quic_tls_scheme_verify(k, 0x0804, content(), sig_pss())));
+    return 0;
+}

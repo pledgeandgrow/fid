@@ -36,6 +36,8 @@ use compiler::parser;
 use compiler::pdb;
 use compiler::cparser;
 use compiler::pgo;
+// BG243: the inlined calls a debug build describes (g_iro_inl_sites)
+use compiler::iropt;
 // ===========================================================================
 // Stack frame (src/pe.rs PeStackFrame — mirrors x86.rs StackFrame)
 // ===========================================================================
@@ -1527,7 +1529,13 @@ pub fn PeirGen_generate(self: &mut PeirGen, module: &IrModule) -> Vec {
         // N9: with the variables, types and frames (pe_add_dwarf);
         // FID_PE_OFF=dbgvars: the line tables and functions only
         if peir_on("dbgvars") && g_pe_dbg_vars.len() == self.dbg_names.len() {
+            // BG243: and the calls inlined into each function
+            g_pe_dwarf_inl = Vec::new();
+            if g_pe_dbg_inl.len() == self.dbg_names.len() {
+                g_pe_dwarf_inl = g_pe_dbg_inl;
+            }
             image = pe_add_dwarf(image, self.enc.code, self.dbg_names, self.dbg_starts, self.dbg_ends, self.lrows, g_pe_lines_file, g_pe_dbg_vars, peir_dbg_type_descs(module));
+            g_pe_dwarf_inl = Vec::new();
         } else {
             image = pe_add_debug_sections(image, pe_dwarf_abbrev(), pe_dwarf_info(g_pe_lines_file, self.dbg_names, self.dbg_starts, self.dbg_ends), pe_dwarf_line(g_pe_lines_file, self.lrows));
         }
@@ -1944,10 +1952,14 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
         // starts the list again: PE88 may build the image twice)
         if self.dbg_names.len() == 0 {
             g_pe_dbg_vars = Vec::new();
+            g_pe_dbg_inl = Vec::new();
         }
         self.dbg_names.push(name);
         self.dbg_starts.push(fc_start);
         g_pe_dbg_vars.push("");
+        // BG243: the calls inlined into it (their nops and ranges)
+        g_pe_dbg_inl.push("");
+        peir_inl_setup(name, func);
         // N9: a row at the function's first byte with its `fn` line, so a
         // debugger's `break <function>` steps over the prologue to the
         // body's first row (the next one: cur_line stays 0)
@@ -2589,6 +2601,12 @@ pub fn PeirGen_gen_function(self: &mut PeirGen, name: str, func: &IrFunction, mo
         self.dbg_ends.push(self.enc.code.len());
         // N9: its parameters and variables, now that the frame is laid out
         PeirGen_dbg_vars_note(self, func, module, &frame);
+        // BG243: the calls inlined into it, where their code is
+        if g_pe_dbg_inl.len() == self.dbg_names.len() {
+            g_pe_dbg_inl.set(g_pe_dbg_inl.len() - 1, peir_inl_note(fc_start));
+        }
+        g_pe_inl_before = 0;
+        g_pe_inl_of = 0;
         self.lines_cur_fn = false;
     }
     // B5: keep the function's code for the next build
@@ -2662,6 +2680,10 @@ fn PeirGen_gen_insts(self: &mut PeirGen, ids: Vec<i64>, n: i64, frame: &mut PeSt
         }
         // DB3: a row where the source line changes
         if self.lines_cur_fn {
+            // BG243: first the lines of an inlined body that kept no code
+            if g_pe_inl_before != 0 {
+                PeirGen_inl_nops(self, func, inst_id);
+            }
             var sl: i64 = peir_inst_line(func, inst_id);
             if sl > 0 && sl != self.cur_line {
                 self.lrows.push(self.enc.code.len());
@@ -2700,12 +2722,17 @@ fn PeirGen_gen_insts(self: &mut PeirGen, ids: Vec<i64>, n: i64, frame: &mut PeSt
                 tail_skip = 2;
             }
         }
+        var inl_at: i64 = self.enc.code.len();
         match IrFunction_get_inst(func, inst_id) {
             OptInst::Some(inst) => {
                 PeirGen_gen_inst(self, inst_id, inst, next_cond, frame, func, module, name);
             }
             OptInst::None => {
             }
+        }
+        // BG243: the code of an inlined body (its call's range)
+        if g_pe_inl_of != 0 && self.lines_cur_fn {
+            peir_inl_mark(inst_id, inl_at, self.enc.code.len());
         }
         self.tail_next = false;
         if self.tail_done {
@@ -4700,6 +4727,11 @@ pub fn PeirGen_gen_inst(self: &mut PeirGen, id: i64, inst: Inst, next_cond: i64,
                         // Float negation: XOR sign bit via register
                         PeirEnc_movsd_xmm_mem_rbp(&mut self.enc, 0, off);
                         var sign_bit: i64 = 1 << 63;
+                        if ir_type_eq(ty, IrType::F32) {
+                            // BG260: an f32 is the low 32 bits; its sign
+                            // is bit 31 (bit 63 left `-x` unchanged)
+                            sign_bit = 1 << 31;
+                        }
                         PeirEnc_mov_imm64(&mut self.enc, PEIR_RAX, sign_bit);
                         PeirEnc_movq_xmm_r64(&mut self.enc, 1, PEIR_RAX);
                         PeirEnc_xorpd_xmm_xmm(&mut self.enc, 0, 1);
@@ -8139,6 +8171,255 @@ fn peir_dbg_decl_line(name: str) -> i64 {
         return 0;
     }
     return HashMap_get(g_pe_lines_decl, name);
+}
+
+// --- BG243: calls inlined into a function of a debug build ------------------
+// iropt.fd's inliner records each call it inlines (g_iro_inl_sites): the
+// copies of the callee's instructions with their lines and what follows
+// them in the caller. Folding may leave none of a body's lines any code
+// (scale(6, 7) is 45), so `-g` without `--debug` had no line row for them
+// and a breakpoint there was never hit. Each such line gets a one-byte nop
+// with its row where the body was (before the first instruction kept after
+// it), and each call its range, written as a DW_TAG_inlined_subroutine of
+// an abstract DW_TAG_subprogram for the callee (pe_ir_enc.fd pe_add_dwarf,
+// nat_enc.fd g_nat_dbg_inl). Only callees of the input file (their lines
+// are the input file's, the one file of pe_ir's rows). The nops are the
+// only change to the code, and only in a debug build;
+// `FID_PE_OFF=dbginl`: none, as before.
+
+/// BG243: per function of a debug build (PeirGen.dbg_names' order), the
+/// calls inlined into it in nat_enc.fd g_nat_dbg_inl's format; "" none.
+pub var g_pe_dbg_inl: Vec<str> = Vec::new();
+/// BG243: for the function being generated, instruction id (as text) ->
+/// the nops to put before it ("r|line,line;...", r the record) ...
+var g_pe_inl_before: i64 = 0;
+/// ... and id -> 1 + the record of the inlined body it is a copy of; 0:
+/// no inlined call.
+var g_pe_inl_of: i64 = 0;
+/// caller -> the positions of its records in g_iro_inl_sites ("i,j,..."),
+/// made for g_pe_inl_index_n records of generation g_pe_inl_index_gen
+/// (iropt.fd g_iro_inl_gen); 0: not made yet.
+var g_pe_inl_index: i64 = 0;
+var g_pe_inl_index_n: i64 = 0 - 1;
+var g_pe_inl_index_gen: i64 = 0 - 1;
+/// The records' callee, call line and code range (-1: no code yet).
+var g_pe_inl_names: Vec<str> = Vec::new();
+var g_pe_inl_calls: Vec<i64> = Vec::new();
+var g_pe_inl_lo: Vec<i64> = Vec::new();
+var g_pe_inl_hi: Vec<i64> = Vec::new();
+
+/// BG243: the nops and records of the calls inlined into `name`, whose
+/// final IR is `func`.
+fn peir_inl_setup(name: str, func: &IrFunction) {
+    g_pe_inl_before = 0;
+    g_pe_inl_of = 0;
+    g_pe_inl_names = Vec::new();
+    g_pe_inl_calls = Vec::new();
+    g_pe_inl_lo = Vec::new();
+    g_pe_inl_hi = Vec::new();
+    if g_iro_inl_sites.len() == 0 || !peir_on("dbginl") {
+        return;
+    }
+    // the records by caller, indexed once per set of records
+    if g_pe_inl_index == 0 || g_pe_inl_index_n != g_iro_inl_sites.len() || g_pe_inl_index_gen != g_iro_inl_gen {
+        g_pe_inl_index = HashMap_new();
+        g_pe_inl_index_n = g_iro_inl_sites.len();
+        g_pe_inl_index_gen = g_iro_inl_gen;
+        var x: i64 = 0;
+        while x < g_iro_inl_sites.len() {
+            var rec: str = g_iro_inl_sites.get(x);
+            var tab: i64 = str_find(rec, "\t");
+            if tab > 0 {
+                var caller: str = str_slice(rec, 0, tab);
+                var at: str = int_to_str(x);
+                if HashMap_contains(g_pe_inl_index, caller) {
+                    var was: str = HashMap_get(g_pe_inl_index, caller);
+                    at = was + "," + at;
+                }
+                HashMap_insert(g_pe_inl_index, caller, at);
+            }
+            x = x + 1;
+        }
+    }
+    if !HashMap_contains(g_pe_inl_index, name) {
+        return;
+    }
+    var idx_s: str = HashMap_get(g_pe_inl_index, name);
+    var idx: Vec<str> = str_split(idx_s, ",");
+    var recs: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < idx.len() {
+        recs.push(g_iro_inl_sites.get(str_parse_int(idx.get(i))));
+        i = i + 1;
+    }
+    // the instructions generated, and the lines they give rows
+    var present: i64 = HashMap_new();
+    var lines: i64 = HashMap_new();
+    var b: i64 = 0;
+    while b < func.blocks.len() {
+        var ids: Vec<i64> = func.blocks.get(b).instructions;
+        var k: i64 = 0;
+        while k < ids.len() {
+            HashMap_insert(present, int_to_str(ids.get(k)), 1);
+            var ln: i64 = peir_inst_line(func, ids.get(k));
+            if ln > 0 {
+                HashMap_insert(lines, int_to_str(ln), 1);
+            }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    g_pe_inl_before = HashMap_new();
+    g_pe_inl_of = HashMap_new();
+    var r: i64 = 0;
+    while r < recs.len() {
+        var p: Vec<str> = str_split(recs.get(r), "\t");
+        r = r + 1;
+        if p.len() < 5 || peir_dbg_decl_line(p.get(1)) <= 0 {
+            continue;
+        }
+        var ri: i64 = g_pe_inl_names.len();
+        g_pe_inl_names.push(p.get(1));
+        g_pe_inl_calls.push(str_parse_int(p.get(2)));
+        g_pe_inl_lo.push(0 - 1);
+        g_pe_inl_hi.push(0 - 1);
+        // the body's lines without code, each before the next copy kept
+        var pending: Vec<str> = Vec::new();
+        var seen: i64 = HashMap_new();
+        var body: Vec<str> = str_split(p.get(3), ",");
+        var e: i64 = 0;
+        while e < body.len() {
+            var kv: Vec<str> = str_split(body.get(e), ":");
+            e = e + 1;
+            if kv.len() != 2 {
+                continue;
+            }
+            var key: str = kv.get(0);
+            var lt: str = kv.get(1);
+            if HashMap_contains(present, key) {
+                HashMap_insert(g_pe_inl_of, key, ri + 1);
+                peir_inl_put(key, ri, pending);
+                pending = Vec::new();
+            } else if str_parse_int(lt) > 0 && !HashMap_contains(lines, lt) && !HashMap_contains(seen, lt) {
+                pending.push(lt);
+                HashMap_insert(seen, lt, 1);
+            }
+        }
+        // the rest before the first instruction kept after the body
+        if pending.len() > 0 {
+            var after: Vec<str> = str_split(p.get(4), ",");
+            var a: i64 = 0;
+            while a < after.len() {
+                if HashMap_contains(present, after.get(a)) {
+                    peir_inl_put(after.get(a), ri, pending);
+                    a = after.len();
+                }
+                a = a + 1;
+            }
+        }
+        HashMap_drop(seen);
+    }
+    HashMap_drop(present);
+    HashMap_drop(lines);
+}
+
+/// BG243: nops for the lines `pending` of record `ri` before instruction
+/// `key`.
+fn peir_inl_put(key: str, ri: i64, pending: Vec<str>) {
+    if pending.len() == 0 {
+        return;
+    }
+    var s: str = int_to_str(ri) + "|" + str_join(pending, ",");
+    if HashMap_contains(g_pe_inl_before, key) {
+        var old: str = HashMap_get(g_pe_inl_before, key);
+        s = old + ";" + s;
+    }
+    HashMap_insert(g_pe_inl_before, key, s);
+}
+
+/// BG243: record `ri`'s code includes [s, e).
+fn peir_inl_span(ri: i64, s: i64, e: i64) {
+    if ri < 0 || ri >= g_pe_inl_lo.len() || e <= s {
+        return;
+    }
+    if g_pe_inl_lo.get(ri) < 0 || s < g_pe_inl_lo.get(ri) {
+        g_pe_inl_lo.set(ri, s);
+    }
+    if e > g_pe_inl_hi.get(ri) {
+        g_pe_inl_hi.set(ri, e);
+    }
+}
+
+/// BG243: instruction `id`'s code [s, e) is part of an inlined body.
+fn peir_inl_mark(id: i64, s: i64, e: i64) {
+    var key: str = int_to_str(id);
+    if HashMap_contains(g_pe_inl_of, key) {
+        var ri: i64 = HashMap_get(g_pe_inl_of, key);
+        peir_inl_span(ri - 1, s, e);
+    }
+}
+
+/// BG243: the nops (one byte, a line row each) peir_inl_setup put before
+/// instruction `id`.
+fn PeirGen_inl_nops(self: &mut PeirGen, func: &IrFunction, id: i64) {
+    var key: str = int_to_str(id);
+    if !HashMap_contains(g_pe_inl_before, key) {
+        return;
+    }
+    var spec: str = HashMap_get(g_pe_inl_before, key);
+    var prev: i64 = self.cur_line;
+    var groups: Vec<str> = str_split(spec, ";");
+    var g: i64 = 0;
+    while g < groups.len() {
+        var rl: Vec<str> = str_split(groups.get(g), "|");
+        g = g + 1;
+        if rl.len() != 2 {
+            continue;
+        }
+        var ri: i64 = str_parse_int(rl.get(0));
+        var ls: Vec<str> = str_split(rl.get(1), ",");
+        var j: i64 = 0;
+        while j < ls.len() {
+            var ln: i64 = str_parse_int(ls.get(j));
+            j = j + 1;
+            if ln <= 0 {
+                continue;
+            }
+            var at: i64 = self.enc.code.len();
+            self.lrows.push(at);
+            self.lrows.push(ln);
+            self.lrows.push(0);
+            PeirEnc_nop(&mut self.enc);
+            peir_inl_span(ri, at, at + 1);
+            self.cur_line = ln;
+        }
+    }
+    // the instruction's code is its own line's (its row follows), or, with
+    // no line, the line's before the nops
+    if peir_inst_line(func, id) <= 0 && prev > 0 && self.cur_line != prev {
+        self.lrows.push(self.enc.code.len());
+        self.lrows.push(prev);
+        self.lrows.push(0);
+        self.cur_line = prev;
+    }
+}
+
+/// BG243: the function's inlined calls with code, in g_nat_dbg_inl's
+/// format: "I", callee, call line, the callee's `fn` line, start and end
+/// from the function's start `fstart`.
+fn peir_inl_note(fstart: i64) -> str {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < g_pe_inl_names.len() {
+        var lo: i64 = g_pe_inl_lo.get(i);
+        var hi: i64 = g_pe_inl_hi.get(i);
+        if lo >= fstart && hi > lo {
+            var callee: str = g_pe_inl_names.get(i);
+            out.push("I\t" + callee + "\t" + int_to_str(g_pe_inl_calls.get(i)) + "\t" + int_to_str(peir_dbg_decl_line(callee)) + "\t" + int_to_str(lo - fstart) + "\t" + int_to_str(hi - fstart));
+        }
+        i = i + 1;
+    }
+    return str_join(out, "\n");
 }
 
 fn peir_dbg_type_name(t: IrType) -> str {

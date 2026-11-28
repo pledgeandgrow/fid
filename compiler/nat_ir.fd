@@ -890,6 +890,14 @@ fn ng_load_args_c(g: &mut NatGen, srcs: Vec<i64>, func: &IrFunction) {
     }
 }
 
+/// BG248: does the runtime's pert_c_<cname> take a program function as C
+/// would (its entry adapter, ng_load_args_c)? Every one but those that call
+/// it themselves with the layer's convention (sys.fd pe_cmp_call:
+/// nat_call_fn with a null __env).
+fn ng_c_over_takes_cbx(cname: str) -> bool {
+    return cname != "qsort" && cname != "bsearch";
+}
+
 /// BG166: register r (a value of signature character c) in the layer's
 /// form: a narrow integer extended for its type, an f32 pattern
 /// zero-extended (C leaves the bits above it undefined).
@@ -4665,16 +4673,29 @@ fn ng_isel_emit_tg1b(g: &mut NatGen, form: i64, arg0: i64, m: MInst, d: i64, a: 
         return true;
     }
     if form == NG_IF_X64_I2F {
+        if w32 {
+            // BG337: one rounding, straight to single
+            ng_i2s_store0(g, d, a, u64src);
+            return true;
+        }
         ng_cvt_i2d(g, 0, a, u64src);
         ng_x64_fstore0(g, d, w32);
         return true;
     }
     if form == NG_IF_A64_I2F {
+        if w32 {
+            ng_i2s_store0(g, d, a, u64src);
+            return true;
+        }
         ng_cvt_i2d(g, 0, a, u64src);
         ng_fstore0(g, d, w32);
         return true;
     }
     if form == NG_IF_RV_I2F {
+        if w32 {
+            ng_i2s_store0(g, d, a, u64src);
+            return true;
+        }
         ng_cvt_i2d(g, 0, a, u64src);
         ng_fstore0(g, d, w32);
         return true;
@@ -5788,6 +5809,12 @@ fn ng_i2f_u(g: &mut NatGen, d: i64, s: i64, to_f32: bool, uns: bool) {
         ng_i2f_fr(g, d, s, to_f32, uns);
         return;
     }
+    if to_f32 {
+        // BG337: one rounding, straight to single (through f64 an integer
+        // above 2^53 could round twice)
+        ng_i2s_store0(g, d, s, uns);
+        return;
+    }
     if ng_x64(g) {
         ng_cvt_i2d(g, 0, s, uns);
         ng_x64_fstore0(g, d, to_f32);
@@ -5795,6 +5822,72 @@ fn ng_i2f_u(g: &mut NatGen, d: i64, s: i64, to_f32: bool, uns: bool) {
     }
     ng_cvt_i2d(g, 0, s, uns);
     ng_fstore0(g, d, to_f32);
+}
+
+/// BG337: general register d = the f32 bits (zero-extended) of integer s,
+/// converted in float register 0 straight to single
+fn ng_i2s_store0(g: &mut NatGen, d: i64, s: i64, uns: bool) {
+    ng_cvt_i2s(g, 0, s, uns);
+    if ng_x64(g) {
+        g.x0_reg = 0 - 1;
+        if g.x1_reg == d {
+            g.x1_reg = 0 - 1;
+        }
+        // movd r32, xmm0 (zero-extends)
+        x64_movq_rx(&mut g.e, d, 0, false);
+        return;
+    }
+    if ng_a64(g) {
+        a64_fmov_ws(&mut g.e, d, 0);
+        return;
+    }
+    rv_fmv_xw(&mut g.e, d, 0);
+    ng_ext(g, d, d, NEXT_ZW);
+}
+
+/// BG337: float register fd = the f32 of general register s in one
+/// rounding, signed or (uns) unsigned: x86-64 cvtsi2ss (a u64 at or above
+/// 2^63 halved with its low bit kept, converted, then addss: the kept bit
+/// stays a sticky bit, so the rounding is still single); AArch64 scvtf /
+/// ucvtf s, x; RISC-V fcvt.s.l / fcvt.s.lu. Clobbers ad and ad2.
+fn ng_cvt_i2s(g: &mut NatGen, fd: i64, s: i64, uns: bool) {
+    if ng_x64(g) {
+        if !uns {
+            x64_cvtsi2ss(&mut g.e, fd, s);
+            return;
+        }
+        var big: i64 = NatEnc_label(&mut g.e);
+        var done: i64 = NatEnc_label(&mut g.e);
+        x64_test(&mut g.e, s, s);
+        x64_jcc_short(&mut g.e, X64_S, big);
+        x64_cvtsi2ss(&mut g.e, fd, s);
+        x64_jmp_short(&mut g.e, done);
+        NatEnc_place(&mut g.e, big);
+        x64_mov(&mut g.e, g.ad2, s);
+        x64_shift_imm(&mut g.e, 5, g.ad2, 1);
+        x64_mov(&mut g.e, g.ad, s);
+        x64_shift_imm(&mut g.e, 4, g.ad, 63);
+        x64_shift_imm(&mut g.e, 5, g.ad, 63);
+        x64_alu(&mut g.e, 0x09, g.ad2, g.ad);
+        x64_cvtsi2ss(&mut g.e, fd, g.ad2);
+        // addss fd, fd
+        x64_sse(&mut g.e, 0xF3, 0x58, fd, fd);
+        NatEnc_place(&mut g.e, done);
+        return;
+    }
+    if ng_a64(g) {
+        if uns {
+            a64_ucvtf_s(&mut g.e, fd, s);
+        } else {
+            a64_scvtf_s(&mut g.e, fd, s);
+        }
+        return;
+    }
+    if uns {
+        rv_fcvt_slu(&mut g.e, fd, s);
+    } else {
+        rv_fcvt_sl(&mut g.e, fd, s);
+    }
 }
 
 /// BG136: float register fd (xmm / d / f number) = the f64 of general
@@ -6214,37 +6307,18 @@ fn ng_fcmp_fr(g: &mut NatGen, d: i64, a: i64, b: i64, cc: i64, is32: bool) {
     }
 }
 
-/// MI25: ng_i2f into float register d (an f32 through f64, as before);
+/// MI25: ng_i2f into float register d (BG337: an f32 in one rounding);
 /// BG136: s read as a u64 when `uns`
 fn ng_i2f_fr(g: &mut NatGen, d: i64, s: i64, to_f32: bool, uns: bool) {
     g.x0_reg = 0 - 1;
     g.x1_reg = 0 - 1;
     var fd: i64 = d - NG_FREG;
-    if ng_x64(g) {
-        if to_f32 {
-            ng_cvt_i2d(g, 0, s, uns);
-            // cvtsd2ss xd, xmm0
-            x64_sse(&mut g.e, 0xF2, 0x5A, fd, 0);
-        } else {
-            ng_cvt_i2d(g, fd, s, uns);
-        }
-        return;
-    }
-    if ng_a64(g) {
-        if to_f32 {
-            ng_cvt_i2d(g, 0, s, uns);
-            a64_fcvt_sd(&mut g.e, fd, 0);
-        } else {
-            ng_cvt_i2d(g, fd, s, uns);
-        }
-        return;
-    }
     if to_f32 {
-        ng_cvt_i2d(g, 0, s, uns);
-        rv_fcvt_sd(&mut g.e, fd, 0);
-    } else {
-        ng_cvt_i2d(g, fd, s, uns);
+        // BG337: one rounding, straight to single
+        ng_cvt_i2s(g, fd, s, uns);
+        return;
     }
+    ng_cvt_i2d(g, fd, s, uns);
 }
 
 /// MI25: ng_f2i from float register s, truncated toward zero
@@ -30364,7 +30438,19 @@ fn ng_gen_call_std(g: &mut NatGen, id: i64, call_name: str, args: Vec<i64>, func
                 csrcs.push(args.get(ci));
                 ci = ci + 1;
             }
-            ng_load_args(g, csrcs);
+            // BG248: a program function handed to the runtime's stand-in
+            // for a C function goes as its entry adapter, as to the real C
+            // function: what such a function gives back (memmove of a
+            // function's address, then `addr as fn(..)`) is called with
+            // the C convention (the CallPtr stubs, ng_cfp_stub_x64). It
+            // returned add's result in rdi where the stub reads rax: 0.
+            // Not for the runtime's own callers of it (qsort, bsearch:
+            // nat_call_fn, the layer's convention)
+            if cfn == over && ng_c_over_takes_cbx(cname) {
+                ng_load_args_c(g, csrcs, func);
+            } else {
+                ng_load_args(g, csrcs);
+            }
             ng_emit_call(g, cfn);
             ng_st_val(g, id, ng_argreg(g, 0));
             return;
@@ -30460,6 +30546,13 @@ fn ng_gen_call_std(g: &mut NatGen, id: i64, call_name: str, args: Vec<i64>, func
 /// low 32 bits of the f64 pattern (0). Zero when there is none.
 fn ng_f32_arg_mask(func: &IrFunction, module: &IrModule, call_name: str, args: Vec<i64>) -> i64 {
     var na: i64 = args.len();
+    // BG299: `Vec::filled(n, 1.5)` of a Vec<f32> (lower.fd
+    // Lowerer_lower_vec_filled: Vec_filled_typed(0, n, p_f64_to_bits(x),
+    // code, tid)): the element word is the double's bits, narrowed to the
+    // f32's (the filled Vec read the low half: 0)
+    if call_name == "Vec_filled_typed" && na == 5 && g_ng_call_ret_f32vec && ng_is_f64_bits_of_f64(func, args.get(2)) {
+        return 1 << 2;
+    }
     var any: bool = false;
     var k: i64 = 0;
     while k < na && k < 63 {
@@ -30473,7 +30566,8 @@ fn ng_f32_arg_mask(func: &IrFunction, module: &IrModule, call_name: str, args: V
     }
     var mask: i64 = 0;
     var vec_ix: i64 = 0 - 1;
-    if (call_name == "Vec_push" || call_name == "p_vec_push") && na >= 2 {
+    // BG299: `contains(1.5)` of a Vec<f32> compares f32 words too
+    if (call_name == "Vec_push" || call_name == "p_vec_push" || call_name == "Vec_contains" || call_name == "p_vec_contains") && na >= 2 {
         vec_ix = na - 2;
     }
     if (call_name == "Vec_set" || call_name == "Vec_insert" || call_name == "p_vec_set" || call_name == "p_vec_insert") && na >= 3 {
@@ -30501,6 +30595,45 @@ fn ng_f32_arg_mask(func: &IrFunction, module: &IrModule, call_name: str, args: V
         k = k + 1;
     }
     return mask;
+}
+
+// BG299: the IR result type of the Call ng_f32_arg_mask is asked about is
+// Vec<f32> (set around the call in ng_gen_inst)
+var g_ng_call_ret_f32vec: bool = false;
+
+/// BG299: value v is `p_f64_to_bits(x)` of an f64 x (an f64 stored as an
+/// element word).
+fn ng_is_f64_bits_of_f64(func: &IrFunction, v: i64) -> bool {
+    match IrFunction_get_inst(func, v) {
+        OptInst::Some(inst) => {
+            match inst {
+                Inst::Call(cn, cargs, _, _) => {
+                    if cn == "p_f64_to_bits" && cargs.len() == 1 {
+                        return ir_type_eq(ng_meta_ty(func, cargs.get(0)), IrType::F64);
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        OptInst::None => {
+        }
+    }
+    return false;
+}
+
+/// BG299: an IR type is Vec<f32>.
+fn ng_ir_vec_f32(t: IrType) -> bool {
+    match t {
+        IrType::Generic(n, targs) => {
+            if n == "Vec" && targs.len() == 1 {
+                return ir_type_eq(targs.get(0), IrType::F32);
+            }
+        }
+        _ => {
+        }
+    }
+    return false;
 }
 
 /// BG165: value v's static type is Vec<f32> (or a pointer to one).
@@ -31412,10 +31545,12 @@ fn ng_gen_inst(g: &mut NatGen, id: i64, inst: Inst, func: &IrFunction, module: &
         Inst::Unreachable => {
             ng_trap(g);
         }
-        Inst::Call(call_name, args, _, _) => {
+        Inst::Call(call_name, args, call_ret, _) => {
             // BG165: the f64 arguments an f32 parameter or Vec<f32> element
             // takes, narrowed as they are passed (ng_gen_call)
+            g_ng_call_ret_f32vec = ng_ir_vec_f32(call_ret);
             g_ng_f32_args = ng_f32_arg_mask(func, module, call_name, args);
+            g_ng_call_ret_f32vec = false;
             ng_gen_call(g, id, call_name, args, func);
             g_ng_f32_args = 0;
         }
@@ -36269,7 +36404,7 @@ fn ng_dbg_vars_resolve(g: &NatGen, rec: &NatFnRec, al: &NatAlloc) {
         regvis.push(pc_v.get(pk0));
         pk0 = pk0 + 1;
     }
-    var ranges: Vec<str> = ng_dbg_live_ranges(g, rec, &regvis);
+    var ranges: Vec<str> = ng_dbg_live_ranges(g, rec, &regvis, al);
     var out: Vec<str> = Vec::new();
     var li: i64 = 0;
     while li < lines.len() {
@@ -36420,7 +36555,16 @@ fn ng_dbg_range_add(rs: str, s: i64, e: i64) -> str {
 /// changes it from one value of the variable to the next), and at the
 /// instruction's first byte when live before it only (its last use may
 /// take the register for its result).
-fn ng_dbg_live_ranges(g: &NatGen, rec: &NatFnRec, vis: &Vec<i64>) -> Vec<str> {
+/// BG245: a value held in a register (al.assign) stays there after its
+/// last use, and after a definition nothing reads, until something writes
+/// that register: it is shown over those instructions too, as other
+/// compilers' location lists do (liveness alone gave most variables a
+/// range of one byte, the first byte of their last use, and `<optimized
+/// out>` one instruction later). Within its machine block only, and up to
+/// the first instruction that may write the register (ng_dbg_clobbers: a
+/// definition of another value assigned to it, a call, an operation with
+/// fixed registers). `FID_NAT_OFF=dbghold`: liveness alone, as before.
+fn ng_dbg_live_ranges(g: &NatGen, rec: &NatFnRec, vis: &Vec<i64>, al: &NatAlloc) -> Vec<str> {
     var out: Vec<str> = Vec::new();
     var n: i64 = rec.mir.len();
     var nt: i64 = vis.len();
@@ -36551,6 +36695,7 @@ fn ng_dbg_live_ranges(g: &NatGen, rec: &NatFnRec, vis: &Vec<i64>) -> Vec<str> {
     if gs.len() == 0 || fstart < 0 {
         return out;
     }
+    var hold_on: bool = ng_on("dbghold");
     t = 0;
     while t < nt {
         var bt2: i64 = bitof.get(t);
@@ -36560,6 +36705,15 @@ fn ng_dbg_live_ranges(g: &NatGen, rec: &NatFnRec, vis: &Vec<i64>) -> Vec<str> {
             var rs: str = "";
             var os: i64 = 0 - 1;
             var oe: i64 = 0 - 1;
+            // BG245: its register (-1: none, or not held past liveness)
+            // and whether that register still holds it
+            var vt: i64 = vis.get(t);
+            var hreg: i64 = 0 - 1;
+            if hold_on && vt >= 0 && vt < al.assign.len() && al.assign.get(vt) >= 0 {
+                hreg = al.assign.get(vt);
+            }
+            var held: bool = false;
+            var prev_blk: i64 = 0 - 1;
             var gi: i64 = 0;
             while gi < gs.len() {
                 var k0: i64 = gs.get(gi);
@@ -36570,6 +36724,20 @@ fn ng_dbg_live_ranges(g: &NatGen, rec: &NatFnRec, vis: &Vec<i64>) -> Vec<str> {
                     e = g.dbg_mpos.get(k1);
                 }
                 var s: i64 = g.dbg_mpos.get(k0);
+                // BG245: a new machine block starts with what flows into
+                // it (its liveness), not with what the code before it left
+                if hreg >= 0 && (mb.of.get(k0) != prev_blk || ng_dbg_group_places(&mir, k0, k1)) {
+                    held = false;
+                }
+                if k1 > k0 {
+                    prev_blk = mb.of.get(k1 - 1);
+                }
+                var was_held: bool = held;
+                if hreg >= 0 && k1 > k0 {
+                    var live0: bool = (bef.get(k0 * words + wi) & mask) != 0;
+                    var live1: bool = (aft.get((k1 - 1) * words + wi) & mask) != 0;
+                    held = ng_dbg_held_after(&mir, al, k0, k1, hreg, vt, held || live0, live1);
+                }
                 if e > s {
                     var at_start: bool = (bef.get(k0 * words + wi) & mask) != 0;
                     var through: bool = at_start;
@@ -36583,7 +36751,10 @@ fn ng_dbg_live_ranges(g: &NatGen, rec: &NatFnRec, vis: &Vec<i64>) -> Vec<str> {
                     var re: i64 = 0 - 1;
                     if through {
                         re = e;
-                    } else if at_start {
+                    } else if (at_start || was_held) && hreg >= 0 && !ng_dbg_group_clobbers(&mir, al, k0, k1, hreg, vt) {
+                        // BG245: nothing in it writes the register
+                        re = e;
+                    } else if at_start || was_held {
                         re = s + 1;
                     }
                     if re > s {
@@ -36611,6 +36782,89 @@ fn ng_dbg_live_ranges(g: &NatGen, rec: &NatFnRec, vis: &Vec<i64>) -> Vec<str> {
 }
 
 // --- CE8: the failing frame's values (`fid emit -g`) -----------------------
+
+/// BG245: may machine instruction `m` write register `a` while vreg index
+/// `v` (assigned `a`) is held there past its liveness? A definition of v
+/// itself does not (a new value of the same variable), nor a move of v
+/// into a value sharing its register (a coalesced copy); a definition of
+/// another value assigned `a`, or of `a` itself, does; so does anything
+/// that may write registers it does not name (a call, the division and
+/// shift forms with fixed registers, a block copy, the prologue and
+/// epilogues, the vector and block-parameter operations).
+fn ng_dbg_clobbers(m: MInst, al: &NatAlloc, a: i64, v: i64) -> bool {
+    var op: i64 = m.op;
+    if mi_is_call(op) || op == MO_DIV || op == MO_REM || op == MO_MULH || op == MO_SHL || op == MO_SAR || op == MO_SHR {
+        return true;
+    }
+    if op == MO_COPY || op == MO_PROLOGUE || op == MO_EPILOGUE || op == MO_TRAP || op == MO_LDIN || op == MO_STOUT {
+        return true;
+    }
+    if (op >= MO_VLD && op <= MO_VEND) || op == MO_VBTEST || op == MO_BPARAM || op == MO_BARG || op == MO_JTAB || op == MO_JTE {
+        return true;
+    }
+    if op < 0 || !mi_defines(op) {
+        return false;
+    }
+    var r: i64 = m.r0;
+    if r < NG_VBASE {
+        return r == a;
+    }
+    var u: i64 = r - NG_VBASE;
+    if u == v {
+        return false;
+    }
+    if u < al.assign.len() && al.assign.get(u) == a {
+        return !(op == MO_MOV && m.r1 == NG_VBASE + v);
+    }
+    return false;
+}
+
+/// BG245: does any instruction of [k0, k1) write register `a` held for v?
+fn ng_dbg_group_clobbers(mir: &Vec<MInst>, al: &NatAlloc, k0: i64, k1: i64, a: i64, v: i64) -> bool {
+    var k: i64 = k0;
+    while k < k1 {
+        if ng_dbg_clobbers(mir.get(k), al, a, v) {
+            return true;
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+/// BG245: does [k0, k1) start a block (a label placed, a block parameter)?
+fn ng_dbg_group_places(mir: &Vec<MInst>, k0: i64, k1: i64) -> bool {
+    var k: i64 = k0;
+    while k < k1 {
+        var op: i64 = mir.get(k).op;
+        if op == MO_PLACE || op == MO_BPARAM {
+            return true;
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+/// BG245: is v still in register `a` after the instructions [k0, k1),
+/// given whether it was there before them (`before`) and whether it is
+/// live after them (`live_after`)? Its own definition puts it there; a
+/// write of `a` by something else (ng_dbg_clobbers) takes it out.
+fn ng_dbg_held_after(mir: &Vec<MInst>, al: &NatAlloc, k0: i64, k1: i64, a: i64, v: i64, before: bool, live_after: bool) -> bool {
+    if live_after {
+        return true;
+    }
+    var h: bool = before;
+    var k: i64 = k0;
+    while k < k1 {
+        var m: MInst = mir.get(k);
+        if m.op >= 0 && mi_defines(m.op) && m.r0 == NG_VBASE + v {
+            h = true;
+        } else if ng_dbg_clobbers(m, al, a, v) {
+            h = false;
+        }
+        k = k + 1;
+    }
+    return h;
+}
 
 /// CE8: `-g` on the machine layer (main.fd sets it; FID_NAT_FRAMES=1 does
 /// the same): a panic prints the source variables of the failing frame
@@ -40464,7 +40718,13 @@ fn nl_loop_end(g: &mut NatGen, par_on: bool) {
         return;
     }
     // Each placed function's start, in address order, and its slot: to
-    // the next one's start, the last one's to the end of the functions
+    // the next one's start, the last one's to the end of the functions.
+    // A function of the kept layout this build has no more (inlined away,
+    // left unreachable: an edit's small version) keeps its slot, the zeros
+    // it left: a later build that has it again (the edit undone, or another
+    // one) puts it back where it was. Before, the function before it got
+    // that room and the returning one went after the code (Nov 27:
+    // relink_check's third build on every target).
     var names: Vec<str> = Vec::new();
     var starts: Vec<i64> = Vec::new();
     var skeys: Vec<i64> = Vec::new();

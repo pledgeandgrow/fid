@@ -1,0 +1,83 @@
+// BG282 (docs/roadmap/bugs-roadmap.md): HPACK decoding is bounded by the
+// header list size (RFC 9113 §6.5.2: name + value + 32 per field).
+// hpack_decode_limit stops copying fields once the list passes its limit
+// (too_large, no fields returned) but decodes the rest of the block, so
+// the dynamic table stays in step (RFC 9113 §10.5.1); hpack_decode fails
+// a list above HPACK_MAX_HEADER_LIST (1 MiB) instead of building it.
+// http2's h2_on_header_block decodes with H2_OUR_MAX_HEADER_LIST (65536).
+// The entry's bomb: a 4000-byte literal "x" with incremental indexing,
+// then 2000 one-byte references 0xBE to it (6,006 bytes; 2001 fields,
+// 8,070,033 bytes of list).
+//
+// Expected output:
+// block 6006 bytes, list would be 8070033 bytes
+// limit 65536: ok true too_large true fields 0
+// table still in step: ok true, x = 4000 bytes, table entries 1
+// hpack_decode: ok false, header list too large
+// 16 fields at the limit 64528: ok true too_large false fields 16
+// 16 fields at the limit 64527: ok true too_large true fields 0
+// small block: ok true too_large false, :method GET
+use hpack;
+use string;
+
+fn put_lit(b: &mut Vec<i64>, n: i64) -> void {
+    // literal with incremental indexing, new name "x", value n x 'a'
+    b.push(64);
+    b.push(1);
+    b.push(120);
+    hpack_put_int(b, 0, 7, n);
+    var i: i64 = 0;
+    while i < n {
+        b.push(97);
+        i = i + 1;
+    }
+}
+
+fn main() -> i64 {
+    var bomb: Vec<i64> = Vec::new();
+    put_lit(&mut bomb, 4000);
+    var i: i64 = 0;
+    while i < 2000 {
+        bomb.push(190);
+        i = i + 1;
+    }
+    println("block " + int_to_str(bomb.len()) + " bytes, list would be " + int_to_str(2001 * (1 + 4000 + 32)) + " bytes");
+
+    // the entry's trigger, at http2's limit
+    var dec: Hpack = hpack_new(4096);
+    val r: HpackHeaders = hpack_decode_limit(&mut dec, bomb, 65536);
+    println("limit 65536: ok " + bool_to_str(r.ok) + " too_large " + bool_to_str(r.too_large) + " fields " + int_to_str(r.names.len()));
+    // the literal was still added to the table: a reference decodes
+    var one: Vec<i64> = Vec::new();
+    one.push(190);
+    val r2: HpackHeaders = hpack_decode_limit(&mut dec, one, 65536);
+    println("table still in step: ok " + bool_to_str(r2.ok) + ", " + r2.names.get(0) + " = " + int_to_str(str_len(r2.vals.get(0))) + " bytes, table entries " + int_to_str(hpack_table_len(&dec)));
+
+    // hpack_decode's own limit
+    var dec2: Hpack = hpack_new(4096);
+    val r3: HpackHeaders = hpack_decode(&mut dec2, bomb);
+    println("hpack_decode: ok " + bool_to_str(r3.ok) + ", " + r3.error);
+
+    // the edge: 16 fields of 4033 bytes are 64528 bytes
+    var sixteen: Vec<i64> = Vec::new();
+    put_lit(&mut sixteen, 4000);
+    i = 0;
+    while i < 15 {
+        sixteen.push(190);
+        i = i + 1;
+    }
+    var dec3: Hpack = hpack_new(4096);
+    val r4: HpackHeaders = hpack_decode_limit(&mut dec3, sixteen, 64528);
+    println("16 fields at the limit 64528: ok " + bool_to_str(r4.ok) + " too_large " + bool_to_str(r4.too_large) + " fields " + int_to_str(r4.names.len()));
+    var dec4: Hpack = hpack_new(4096);
+    val r5: HpackHeaders = hpack_decode_limit(&mut dec4, sixteen, 64527);
+    println("16 fields at the limit 64527: ok " + bool_to_str(r5.ok) + " too_large " + bool_to_str(r5.too_large) + " fields " + int_to_str(r5.names.len()));
+
+    // an ordinary block (static index 2, :method GET)
+    var small: Vec<i64> = Vec::new();
+    small.push(130);
+    var dec5: Hpack = hpack_new(4096);
+    val r6: HpackHeaders = hpack_decode_limit(&mut dec5, small, 65536);
+    println("small block: ok " + bool_to_str(r6.ok) + " too_large " + bool_to_str(r6.too_large) + ", " + r6.names.get(0) + " " + r6.vals.get(0));
+    return 0;
+}

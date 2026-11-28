@@ -102,7 +102,8 @@ original plan are noted inline.
       exes. Verified: deleted output restored with zero C compile
       ("Reused cached artifact").
 - [x] A11. Remote-cache server for `.fidcache` (Bazel-style HTTP CAS) —
-      `tools/cas.fd` (`fid run tools/cas.fd -- [root] [port]`, default
+      `tools/cas.fd` (`fid ccompile tools/cas.fd -o fidcas.exe`, then
+      `fidcas.exe [root] [port]`; `fid run` cannot serve, BG363; default
       `./fidcas` :7331): `GET|PUT /cas/<name>` raw bytes + `/health`,
       name allowlist + traversal rejection, tmp+rename writes (Windows:
       same-key PUT keeps existing object, no tmp leak). Client side:

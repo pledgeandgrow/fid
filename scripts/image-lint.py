@@ -179,9 +179,12 @@ def lint_elf(L):
             L.ok(sh_addr % sh_align == 0, "section %d (%s): address %#x not aligned to %#x" % (i, label, sh_addr, sh_align))
         L.ok(sh_link < e_shnum, "section %d (%s): sh_link %d out of range" % (i, label, sh_link))
         if (sh_flags & 2) and e_type != 1 and sh_size:  # SHF_ALLOC in an image: mapped by PT_LOADs
-            # The machine layer's .text is the whole loaded image, so it
-            # may run over several adjoining segments: every byte must be in
-            # one, at the file offset the section says
+            # Every byte in a segment, at the file offset the section says.
+            # BG234: and the whole section in one segment whose permissions
+            # its flags agree with (readelf -l maps a section to the segments
+            # that hold all of it, objdump -d disassembles an EXECINSTR
+            # one): the machine layer's .text was the whole image, flagged
+            # WAX, over the R+X code and RW data segments
             seg = [g for g in loads if g[0] < sh_addr + sh_size and sh_addr < g[0] + g[1]]
             covered = sh_addr
             for g in sorted(seg):
@@ -195,6 +198,12 @@ def lint_elf(L):
                             L.ok(sh_offset + (a - sh_addr) == g[2] + (a - g[0]), "section %d (%s): file offset %#x does not map to its address %#x in segment %d" % (i, label, sh_offset, sh_addr, g[5]))
                 if sh_flags & 4:  # SHF_EXECINSTR
                     L.ok(any(g[4] & 1 for g in seg), "section %d (%s) is executable but no segment holding it is" % (i, label))
+                L.ok(len(seg) == 1, "section %d (%s): %#x+%#x runs over %d PT_LOAD segments (no segment maps it)" % (i, label, sh_addr, sh_size, len(seg)))
+                for g in seg:
+                    if sh_flags & 4:
+                        L.ok(g[4] & 1, "section %d (%s) is executable but segment %d holding part of it is not" % (i, label, g[5]))
+                    if sh_flags & 1:  # SHF_WRITE
+                        L.ok(g[4] & 2, "section %d (%s) is writable but segment %d holding it is not" % (i, label, g[5]))
     # A dynamic segment needs its section (readelf: "no .dynamic section in
     # the dynamic segment"), at the same address and file offset
     for (dv, do_, dsz, di) in dyn_ph:
@@ -627,6 +636,7 @@ def self_test():
     shoff = struct.unpack_from("<Q", elf, 40)[0]
     expect(patch(elf, shoff + 64 * 2 + 56, "<Q", 16), False, "ELF symbol entry size 16")
     expect(patch(elf, shoff + 64 * 1 + 24, "<Q", 0x500000), False, "ELF .text outside its segment")
+    expect(patch(elf, shoff + 64 * 1 + 8, "<Q", 7), False, "ELF .text writable in a read-only segment (BG234)")
     expect(patch(elf, 62, "<H", 9), False, "ELF e_shstrndx out of range")
     pe = tiny_pe()
     expect(pe, True, "PE executable")

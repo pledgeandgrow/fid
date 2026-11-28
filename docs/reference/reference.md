@@ -589,7 +589,8 @@ may treat `str` as an integer.
 
 `+`, `-`, `*` and negation panic on overflow at the declared width, unless the
 function is `@wrapping`, where they wrap. `/` and `%` by zero always panic.
-Unsigned types are unsigned for division, remainder, comparison, `>>` and
+A signed type's minimum `% -1` is 0 (the remainder is in range; only the
+quotient `MIN / -1` overflows). Unsigned types are unsigned for division, remainder, comparison, `>>` and
 printing (`test_int_width.fd`; `safety/test_overflow_add.fd`,
 `test_overflow_sub.fd`, `test_overflow_mul.fd`, `test_div_zero.fd`).
 

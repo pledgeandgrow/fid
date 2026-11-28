@@ -1,0 +1,127 @@
+// BG244 (docs/roadmap/bugs-roadmap.md): `ccompile -g` gives each named
+// local of a function a C variable under its Fides name
+// (compiler/codegen_c.fd cg_dbg_c_names), so a C debugger shows `acc`,
+// not v2: a slot becomes the variable (`int64_t acc = 0;`, `v2 =
+// (void*)&acc;` where the alloca was), a parameter and a value bound once
+// a copy (`int64_t base = (int64_t)v0;`, `name = (const char*)v9;` after
+// its instruction). A name C or the generated C already uses gets a
+// number (`free` -> `free_1`), a second binding of one name too (`acc_1`);
+// a slot read or written wider than its type (a struct store into a
+// bool slot) keeps its alloca. Without -g the C is what it was: the
+// alloca, no copies.
+// Run (from the repository root; FID_C_OUT=<file.c> also writes the -g C,
+// which tests/tooling/c-dbg-names-check.sh compiles):
+//   fid run tests/tooling/c_dbg_names_unit.fd
+// Expected output:
+// slot acc true
+// slot bound true
+// bool slot true
+// param base true
+// param factor true
+// value name true
+// reserved free_1 true
+// shadowed acc_1 true
+// wide slot kept true
+// no -g: alloca true
+// no -g: no names true
+use core;
+use vec;
+use string;
+use file;
+use compiler::ast;
+use compiler::ir;
+use compiler::codegen_c;
+
+fn param(f: &mut IrFunction, name: str, ty: IrType) -> i64 {
+    var id: i64 = IrFunction_new_value(f, ValueMeta_new(ty));
+    f.params.push(ValueIdType_new(id, ty));
+    IrFunction_bind_local(f, name, id);
+    return id;
+}
+
+/// scale(base, factor): acc (a slot), flag (a bool slot), name (a str
+/// value), free (a slot whose name the C library has), a second acc in
+/// an inner scope, wide (a bool slot written with an 8-byte store type)
+fn scale_fn() -> IrFunction {
+    var f: IrFunction = IrFunction_new("scale", IrType::I64);
+    var base: i64 = param(&mut f, "base", IrType::I64);
+    var factor: i64 = param(&mut f, "factor", IrType::I64);
+    var acc: i64 = IrFunction_emit(&mut f, Inst::Alloca(IrType::I64, Region::Stack));
+    IrFunction_bind_local(&mut f, "acc", acc);
+    var prod: i64 = IrFunction_emit(&mut f, Inst::BinOp(BinOp::Mul, base, factor, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Store(acc, prod, OptIrType::None));
+    var flag: i64 = IrFunction_emit(&mut f, Inst::Alloca(IrType::Bool, Region::Stack));
+    IrFunction_bind_local(&mut f, "flag", flag);
+    var t: i64 = IrFunction_emit(&mut f, Inst::ConstBool(true));
+    IrFunction_emit(&mut f, Inst::Store(flag, t, OptIrType::None));
+    var name: i64 = IrFunction_emit(&mut f, Inst::ConstStr("fides"));
+    IrFunction_bind_local(&mut f, "name", name);
+    var fr: i64 = IrFunction_emit(&mut f, Inst::Alloca(IrType::I64, Region::Stack));
+    IrFunction_bind_local(&mut f, "free", fr);
+    IrFunction_emit(&mut f, Inst::Store(fr, prod, OptIrType::None));
+    var acc2: i64 = IrFunction_emit(&mut f, Inst::Alloca(IrType::I64, Region::Stack));
+    IrFunction_bind_local(&mut f, "acc", acc2);
+    IrFunction_emit(&mut f, Inst::Store(acc2, base, OptIrType::None));
+    var wide: i64 = IrFunction_emit(&mut f, Inst::Alloca(IrType::Bool, Region::Stack));
+    IrFunction_bind_local(&mut f, "wide", wide);
+    IrFunction_emit(&mut f, Inst::Store(wide, prod, OptIrType::Some(IrType::I64)));
+    var r: i64 = IrFunction_emit(&mut f, Inst::Load(acc, IrType::I64));
+    IrFunction_emit(&mut f, Inst::Return(OptValueId::Some(r)));
+    return f;
+}
+
+fn gen(debug: bool) -> str {
+    var m: IrModule = IrModule_new();
+    IrModule_add_function(&mut m, scale_fn());
+    if debug {
+        set_c_debug_info("tests/tooling/c_dbg_names_unit.fd", "fn scale(base: i64, factor: i64) -> i64 {}", "c_dbg_names_unit.c");
+    } else {
+        clear_c_debug_info();
+    }
+    var g: CCodeGen = CCodeGen_new();
+    var c: str = CCodeGen_generate(&mut g, m);
+    clear_c_debug_info();
+    return c;
+}
+
+/// The C of the function `scale` in `c` (from its definition to the `}`
+/// that ends it).
+fn fn_body(c: str) -> str {
+    var at: i64 = str_find(c, " scale(int64_t v0, int64_t v1) {");
+    if at < 0 {
+        return "";
+    }
+    var rest: str = str_slice(c, at, str_len(c));
+    var end: i64 = str_find(rest, "\n}\n");
+    if end < 0 {
+        return rest;
+    }
+    return str_slice(rest, 0, end + 2);
+}
+
+fn main() {
+    var c: str = gen(true);
+    var b: str = fn_body(c);
+    println("slot acc " + bool_to_str(str_contains(b, "    int64_t acc = 0;")));
+    println("slot bound " + bool_to_str(str_contains(b, " = (void*)&acc;") && !str_contains(b, "v2 = alloca(")));
+    println("bool slot " + bool_to_str(str_contains(b, "    bool flag = 0;") && str_contains(b, " = (void*)&flag;")));
+    println("param base " + bool_to_str(str_contains(b, "    int64_t base = (int64_t)v0;")));
+    println("param factor " + bool_to_str(str_contains(b, "    int64_t factor = (int64_t)v1;")));
+    println("value name " + bool_to_str(str_contains(b, "    const char* name = 0;") && str_contains(b, "    name = (const char*)v")));
+    println("reserved free_1 " + bool_to_str(str_contains(b, "    int64_t free_1 = 0;") && !str_contains(b, "int64_t free = 0;")));
+    println("shadowed acc_1 " + bool_to_str(str_contains(b, "    int64_t acc_1 = 0;") && str_contains(b, " = (void*)&acc_1;")));
+    println("wide slot kept " + bool_to_str(!str_contains(b, "bool wide") && str_contains(b, " = alloca(1);")));
+    match env_var("FID_C_OUT") {
+        Option::Some(out) => {
+            if file::file_write(out, c) != 0 {
+                println("could not write " + out);
+            }
+        }
+        Option::None => {
+        }
+    }
+    var c0: str = gen(false);
+    var b0: str = fn_body(c0);
+    println("no -g: alloca " + bool_to_str(str_contains(b0, "v2 = alloca(8);")));
+    println("no -g: no names " + bool_to_str(str_len(b0) > 0 && !str_contains(b0, "acc") && !str_contains(b0, "base")));
+}

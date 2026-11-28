@@ -901,7 +901,9 @@ fn qhs_client_hello(t: &mut QuicTls) {
     qhs_u16(&mut sig_list, 0x0807);
     if t.peer_key.len() == 0 {
         // Without a pinned key any server is accepted: offer what servers
-        // with RSA or ECDSA certificates sign with (qhs_cv_verify checks)
+        // with RSA or ECDSA certificates sign with. The PKCS#1 v1.5 codes
+        // are for the certificates' signatures only (RFC 8446 §4.2.3): a
+        // CertificateVerify must not use them (qhs_client_cv refuses it)
         qhs_u16(&mut sig_list, 0x0403);
         qhs_u16(&mut sig_list, 0x0804);
         qhs_u16(&mut sig_list, 0x0503);
@@ -1990,9 +1992,18 @@ fn qhs_client_cert(t: &mut QuicTls, body: Vec<i64>) {
 }
 
 /// The RSA and ECDSA signature schemes a client without a pinned key
-/// offers (RFC 8446 §4.2.3), all checked by qhs_cv_verify: 0x0403, 0x0503,
-/// 0x0603 (ECDSA), 0x0804, 0x0805, 0x0806 (RSA-PSS), 0x0401, 0x0501,
-/// 0x0601 (RSA PKCS#1 v1.5).
+/// offers (RFC 8446 §4.2.3): 0x0403, 0x0503, 0x0603 (ECDSA), 0x0804,
+/// 0x0805, 0x0806 (RSA-PSS), checked by qhs_cv_verify, and 0x0401,
+/// 0x0501, 0x0601 (RSA PKCS#1 v1.5), offered for certificate signatures
+/// only and refused in a CertificateVerify (qhs_cv_scheme_allowed).
+
+/// Whether `scheme` may sign a TLS 1.3 handshake message: not one of the
+/// RSASSA-PKCS1-v1_5 code points (0x0201, 0x0401, 0x0501, 0x0601), which
+/// "are not defined for use in signed TLS handshake messages" (RFC 8446
+/// §4.2.3; §4.4.3: RSA signatures MUST use RSASSA-PSS).
+fn qhs_cv_scheme_allowed(scheme: i64) -> bool {
+    return scheme != 0x0201 && scheme != 0x0401 && scheme != 0x0501 && scheme != 0x0601;
+}
 
 /// The ECDSA signature a TLS 1.3 `scheme` wants checked: the certificate's
 /// key must be on the scheme's named curve (RFC 8446 §4.2.3).
@@ -2051,8 +2062,12 @@ pub fn quic_tls_scheme_verify(k: Spki, scheme: i64, content: Vec<i64>, sig: Vec<
 }
 
 /// The handshake's check of a CertificateVerify: the certificate's own
-/// Ed25519 key when it was kept, else the scheme table.
+/// Ed25519 key when it was kept, else the scheme table, never a PKCS#1
+/// v1.5 scheme.
 fn qhs_cv_verify(t: &QuicTls, scheme: i64, content: Vec<i64>, sig: Vec<i64>) -> bool {
+    if !qhs_cv_scheme_allowed(scheme) {
+        return false;
+    }
     if scheme == 0x0807 {
         var key: Vec<i64> = t.peer_cert_key;
         if key.len() != 32 && t.peer_spki.ok {
@@ -2083,6 +2098,10 @@ fn qhs_client_cv(t: &mut QuicTls, body: Vec<i64>, hash: Vec<i64>) {
             return;
         }
         t.state = QTS_WAIT_FIN;
+        return;
+    }
+    if !qhs_cv_scheme_allowed(scheme) {
+        qhs_fail(t, QA_ILLEGAL_PARAMETER, "CertificateVerify with an RSASSA-PKCS1-v1_5 scheme");
         return;
     }
     if !qhs_cv_verify(t, scheme, qhs_cv_content(hash), sig) {

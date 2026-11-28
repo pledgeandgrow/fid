@@ -132,31 +132,31 @@ fn main() {
         print("\n");
     }
 
-    // PF >= 240 means PDU1 (destination-specific)
-    if !j1939_is_pdu1(j_id) {
-        print("FAIL: PF=0xF4 should be PDU1\n");
+    // SAE J1939-21: PF >= 240 means PDU2 (broadcast, PS = group extension)
+    if !j1939_is_pdu2(j_id) {
+        print("FAIL: PF=0xF4 should be PDU2\n");
     }
-    if j1939_is_pdu2(j_id) {
-        print("FAIL: PF=0xF4 should not be PDU2\n");
+    if j1939_is_pdu1(j_id) {
+        print("FAIL: PF=0xF4 should not be PDU1\n");
     }
 
-    // PGN for PDU1: (DP << 16) | (PF << 8) = 0x00F400
+    // PGN for PDU2: (DP << 16) | (PF << 8) | PS = 0x00F405
     val j_pgn = j1939_pgn(j_id);
-    if j_pgn != 0x00F400 {
-        print("FAIL: J1939 PGN expected 0xF400, got ");
+    if j_pgn != 0x00F405 {
+        print("FAIL: J1939 PGN expected 0xF405, got ");
         print(j_pgn);
         print("\n");
     }
 
-    // PDU2 test: PF=0x80 (< 240)
+    // PDU1 test: PF=0x80 (< 240, destination-specific, PS = destination)
     val j2_id = j1939_id(6, 0, 0, 0x80, 0x10, 0x01);
-    if !j1939_is_pdu2(j2_id) {
-        print("FAIL: PF=0x80 should be PDU2\n");
+    if !j1939_is_pdu1(j2_id) {
+        print("FAIL: PF=0x80 should be PDU1\n");
     }
-    // PGN for PDU2: (DP << 16) | (PF << 8) | PS = 0x008010
+    // PGN for PDU1: (DP << 16) | (PF << 8) = 0x008000
     val j2_pgn = j1939_pgn(j2_id);
-    if j2_pgn != 0x008010 {
-        print("FAIL: J1939 PGN expected 0x8010, got ");
+    if j2_pgn != 0x008000 {
+        print("FAIL: J1939 PGN expected 0x8000, got ");
         print(j2_pgn);
         print("\n");
     }
@@ -248,17 +248,22 @@ fn main() {
     if rpm_id != OBD_BROADCAST_ID {
         print("FAIL: OBD request should use broadcast ID 0x7DF\n");
     }
-    val rpm_mode = can_frame_byte(rpm_req, 0);
+    // ISO 15765-2 single frame: [PCI 0x02, mode, PID]
+    if can_frame_byte(rpm_req, 0) != 0x02 {
+        print("FAIL: OBD PCI byte expected 0x02\n");
+    }
+    val rpm_mode = can_frame_byte(rpm_req, 1);
     if rpm_mode != 0x01 {
         print("FAIL: OBD mode expected 0x01\n");
     }
-    val rpm_pid = can_frame_byte(rpm_req, 1);
+    val rpm_pid = can_frame_byte(rpm_req, 2);
     if rpm_pid != 0x0C {
         print("FAIL: OBD PID expected 0x0C\n");
     }
 
-    // Decode RPM response: [0x41, 0x0C, 0x1A, 0x00] → RPM = (0x1A * 256 + 0) / 4 = 26 * 256 / 4 = 1664
+    // Decode RPM response: [0x04, 0x41, 0x0C, 0x1A, 0x00] → RPM = (0x1A * 256 + 0) / 4 = 26 * 256 / 4 = 1664
     val rpm_resp_data = Vec::new();
+    rpm_resp_data.push(0x04);
     rpm_resp_data.push(0x41);
     rpm_resp_data.push(0x0C);
     rpm_resp_data.push(0x1A);
@@ -271,8 +276,9 @@ fn main() {
         print("\n");
     }
 
-    // Decode speed response: [0x41, 0x0D, 0x64] → 100 km/h
+    // Decode speed response: [0x03, 0x41, 0x0D, 0x64] → 100 km/h
     val spd_resp_data = Vec::new();
+    spd_resp_data.push(0x03);
     spd_resp_data.push(0x41);
     spd_resp_data.push(0x0D);
     spd_resp_data.push(0x64);
@@ -287,6 +293,7 @@ fn main() {
     // Decode coolant temp: [0x41, 0x05, 0x5A] → 90°C (0x5A=90, 90-40=50... wait)
     // 0x5A = 90, temp = 90 - 40 = 50°C
     val temp_resp_data = Vec::new();
+    temp_resp_data.push(0x03);
     temp_resp_data.push(0x41);
     temp_resp_data.push(0x05);
     temp_resp_data.push(0x5A);

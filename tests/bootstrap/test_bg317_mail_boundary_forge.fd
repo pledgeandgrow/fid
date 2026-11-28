@@ -1,0 +1,100 @@
+// BG317 (docs/roadmap/bugs-roadmap.md): body text can no longer forge MIME
+// parts in mail_build. Every boundary starts with "=_", which
+// quoted-printable ("=" written "=3D") and base64 never produce, so a text
+// part holding "=_" is sent quoted-printable: a "--<boundary>" line in
+// the text arrives as "--=3D_..." and the message keeps exactly its own
+// delimiter lines (RFC 2046 §5.1.1: the boundary must not appear in the
+// encapsulated parts).
+//
+// Expected output:
+// boundary: =_mix_eebaaa1e0369
+// mixed: open 2 close 1
+// cte: quoted-printable
+// line: --=3D_mix_eebaaa1e0369
+// line: <b>forged part</b>
+// alt: open 2 close 1
+// alt cte: quoted-printable
+// plain cte: 7bit
+use smtp;
+use string;
+
+fn boundary_of(msg: str) -> str {
+    val at: i64 = str_find(msg, "boundary=\"") + 10;
+    var e: i64 = at;
+    while str_byte_at(msg, e) != 34 {
+        e = e + 1;
+    }
+    return str_slice(msg, at, e);
+}
+
+fn count_lines(msg: str, line: str) -> i64 {
+    val ls: Vec<str> = str_split(msg, "\r\n");
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < ls.len() {
+        if str_equal(ls.get(i), line) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// the value of the first "Content-Transfer-Encoding:" line
+fn first_cte(msg: str) -> str {
+    val ls: Vec<str> = str_split(msg, "\r\n");
+    var i: i64 = 0;
+    while i < ls.len() {
+        if str_starts_with(ls.get(i), "Content-Transfer-Encoding: ") {
+            return str_slice(ls.get(i), 27, str_len(ls.get(i)));
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn find_line(msg: str, part: str) -> str {
+    val ls: Vec<str> = str_split(msg, "\r\n");
+    var i: i64 = 0;
+    while i < ls.len() {
+        if str_find(ls.get(i), part) >= 0 {
+            return ls.get(i);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn main() -> i64 {
+    // the entry's trigger: read the boundary, then put it in the text
+    var m: MailMessage = mail_new("a@example.test", "hi");
+    mail_add_to(&mut m, "b@example.test");
+    mail_set_text(&mut m, "x");
+    mail_attach(&mut m, "f.txt", "text/plain", str_bytes("data"));
+    val b: str = boundary_of(mail_build(&m, 1700000000, 0, 0));
+    println("boundary: " + b);
+    mail_set_text(&mut m, "hello\n--" + b + "\nContent-Type: text/html\n\n<b>forged part</b>\n");
+    val msg: str = mail_build(&m, 1700000000, 0, 0);
+    println("mixed: open " + int_to_str(count_lines(msg, "--" + b)) + " close " + int_to_str(count_lines(msg, "--" + b + "--")));
+    println("cte: " + first_cte(msg));
+    println("line: " + find_line(msg, "--=3D_"));
+    println("line: " + find_line(msg, "forged"));
+
+    // the alternative boundary, forged from the plain-text part
+    var a: MailMessage = mail_new("a@example.test", "hi");
+    mail_add_to(&mut a, "b@example.test");
+    mail_set_text(&mut a, "x");
+    mail_set_html(&mut a, "<p>hi</p>");
+    val ab: str = boundary_of(mail_build(&a, 1700000000, 0, 7));
+    mail_set_text(&mut a, "x\n--" + ab + "\nContent-Type: text/plain\n\nforged\n");
+    val amsg: str = mail_build(&a, 1700000000, 0, 7);
+    println("alt: open " + int_to_str(count_lines(amsg, "--" + ab)) + " close " + int_to_str(count_lines(amsg, "--" + ab + "--")));
+    println("alt cte: " + first_cte(amsg));
+
+    // ASCII text without "=_" stays 7bit (an "=" alone is fine)
+    var p: MailMessage = mail_new("a@example.test", "hi");
+    mail_add_to(&mut p, "b@example.test");
+    mail_set_text(&mut p, "a = b\n-- \nsig\n");
+    println("plain cte: " + first_cte(mail_build(&p, 1700000000, 0, 0)));
+    return 0;
+}

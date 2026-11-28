@@ -1,0 +1,104 @@
+// BG316 (docs/roadmap/bugs-roadmap.md): tar_parse returns an error for a
+// header whose numeric field does not fit in i64 (a GNU base-256 size of
+// 2^88, a pax "size" of twenty digits, a pax record length that long)
+// instead of trapping on an integer overflow. tar_field_num gives -1 for
+// such a field; a base-256 size that fits is still read.
+//
+// Expected output:
+// bad size at 0
+// -1
+// bad size at 1024
+// bad pax header
+// 8589934592
+// truncated data at 512
+// ok 1 a 1
+use tar;
+use vec;
+
+// One file entry "a" holding "A", padded to whole blocks.
+fn one_file() -> Vec<i64> {
+    var data: Vec<i64> = Vec::new();
+    data.push(65);
+    return tar_header(&tar_file("a", data, 420));
+}
+
+fn with_data(h: Vec<i64>, data: str) -> Vec<i64> {
+    var out: Vec<i64> = h;
+    var i: i64 = 0;
+    while i < str_len(data) {
+        out.push(str_byte_at(data, i));
+        i = i + 1;
+    }
+    while out.len() % 512 != 0 {
+        out.push(0);
+    }
+    return out;
+}
+
+// A pax "x" header carrying `records`, then the file entry "a".
+fn pax_then_file(records: str) -> Vec<i64> {
+    var px: TarEntry = tar_entry("pax", TAR_PAX, 420, Vec::new());
+    var h: Vec<i64> = tar_header(&px);
+    tar_put_size(&mut h, str_len(records));
+    var out: Vec<i64> = with_data(h, records);
+    var f: Vec<i64> = one_file();
+    var i: i64 = 0;
+    while i < f.len() {
+        out.push(f.get(i));
+        i = i + 1;
+    }
+    out.push(65);
+    while out.len() % 512 != 0 {
+        out.push(0);
+    }
+    return out;
+}
+
+// Write `size` into the octal size field of the header at the start of `h`.
+fn tar_put_size(h: &mut Vec<i64>, size: i64) {
+    var i: i64 = 0;
+    var v: i64 = size;
+    while i < 11 {
+        h.set(124 + 10 - i, 48 + v % 8);
+        v = v / 8;
+        i = i + 1;
+    }
+    h.set(135, 0);
+    tar_fix_checksum(h);
+}
+
+fn main() -> i64 {
+    // the entry's trigger: base-256 size 0x80 then eleven 0xFF bytes
+    var h: Vec<i64> = one_file();
+    h.set(124, 128);
+    var i: i64 = 125;
+    while i < 136 {
+        h.set(i, 255);
+        i = i + 1;
+    }
+    tar_fix_checksum(&mut h);
+    var b: Vec<i64> = with_data(h, "A");
+    println(tar_parse(b).err);
+    println(f"{tar_field_num(&b, 124, 12)}");
+    // a pax size of twenty digits, and a pax record length that long
+    println(tar_parse(pax_then_file("29 size=99999999999999999999\n")).err);
+    println(tar_parse(pax_then_file("99999999999999999999 size=1\n")).err);
+    // a base-256 size that fits (2^33) is read, then found too long
+    var g: Vec<i64> = one_file();
+    i = 124;
+    while i < 136 {
+        g.set(i, 0);
+        i = i + 1;
+    }
+    g.set(124, 128);
+    g.set(131, 2);
+    tar_fix_checksum(&mut g);
+    var gb: Vec<i64> = with_data(g, "A");
+    println(f"{tar_field_num(&gb, 124, 12)}");
+    println(tar_parse(gb).err);
+    // an ordinary archive still reads
+    var ok: TarArchive = tar_parse(with_data(one_file(), "A"));
+    var e: TarEntry = ok.entries.get(0);
+    println(f"ok {ok.entries.len()} {e.name} {e.size}");
+    return 0;
+}

@@ -1,0 +1,77 @@
+// BG320 (docs/roadmap/bugs-roadmap.md): st_tensor gives found=false for a
+// shape whose element count does not fit in i64 (or does not match the
+// data), instead of trapping on an integer overflow, and data_offsets past
+// the file are refused the same way. A well-formed tensor still loads.
+//
+// Expected output:
+// open true
+// false
+// false
+// false
+// false
+// true 6 0
+// 2.5
+use safetensors;
+use vec;
+
+// A safetensors file: u64le header length, the JSON header, `data` bytes.
+fn st_file(header: str, data: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    var n: i64 = str_len(header);
+    var i: i64 = 0;
+    while i < 8 {
+        b.push((n >> (i * 8)) & 255);
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        b.push(str_byte_at(header, i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < data {
+        b.push(0);
+        i = i + 1;
+    }
+    return b;
+}
+
+fn found(header: str, data: i64) -> bool {
+    val b = st_file(header, data);
+    val s = st_open(b);
+    return st_tensor(b, s, "t").found;
+}
+
+fn yes_no(v: bool) -> str {
+    if v {
+        return "true";
+    }
+    return "false";
+}
+
+fn main() -> i64 {
+    // the entry's trigger
+    val h = "{\"t\":{\"dtype\":\"F32\",\"shape\":[4294967296,4294967296,4],\"data_offsets\":[0,4]}}";
+    val b = st_file(h, 4);
+    val s = st_open(b);
+    println("open " + yes_no(s.ok));
+    println(yes_no(st_tensor(b, s, "t").found));
+    // a product that wraps to the data's size, and one dimension too big
+    println(yes_no(found("{\"t\":{\"dtype\":\"U8\",\"shape\":[4294967296,4294967296,1],\"data_offsets\":[0,0]}}", 0)));
+    println(yes_no(found("{\"t\":{\"dtype\":\"F64\",\"shape\":[2305843009213693952],\"data_offsets\":[0,8]}}", 8)));
+    // data_offsets far past the file
+    println(yes_no(found("{\"t\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[9223372036854775806,9223372036854775807]}}", 1)));
+    // a well-formed F32 tensor of shape [2, 3] (24 bytes)
+    val g = st_file("{\"t\":{\"dtype\":\"F32\",\"shape\":[2,3],\"data_offsets\":[0,24]}}", 24);
+    var gb: Vec<i64> = g;
+    val gs = st_open(gb);
+    val t = st_tensor(gb, gs, "t");
+    println(yes_no(t.found) + f" {st_elems(t)} {t.data_end - t.data_begin - 24}");
+    // 2.5 as f32 is 0x40200000, little-endian at element 0
+    val off = t.data_begin;
+    gb.set(off + 2, 32);
+    gb.set(off + 3, 64);
+    val t2 = st_tensor(gb, gs, "t");
+    println(f"{st_f32(gb, t2, 0)}");
+    return 0;
+}

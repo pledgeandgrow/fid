@@ -3376,6 +3376,46 @@ fn pe_dbg_shown_for(names: Vec<str>) -> Vec<str> {
     return out;
 }
 
+/// BG243: per function of the next pe_add_dwarf's `names`, the calls
+/// inlined into it in nat_enc.fd g_nat_dbg_inl's format (pe_ir.fd
+/// peir_inl_note sets it for the call); empty: none.
+pub var g_pe_dwarf_inl: Vec<str> = Vec::new();
+
+/// BG243: `inl` with each callee under the name a debugger shows for it
+/// (g_pe_dbg_shown_pairs, as pe_dbg_shown_for does for the functions).
+fn pe_dbg_inl_shown(inl: Vec<str>) -> Vec<str> {
+    if g_pe_dbg_shown_pairs.len() == 0 {
+        return inl;
+    }
+    var idx: i64 = HashMap_new();
+    var k: i64 = 0;
+    while k + 1 < g_pe_dbg_shown_pairs.len() {
+        HashMap_insert(idx, g_pe_dbg_shown_pairs.get(k), k + 2);
+        k = k + 2;
+    }
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < inl.len() {
+        var lines: Vec<str> = str_split(inl.get(i), "\n");
+        var j: i64 = 0;
+        while j < lines.len() {
+            var p: Vec<str> = str_split(lines.get(j), "\t");
+            if p.len() >= 6 && p.get(0) == "I" {
+                var at: i64 = HashMap_get(idx, p.get(1));
+                if at > 0 {
+                    p.set(1, g_pe_dbg_shown_pairs.get(at - 1));
+                    lines.set(j, str_join(p, "\t"));
+                }
+            }
+            j = j + 1;
+        }
+        out.push(str_join(lines, "\n"));
+        i = i + 1;
+    }
+    HashMap_drop(idx);
+    return out;
+}
+
 /// N9: `image` (a pe_build_file image whose .text is `code`) with the
 /// DWARF of a debug build: .debug_abbrev, .debug_info (functions with
 /// their declaration lines, parameters, variables and types), .debug_line
@@ -3386,6 +3426,9 @@ fn pe_dbg_shown_for(names: Vec<str>) -> Vec<str> {
 /// CT9: a function shows under its name as written (`Point::len` for
 /// `Point_len`, `max<i64>` for `max__i64`) when g_pe_dbg_shown_pairs
 /// names it (pe_dbg_shown_for).
+/// BG243: the calls inlined into each function (g_pe_dwarf_inl, when it
+/// has an entry per name) become DW_TAG_inlined_subroutine entries of an
+/// abstract DW_TAG_subprogram per callee (nat_enc.fd g_nat_dbg_inl).
 pub fn pe_add_dwarf(image: Vec<i64>, code: Vec<i64>, names: Vec<str>, starts: Vec<i64>, ends: Vec<i64>, rows: Vec<i64>, file: str, vars: Vec<str>, types: Vec<str>) -> Vec<i64> {
     var line: Vec<i64> = pe_dwarf_line(file, rows);
     if vars.len() != names.len() {
@@ -3396,6 +3439,11 @@ pub fn pe_add_dwarf(image: Vec<i64>, code: Vec<i64>, names: Vec<str>, starts: Ve
     var old_types: Vec<str> = g_nat_dbg_types;
     var old_shown: Vec<str> = g_nat_dbg_shown;
     var old_files: Vec<str> = g_nat_line_files;
+    var old_inl: Vec<str> = g_nat_dbg_inl;
+    g_nat_dbg_inl = Vec::new();
+    if g_pe_dwarf_inl.len() == names.len() {
+        g_nat_dbg_inl = pe_dbg_inl_shown(g_pe_dwarf_inl);
+    }
     g_nat_dbg_ext = true;
     g_nat_dbg_vars = vars;
     g_nat_dbg_types = types;
@@ -3409,6 +3457,7 @@ pub fn pe_add_dwarf(image: Vec<i64>, code: Vec<i64>, names: Vec<str>, starts: Ve
     g_nat_dbg_types = old_types;
     g_nat_dbg_shown = old_shown;
     g_nat_line_files = old_files;
+    g_nat_dbg_inl = old_inl;
     var parts: Vec<Vec<i64>> = Vec::new();
     parts.push(dw.abbrev);
     parts.push(dw.info);

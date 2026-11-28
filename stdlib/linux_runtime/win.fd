@@ -279,6 +279,7 @@ fn pe_win_arg(cmd: i64, at: i64, out: i64) -> i64 {
 /// high in the address space: the runtime takes the 64 MB below it for the
 /// main thread's stack (its overflow test), and nothing else is there.
 pub fn pe_win_start() -> i64 {
+    pe_task_stack_commit = PE_WIN_STACK_COMMIT;
     pe_w(PE_W_CONSOLE_OUTPUT_CP, 65001, 0, 0, 0);
     var cmd: i64 = pe_w(PE_W_COMMAND_LINE, 0, 0, 0, 0);
     var args: Vec<i64> = Vec::new();
@@ -543,6 +544,11 @@ fn pe_win_open(path0: i64, flags: i64) -> i64 {
     var attr: i64 = pe_win_ld32(data);
     pert_free(data);
     if exists && (attr & 16) != 0 {
+        if (flags & 3) != 0 {
+            // BG427: a directory opened for writing is EISDIR, as on Linux
+            // (it opened for listing, and the write then failed unseen)
+            return 0 - 21;
+        }
         return pe_win_open_dir(path);
     }
     var acc: i64 = 2147483648;  // GENERIC_READ
@@ -627,33 +633,48 @@ fn pe_win_read(fd: i64, buf: i64, n: i64) -> i64 {
         return pe_win_recv(fd, buf, n);
     }
     var h: i64 = pe_win_handle(fd);
-    var got: i64 = pert_malloc(8);
-    pe_st(got, 0);
-    var ok: i64 = pe_w32(nat_win_call(PE_W_READ_FILE, h, buf, n, got, 0, 0, 0, 0, 0, 0));
-    var r: i64 = pe_win_ld32(got);
-    pert_free(got);
-    if ok == 0 {
-        var e: i64 = pe_w(PE_W_LAST_ERROR, 0, 0, 0, 0) & 4294967295;
-        if e == 109 || e == 38 {
-            return 0;
-        }  // BROKEN_PIPE, HANDLE_EOF
-        return 0 - 5;
-    }
-    // A console gives CR LF: the program sees LF, as on Linux
-    if r > 0 && (pe_w(PE_W_FILE_TYPE, h, 0, 0, 0) & 4294967295) == 2 {
-        var j: i64 = 0;
-        var i: i64 = 0;
-        while i < r {
-            var c: i64 = pe_ldb(buf + i);
-            if c != 13 {
-                pe_stb(buf + j, c);
-                j = j + 1;
-            }
-            i = i + 1;
+    while true {
+        var got: i64 = pert_malloc(8);
+        pe_st(got, 0);
+        var ok: i64 = pe_w32(nat_win_call(PE_W_READ_FILE, h, buf, n, got, 0, 0, 0, 0, 0, 0));
+        var r: i64 = pe_win_ld32(got);
+        pert_free(got);
+        if ok == 0 {
+            var e: i64 = pe_w(PE_W_LAST_ERROR, 0, 0, 0, 0) & 4294967295;
+            if e == 109 || e == 38 {
+                return 0;
+            }  // BROKEN_PIPE, HANDLE_EOF
+            return 0 - 5;
         }
-        r = j;
+        // A console gives CR LF: the program sees LF, as on Linux
+        if r > 0 && (pe_w(PE_W_FILE_TYPE, h, 0, 0, 0) & 4294967295) == 2 {
+            r = pe_win_drop_cr(buf, r);
+            // BG207: a read of nothing but CRs (read_line asks for one
+            // byte at a time: the CR of "abc\r\n" alone) is not the end of
+            // the input, which 0 says: read on (the LF follows)
+            if r == 0 {
+                continue;
+            }
+        }
+        return r;
     }
-    return r;
+    return 0;
+}
+
+/// A console read's `r` bytes at buf with the CR bytes taken out (BG207):
+/// how many are left.
+fn pe_win_drop_cr(buf: i64, r: i64) -> i64 {
+    var j: i64 = 0;
+    var i: i64 = 0;
+    while i < r {
+        var c: i64 = pe_ldb(buf + i);
+        if c != 13 {
+            pe_stb(buf + j, c);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return j;
 }
 
 fn pe_win_write(fd: i64, buf: i64, n: i64) -> i64 {
@@ -967,6 +988,11 @@ fn pe_win_sh(cmd: i64) -> i64 {
     pe_st(code, 0);
     pe_w(PE_W_EXIT_CODE, hp, code, 0, 0);
     var r: i64 = pe_win_ld32(code);
+    if r >= 2147483648 {
+        // BG468: the DWORD as C's system() / pe_ir give it, a signed int:
+        // `exit -1` is -1, an access violation -1073741819
+        r = r - 4294967296;
+    }
     pert_free(code);
     pe_w(PE_W_CLOSE_HANDLE, hp, 0, 0, 0);
     pe_w(PE_W_CLOSE_HANDLE, pe_ld(pi + 8), 0, 0, 0);
@@ -1381,6 +1407,24 @@ fn pe_win_cpus() -> i64 {
     return n;
 }
 
+// BG251: kernel32 functions a program declares in an `extern "C"` block
+// that names no library (stdlib/sys.fd: <windows.h>'s, which pe_ir imports
+// from kernel32.dll). This backend takes such a block for the C library's
+// (msvcrt.dll, nat_enc.fd nat_pe_dll_for), which has none of them: the
+// runtime makes the calls itself, through its own kernel32 imports.
+
+pub fn pert_c_GetSystemInfo(info: i64) {
+    pe_w(PE_W_SYSTEM_INFO, info, 0, 0, 0);
+}
+
+pub fn pert_c_GlobalMemoryStatusEx(info: i64) -> i64 {
+    return pe_w32(pe_w(PE_W_MEMORY_STATUS, info, 0, 0, 0));
+}
+
+pub fn pert_c_GetCurrentProcessId() -> i64 {
+    return pe_w(PE_W_PROCESS_ID, 0, 0, 0, 0) & 4294967295;
+}
+
 fn pe_win_affinity(size: i64, mask: i64) -> i64 {
     var n: i64 = pe_win_cpus();
     pe_zero(mask, size);
@@ -1421,6 +1465,36 @@ fn pe_win_old_word() -> i64 {
     }
     return pe_win_prot_old;
 }
+
+/// BG249: a task's stack of `size` bytes (conc.fd pe_task_stack_new): the
+/// whole mapping reserved, PE_WIN_STACK_COMMIT bytes at its top committed and
+/// a PAGE_GUARD page under them, as pe_runtime's pe_ctx_stack makes one.
+/// With the TEB's StackBase, StackLimit (the committed part's bottom) and
+/// DeallocationStack (the mapping) set for it, the system grows it as a
+/// thread's stack: each touch of the guard page commits it and puts the
+/// guard on the page under it, and near the bottom it raises STACK_OVERFLOW
+/// (pe_win_on_exception: an overflow into the task's guard region).
+/// -12 (ENOMEM) when the system refuses.
+fn pe_win_task_stack(size: i64) -> i64 {
+    var m: i64 = pe_w(PE_W_VIRTUAL_ALLOC, 0, size, 8192, 4);  // MEM_RESERVE
+    if m == 0 {
+        return 0 - 12;
+    }
+    var top: i64 = m + size;
+    if pe_w(PE_W_VIRTUAL_ALLOC, top - PE_WIN_STACK_COMMIT, PE_WIN_STACK_COMMIT, 4096, 4) == 0 {
+        pe_w(PE_W_VIRTUAL_FREE, m, 0, 32768, 0);
+        return 0 - 12;
+    }
+    // the guard page: committed PAGE_READWRITE | PAGE_GUARD
+    if pe_w(PE_W_VIRTUAL_ALLOC, top - PE_WIN_STACK_COMMIT - 4096, 4096, 4096, 260) == 0 {
+        pe_w(PE_W_VIRTUAL_FREE, m, 0, 32768, 0);
+        return 0 - 12;
+    }
+    return m;
+}
+
+/// BG249: what a task's stack has committed when it is made (its top).
+const PE_WIN_STACK_COMMIT: i64 = 16384;
 
 fn pe_win_mprotect(addr: i64, len: i64, prot: i64) -> i64 {
     // The runtime's guard regions (PROT_NONE under a stack): read/write with
@@ -1879,7 +1953,10 @@ pub fn pe_win_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) ->
         return 0;
     }
     if n == 276 || n == 38 {  // renameat2, renameat
-        if pe_w32(pe_w(PE_W_MOVE_FILE, b, d, 3, 0)) == 0 {
+        // BG340: MOVEFILE_COPY_ALLOWED (2) without REPLACE_EXISTING: an
+        // existing target makes the rename fail, as the C runtime's
+        // rename() and pe_ir's do on Windows
+        if pe_w32(pe_w(PE_W_MOVE_FILE, b, d, 2, 0)) == 0 {
             return pe_win_errno();
         }
         return 0;
@@ -1897,6 +1974,9 @@ pub fn pe_win_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) ->
             pe_w(PE_W_EXIT_PROCESS, 1, 0, 0, 0);
         }
         return a;
+    }
+    if n == 222 && (d & PE_MMAP_TASK_STACK) != 0 {  // a task's stack (BG249)
+        return pe_win_task_stack(b);
     }
     if n == 222 {  // mmap
         var m: i64 = pe_w(PE_W_VIRTUAL_ALLOC, 0, b, 12288, 4);

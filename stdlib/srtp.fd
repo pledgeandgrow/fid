@@ -306,6 +306,21 @@ pub fn srtp_context_new(profile: i64, master_key: Vec<i64>, master_salt: Vec<i64
 }
 
 // the slot of an SSRC, made on first use
+/// The slot of an SSRC, or -1 when it has none (no state is created).
+fn srp_find(c: &SrtpContext, ssrc: i64) -> i64 {
+    var i: i64 = 0;
+    while i < c.ssrcs.len() {
+        if c.ssrcs.get(i) == ssrc {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+/// The slot of an SSRC, created when it has none. The unprotect functions
+/// call it only once a packet authenticates, so forged packets with new
+/// SSRCs leave no state behind.
 fn srp_slot(c: &mut SrtpContext, ssrc: i64) -> i64 {
     var i: i64 = 0;
     while i < c.ssrcs.len() {
@@ -504,21 +519,28 @@ pub fn srtp_unprotect(c: &mut SrtpContext, pkt: Vec<i64>) -> SrtpResult {
     }
     val seq: i64 = (pkt.get(2) << 8) | pkt.get(3);
     val ssrc: i64 = srp_u32(&pkt, 8);
-    val k: i64 = srp_slot(c, ssrc);
-    var v: i64 = c.rocs.get(k);
-    if c.started.get(k) != 0 {
-        v = srtp_estimate_roc(c.rocs.get(k), c.seqs.get(k), seq);
+    // look up without creating: an unknown SSRC starts at ROC 0 with an
+    // empty replay window, and gets a slot only if the packet authenticates
+    val known: i64 = srp_find(c, ssrc);
+    var v: i64 = 0;
+    if known >= 0 {
+        v = c.rocs.get(known);
+        if c.started.get(known) != 0 {
+            v = srtp_estimate_roc(c.rocs.get(known), c.seqs.get(known), seq);
+        }
     }
     if v < 0 {
         return srp_fail("too old");
     }
     val index: i64 = v * 65536 + seq;
-    val rs: i64 = srp_replay_state(c.tops.get(k), &c.wins.get(k), index);
-    if rs == 1 {
-        return srp_fail("replayed");
-    }
-    if rs == 2 {
-        return srp_fail("too old");
+    if known >= 0 {
+        val rs: i64 = srp_replay_state(c.tops.get(known), &c.wins.get(known), index);
+        if rs == 1 {
+            return srp_fail("replayed");
+        }
+        if rs == 2 {
+            return srp_fail("too old");
+        }
     }
     val head: Vec<i64> = srp_slice(&pkt, 0, hl);
     var out: Vec<i64> = head;
@@ -539,6 +561,7 @@ pub fn srtp_unprotect(c: &mut SrtpContext, pkt: Vec<i64>) -> SrtpResult {
         srp_append(&mut out, &pt);
     }
     // update the replay window and the ROC / s_l
+    val k: i64 = srp_slot(c, ssrc);
     var w: Vec<i64> = c.wins.get(k);
     w.set(index % SRP_WINDOW, index);
     c.wins.set(k, w);
@@ -644,7 +667,7 @@ pub fn srtcp_unprotect(c: &mut SrtpContext, pkt: Vec<i64>) -> SrtpResult {
         return srp_fail("not an SRTCP packet");
     }
     val ssrc: i64 = srp_u32(&pkt, 4);
-    val k: i64 = srp_slot(c, ssrc);
+    val known: i64 = srp_find(c, ssrc);
     var out: Vec<i64> = srp_slice(&pkt, 0, 8);
     var eword: i64 = 0;
     var index: i64 = 0;
@@ -660,12 +683,14 @@ pub fn srtcp_unprotect(c: &mut SrtpContext, pkt: Vec<i64>) -> SrtpResult {
         index = eword & 2147483647;
         encrypted = (eword & 2147483648) != 0;
     }
-    val rs: i64 = srp_replay_state(c.rtcp_tops.get(k), &c.rtcp_wins.get(k), index);
-    if rs == 1 {
-        return srp_fail("replayed");
-    }
-    if rs == 2 {
-        return srp_fail("too old");
+    if known >= 0 {
+        val rs: i64 = srp_replay_state(c.rtcp_tops.get(known), &c.rtcp_wins.get(known), index);
+        if rs == 1 {
+            return srp_fail("replayed");
+        }
+        if rs == 2 {
+            return srp_fail("too old");
+        }
     }
     var trailer: Vec<i64> = Vec::new();
     srp_put32(&mut trailer, eword);
@@ -704,6 +729,7 @@ pub fn srtcp_unprotect(c: &mut SrtpContext, pkt: Vec<i64>) -> SrtpResult {
             srp_append(&mut out, &body);
         }
     }
+    val k: i64 = srp_slot(c, ssrc);
     var w: Vec<i64> = c.rtcp_wins.get(k);
     w.set(index % SRP_WINDOW, index);
     c.rtcp_wins.set(k, w);

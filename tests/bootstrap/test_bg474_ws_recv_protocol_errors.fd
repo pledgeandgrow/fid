@@ -1,0 +1,103 @@
+// Bugs roadmap BG474: stdlib/ws.fd ws_recv accepted frames RFC 6455 says
+// fail the connection (RSV bits, reserved opcodes, fragmented or long
+// control frames, unmasked client frames, invalid UTF-8 in a text
+// message) and merged two messages into one when a new data frame came
+// inside a fragmented message (§5.4). Each now gives opcode -1. The bytes
+// are served through ws_set_tls's hooks (a fake TLS session), no socket.
+//
+// Expected output:
+// good 1 abc
+// fragmented 1 abcxy
+// interleaved -1
+// unmasked to server -1
+// masked to client -1
+// rsv1 -1
+// opcode 3 -1
+// ping not fin -1
+// ping 126 bytes -1
+// lone continuation -1
+// bad utf8 -1
+// ping first 9
+
+use ws;
+
+var g_feed: str = "";
+var g_pos: i64 = 0;
+
+fn hexval(c: i64) -> i64 {
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    return c - 97 + 10;
+}
+
+fn fake_recv(tls: i64, buf: i64, n: i64, timeout_ms: i64) -> i64 {
+    var got: i64 = 0;
+    while got < n && g_pos + 1 < str_len(g_feed) {
+        val b: i64 = hexval(str_byte_at(g_feed, g_pos)) * 16 + hexval(str_byte_at(g_feed, g_pos + 1));
+        p_volatile_store8(buf + got, b);
+        g_pos = g_pos + 2;
+        got = got + 1;
+    }
+    if got == 0 {
+        return -1;
+    }
+    return got;
+}
+
+fn fake_send(tls: i64, buf: i64, n: i64) -> i64 {
+    return n;
+}
+
+fn fake_close(tls: i64) -> i64 {
+    return 0;
+}
+
+// The frame ws_recv reads from `hex`, on the server side (client = false)
+// or the client side.
+fn recv_hex(hex: str, client: bool) -> WsFrame {
+    g_feed = hex;
+    g_pos = 0;
+    val c: WsConn = WsConn {
+        fd: 5, is_client: client, open: true, tls: 1
+    };
+    return ws_recv(c);
+}
+
+fn main() {
+    ws_set_tls(fake_recv, fake_send, fake_close);
+    // masked text "abc" to a server, mask key 00000000
+    val f1: WsFrame = recv_hex("818300000000616263", false);
+    println(f"good {f1.opcode} {f1.text}");
+    // text FIN=0 "abc", then continuation FIN=1 "xy" (masked, zero key)
+    val f2: WsFrame = recv_hex("0183000000006162638082000000007879", false);
+    println(f"fragmented {f2.opcode} {f2.text}");
+    // text FIN=0 "abc", then a new binary frame FIN=1 "xy": two messages
+    val f3: WsFrame = recv_hex("0183000000006162638282000000007879", false);
+    println(f"interleaved {f3.opcode}");
+    // the bug's trigger: unmasked frames to a server
+    val f4: WsFrame = recv_hex("01036162638202787" + "9", false);
+    println(f"unmasked to server {f4.opcode}");
+    val f5: WsFrame = recv_hex("818300000000616263", true);
+    println(f"masked to client {f5.opcode}");
+    val f6: WsFrame = recv_hex("c103616263", true);
+    println(f"rsv1 {f6.opcode}");
+    val f7: WsFrame = recv_hex("8303616263", true);
+    println(f"opcode 3 {f7.opcode}");
+    val f8: WsFrame = recv_hex("0900", true);
+    println(f"ping not fin {f8.opcode}");
+    var big: str = "897e007e";
+    var k: i64 = 0;
+    while k < 126 {
+        big = big + "61";
+        k = k + 1;
+    }
+    val f9: WsFrame = recv_hex(big, true);
+    println(f"ping 126 bytes {f9.opcode}");
+    val f10: WsFrame = recv_hex("8003616263", true);
+    println(f"lone continuation {f10.opcode}");
+    val f11: WsFrame = recv_hex("8102c328", true);
+    println(f"bad utf8 {f11.opcode}");
+    val f12: WsFrame = recv_hex("89026869", true);
+    println(f"ping first {f12.opcode}");
+}

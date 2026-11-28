@@ -1,0 +1,51 @@
+// Bugs roadmap BG392: every call of a user `impl` method returning a str
+// or a Vec leaked the returned value (bound or used as a temporary), and so
+// did StringBuilder.to_str(): impl methods' result types were registered
+// under their bare names only, while the call is emitted under the mangled
+// `Type_method`, so Lowerer_rc_note_call found no type and the result was no
+// temporary of its statement. compiler/lower.fd Lowerer_reg_method_ret
+// registers the mangled name too.
+// Leak gate: `fid run tests/bootstrap/test_bg392_method_owned_result.fd
+// --leaks` must report "every block was freed".
+//
+// Expected output:
+// P5
+// P5
+// P5
+// q
+// 2
+// 3
+
+struct P { x: i64 }
+
+impl P {
+    fn name(self: &P) -> str {
+        return f"P{self.x}";
+    }
+    fn items(self: &P) -> Vec<i64> {
+        var v: Vec<i64> = Vec::new();
+        v.push(self.x);
+        v.push(self.x + 1);
+        return v;
+    }
+}
+
+fn pname(p: &P) -> str {
+    return f"P{p.x}";
+}
+
+fn main() {
+    val p = P { x: 5 };
+    val a: str = p.name();
+    println(a);
+    println(p.name());
+    val b: str = pname(&p);
+    println(b);
+    var sb = StringBuilder::new();
+    sb.append_str("q");
+    val d: str = sb.to_str();
+    println(d);
+    val v = p.items();
+    println(v.len());
+    println(p.items().len() + 1);
+}

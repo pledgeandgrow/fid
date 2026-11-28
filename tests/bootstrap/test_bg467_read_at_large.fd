@@ -1,0 +1,89 @@
+// BG467 (docs/roadmap/bugs-roadmap.md): under `fid run`, p_file_read_at
+// (stdlib/fs.fd's streaming File reads) read the whole file with
+// p_file_read_bytes, 8 bytes of memory per file byte, and then took the
+// slice: reading 10 bytes near the end of a 3 GiB file panicked "out of
+// memory". It now reads only the bytes asked for, through the host's
+// p_file_read_at, as every compiled backend does. Here the bytes a window
+// gives are checked on a 100 KB file (the 3 GiB case, a sparse file, is
+// tests/tooling/bg467-read-at-large-check.sh): windows, the last bytes,
+// past the end, a negative offset and n = 0.
+//
+// Expected output:
+// size 100000
+// at 0: 0,1,2
+// at 99998: 100,101
+// at 100000: 0
+// at 5000000: 0
+// at -1: 0
+// n 0: 0
+// sum 213760
+
+/// The runtime's Vec taken as a raw word and freed here (as
+/// test_file_read_at.fd).
+fn read_at(path: str, off: i64, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val raw: i64 = p_file_read_at(path, off, n) as i64;
+    if raw == 0 {
+        return out;
+    }
+    val len: i64 = Vec_len(raw);
+    var i: i64 = 0;
+    while i < len {
+        out.push(Vec_get(raw, i));
+        i = i + 1;
+    }
+    Vec_drop(raw);
+    return out;
+}
+
+fn show(v: & Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        if i > 0 {
+            s = s + ",";
+        }
+        s = s + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    val path: str = "tests/test_bg467_read_at_large.tmp";
+    p_file_delete(path);
+    var data: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 100000 {
+        data.push(i % 251);
+        i = i + 1;
+    }
+    p_file_write_vec(path, data);
+    println("size " + int_to_str(p_file_size(path)));
+    val a: Vec<i64> = read_at(path, 0, 3);
+    println("at 0: " + show(& a));
+    val b: Vec<i64> = read_at(path, 99998, 10);
+    println("at 99998: " + show(& b));
+    val c: Vec<i64> = read_at(path, 100000, 10);
+    println("at 100000: " + int_to_str(c.len()));
+    val d: Vec<i64> = read_at(path, 5000000, 10);
+    println("at 5000000: " + int_to_str(d.len()));
+    val e: Vec<i64> = read_at(path, 0 - 1, 10);
+    println("at -1: " + int_to_str(e.len()));
+    val f: Vec<i64> = read_at(path, 10, 0);
+    println("n 0: " + int_to_str(f.len()));
+    // 20 windows of 100 bytes, as a streaming reader takes them
+    var sum: i64 = 0;
+    var w: i64 = 0;
+    while w < 20 {
+        val part: Vec<i64> = read_at(path, w * 1000, 100);
+        var j: i64 = 0;
+        while j < part.len() {
+            sum = sum + part.get(j);
+            j = j + 1;
+        }
+        w = w + 1;
+    }
+    println("sum " + int_to_str(sum));
+    p_file_delete(path);
+}

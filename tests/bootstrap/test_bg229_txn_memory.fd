@@ -1,0 +1,91 @@
+// Bugs roadmap BG229: under `fid run` each txn { } entered pushed a full
+// copy of the interpreter's memory (interp.fd Inst::TxnBegin,
+// Memory_clone: at least 8 MB of the host's per txn, more with a large
+// heap), and a `return` out of a txn skipped its TxnEnd, so that copy was
+// never let go: 228 MB at 30 txns, 2,277 MB at 300 next to a 20,000-element
+// Vec. Now a txn keeps a write log of the bytes it changes (Memory_put,
+// Memory_tx_rollback), and a call that leaves a txn without its TxnEnd
+// closes it (Interpreter_txn_unwind). The 2,000 txns and 2,000 returns out
+// of one below needed about 30 GB before (run it on an older fid with
+// care); C and native never copied anything.
+//
+// Expected output:
+// 20000 199990000
+// 2000 2000
+// 2000
+// 160 abort kept
+// 20000 199990000
+
+fn early(n: i64, v: &mut Vec<i64>, i: i64) -> i64 {
+    var k: i64 = n;
+    txn {
+        k = k + 1;
+        v.set(i % v.len(), v.get(i % v.len()));
+        if k > 0 {
+            return k;
+        }
+    }
+    return 0 - k;
+}
+
+fn sum(v: &Vec<i64>) -> i64 {
+    var s: i64 = 0;
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + v.get(i);
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i64 {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 20000 {
+        v.push(i);
+        i = i + 1;
+    }
+    println(int_to_str(v.len()) + " " + int_to_str(sum(&v)));
+
+    // many txns next to a large heap, each writing a little
+    var n: i64 = 0;
+    var w: i64 = 0;
+    i = 0;
+    while i < 2000 {
+        txn {
+            n = n + 1;
+            v.set(i, v.get(i));
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+    println(int_to_str(n) + " " + int_to_str(w));
+
+    // a return out of a txn, 2,000 times
+    var r: i64 = 0;
+    i = 0;
+    while i < 2000 {
+        r = r + early(0, &mut v, i);
+        i = i + 1;
+    }
+    println(r);
+
+    // an abort still puts the locals back
+    var m: i64 = 100;
+    txn {
+        m = m + 50;
+        txn {
+            m = m + 1000;
+            abort;
+        }
+        m = m + 10;
+    }
+    var s: str = "kept";
+    txn {
+        s = "lost";
+        abort;
+    }
+    println(int_to_str(m) + " abort " + s);
+    println(int_to_str(v.len()) + " " + int_to_str(sum(&v)));
+    return 0;
+}

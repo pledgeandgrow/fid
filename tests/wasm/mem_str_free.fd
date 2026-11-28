@@ -1,0 +1,51 @@
+// XT31: the strings the runtime makes are freed with their last owner.
+// The Linux runtime's `-> str` builtins returned an i64 (a local, or an
+// i64 call such as pe_dup): the return counted the caller as a second
+// owner, so int_to_str, float_to_str, a file's text, ... were never freed
+// under `fid wasm` and the machine layer (`emit --nat`, the Linux
+// targets): this loop grew the memory by about 100 MB. Now each string
+// goes back to the allocator (base.fd p_str_give) and the memory stays
+// at its first chunks. tests/wasm/memory-check.sh runs it in an empty
+// folder and checks the output and that the memory at exit stays under
+// 32 MB (it was 332 MB).
+//
+// Expected output:
+// n 0
+// total 13778890
+// read 122880000
+
+fn main() -> i64 {
+    var i: i64 = 0;
+    var n: i64 = 0;
+    var total: i64 = 0;
+    while i < 1000000 {
+        if str_len(int_to_str(i)) > 100 {
+            n = n + 1;
+        }
+        val f: str = float_to_str((i as f64) + 0.5);
+        total = total + str_len(f);
+        val t: str = str_trim("  " + int_to_str(i % 1000) + "  ");
+        total = total + str_len(t);
+        total = total + str_len(str_to_upper("ab" + int_to_str(i % 10)));
+        i = i + 1;
+    }
+    println("n " + int_to_str(n));
+    println("total " + int_to_str(total));
+    // a file's text (p_file_read), 30,000 times
+    p_file_write("xt31_text.txt", str_repeat("t", 4096));
+    var read: i64 = 0;
+    i = 0;
+    while i < 30000 {
+        match read_file("xt31_text.txt") {
+            Option::Some(t) => {
+                read = read + str_len(t);
+            }
+            Option::None => {
+            }
+        }
+        i = i + 1;
+    }
+    p_file_delete("xt31_text.txt");
+    println("read " + int_to_str(read));
+    return 0;
+}

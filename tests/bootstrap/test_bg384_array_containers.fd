@@ -1,0 +1,66 @@
+// Bugs roadmap BG384: an array value pushed into a Vec<[T; N]>, put in an
+// enum payload or captured by a closure kept only the address of the local
+// array: lost or garbage after the function returned or the loop went on.
+// compiler/lower.fd: an array element is stored in the Vec's buffer as a
+// struct is (Lowerer_box_vec_element, Vec_push_mem), an enum payload and a
+// closure capture keep a heap copy (Lowerer_arr_heap_copy).
+//
+// Expected output:
+// 210
+// 14
+// 12
+// 14
+// 15
+
+enum E {
+    A([i64; 3]),
+    B
+}
+
+fn mkv() -> Vec<[i64; 3]> {
+    var v: Vec<[i64; 3]> = Vec::new();
+    var i = 0;
+    while i < 3 {
+        val a: [i64; 3] = [i, i * 10, i * 100];
+        v.push(a);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn mke(k: i64) -> E {
+    val a: [i64; 3] = [k, k + 1, k + 2];
+    return E::A(a);
+}
+
+fn mka(k: i64) -> fn(i64) -> i64 {
+    val a: [i64; 3] = [k, k * 2, k * 3];
+    return fn(i: i64) -> i64 {
+        return a[i];
+    };
+}
+
+fn clobber() -> i64 {
+    var z: [i64; 8] = [7, 7, 7, 7, 7, 7, 7, 7];
+    return z[0] + z[7];
+}
+
+fn main() {
+    val v = mkv();
+    val x = v.get(1);
+    val y = v.get(2);
+    println(x[1] + y[2]);
+    val e = mke(5);
+    println(clobber());
+    match e {
+        E::A(a) => {
+            println(a[0] + a[2]);
+        }
+        E::B => {
+            println(0);
+        }
+    }
+    val h = mka(5);
+    println(clobber());
+    println(h(2));
+}

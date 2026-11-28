@@ -1,0 +1,48 @@
+// Bugs roadmap BG369: a `[T; N]` struct field (and a tuple element) held
+// the address of the array's stack data: a struct built with an array
+// literal and returned read the callee's dead frame, and copies of the
+// struct shared the elements. compiler/lower.fd: a struct literal, a field
+// assignment and a tuple literal keep a heap copy of the array of their own
+// (Lowerer_arr_heap_copy), and `var q = s.a` copies the elements into q's
+// buffer (Lowerer_lower_let_stmt). Reference §8.1: arrays are values.
+// (The heap copies are not freed yet: a struct does not own its array.)
+//
+// Expected output:
+// 14
+// 5
+// 2
+// 2
+// 14
+// 12
+
+struct S { a: [i64; 4], n: i64 }
+
+fn mk() -> S {
+    return S { a: [1, 2, 3, 4], n: 9 };
+}
+
+fn clobber() -> i64 {
+    var z: [i64; 8] = [7, 7, 7, 7, 7, 7, 7, 7];
+    return z[0] + z[7];
+}
+
+fn tup(k: i64) -> ([i64; 2], i64) {
+    val a: [i64; 2] = [k, k + 1];
+    return (a, 5);
+}
+
+fn main() {
+    val s0 = mk();
+    println(clobber());
+    println(s0.a[0] + s0.a[3]);
+    var s = S { a: [1, 2, 3, 4], n: 9 };
+    var s2 = s;
+    var q = s2.a;
+    q[1] = 50;
+    println(s2.a[1]);
+    s2.a = q;
+    println(s.a[1]);
+    val (x, y) = tup(3);
+    println(clobber());
+    println(x[0] + x[1] + y);
+}

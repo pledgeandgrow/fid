@@ -1,0 +1,29 @@
+// Bugs roadmap BG426: under `fid run` a string the interpreter holds became,
+// in its memory, a copy headed [P_STR_MAGIC][len], which core's p_str_adopt
+// and p_str_take took for a C string and copied up to its first zero byte
+// (p_str_from_ptr). Strings are counted (reference §1.8): the raw result of
+// p_file_read keeps all 5 bytes through p_str_take and p_str_adopt.
+//
+// Expected output:
+// 5
+// 5 99 100
+// 5 99 100
+fn main() {
+    p_file_write("bg426_take.dat", "ab\0cd");
+    println(f"{p_file_size("bg426_take.dat")}");
+    var r: i64 = p_file_read("bg426_take.dat");
+    var t: str = "";
+    // SAFETY: r is p_file_read's result for a file just written (not 0);
+    // p_str_take gives t an owner of its own
+    unsafe {
+        t = p_str_take(r);
+    }
+    println(f"{str_len(t)} {str_byte_at(t, 3)} {str_byte_at(t, 4)}");
+    var a: str = "";
+    // SAFETY: p_str_adopt takes over r, which nothing else uses after this
+    unsafe {
+        a = p_str_adopt(r);
+    }
+    println(f"{str_len(a)} {str_byte_at(a, 3)} {str_byte_at(a, 4)}");
+    p_file_delete("bg426_take.dat");
+}

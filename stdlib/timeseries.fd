@@ -305,6 +305,17 @@ fn ts_sext(v: i64, n: i64) -> i64 {
     return v;
 }
 
+// A delta-of-delta of an n-bit bucket: the encoder's ranges are the
+// paper's [-63, 64], [-255, 256], [-2047, 2048], so the bit pattern that
+// sign-extends to -2^(n-1) is +2^(n-1) (BG402).
+fn ts_dod_bits(v: i64, n: i64) -> i64 {
+    val d: i64 = ts_sext(v, n);
+    if d == 0 - (1 << (n - 1)) {
+        return 1 << (n - 1);
+    }
+    return d;
+}
+
 // ─── Gorilla ─────────────────────────────────────────────────────────────
 
 /// A compressed block that points can be appended to.
@@ -446,11 +457,11 @@ pub fn ts_gorilla_decode(b: Vec<i64>) -> TsDecoded {
         var dod: i64 = 0;
         if ts_bits_get(&mut r, 1) == 1 {
             if ts_bits_get(&mut r, 1) == 0 {
-                dod = ts_sext(ts_bits_get(&mut r, 7), 7);
+                dod = ts_dod_bits(ts_bits_get(&mut r, 7), 7);
             } else if ts_bits_get(&mut r, 1) == 0 {
-                dod = ts_sext(ts_bits_get(&mut r, 9), 9);
+                dod = ts_dod_bits(ts_bits_get(&mut r, 9), 9);
             } else if ts_bits_get(&mut r, 1) == 0 {
-                dod = ts_sext(ts_bits_get(&mut r, 12), 12);
+                dod = ts_dod_bits(ts_bits_get(&mut r, 12), 12);
             } else {
                 dod = ts_bits_get(&mut r, 64);
             }

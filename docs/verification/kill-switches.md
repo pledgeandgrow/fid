@@ -217,14 +217,15 @@ macOS targets and `--nat` Windows) and by the rule passes it runs
 | `FID_NAT_OFF=dbgscopes` | lexical scopes in the debug info for a name bound more than once (DB4) |
 | `FID_NAT_OFF=dbgbraces` | a scope runs to its block's `}` (DB4); off: only the lines that define or read it |
 | `FID_NAT_OFF=dbgranges` | the code ranges where each variable is live (CT6); off: the whole function |
+| `FID_NAT_OFF=dbghold` | a value held in a register stays in the location lists past its last use, until the register is written (BG245); off: where it is live only |
 | `FID_NAT_OFF=unwind` | `--nat` Windows: .pdata / .xdata, the exception directory debuggers, profilers and the dispatcher walk (DB6) |
 | `FID_NAT_OFF=wxsplit` | Linux: the data on pages of its own (read/execute .text, read/write .data) instead of one RWX segment |
 | `FID_NAT_OFF=ldyn` | C functions imported through the dynamic linker (TG15: ELF dynamic section, dyld GOT slots, `--nat` Windows IAT) |
 | `FID_NAT_OFF=pie` | a position-independent Linux executable (TG14); wins over `--pie` and `FID_NAT_ON=pie` |
 | `FID_NAT_OFF=rvc` | RISC-V 2-byte instructions (TG9/TG19; on by default with every `--cpu` but `rv64g`) |
 | `FID_NAT_OFF=relink` | the function cache (SP7): functions put back in the kept layout; off: the layout is not kept. Since Nov 27 relinking is asked for (`fid serve --relink` or `FID_NAT_ON=relink`): a kept layout is not the image a one-shot build makes (SP8) |
-| `FID_NAT_OFF=ncnarrow` | the function cache (SP6): a hit that no longer fits is given up alone, its callers checked against it in the next attempt (up to 8, each replaying what the earlier ones compiled); off: it and every entry that recorded anything of it are given up, transitively, in at most two attempts |
 | `FID_NAT_OFF=fnalign` | the function cache (SP6): a function with a padded loop head starts on the loop alignment, so its bytes do not depend on where it lands (compiler/nat_ir.fd `ng_fn_start_align`); off: every function on the function alignment, and the cache gives up a hit placed at another phase (`nc_pos16`) |
+| `FID_NAT_OFF=ncnarrow` | the function cache (SP6): a hit that no longer fits is given up alone, its callers checked against it in the next attempt (up to 8, each replaying what the earlier ones compiled); off: it and every entry that recorded anything of it are given up, transitively, in at most two attempts |
 
 Note `forward` is two passes: egraph.fd's (`FID_NAT_OFF=forward`) and
 iropt_me.fd's LF6 (`FID_IROPT_OFF=forward`); both are on by default.
@@ -246,6 +247,7 @@ its per-function cache key):
 | `FID_PE_OFF=tail` | sibling tail calls (OP13) |
 | `FID_PE_OFF=layout` | block layout with cold blocks last (OP15) |
 | `FID_PE_OFF=dbgvars` | variables, types and frames in the debug information (N9; line tables and functions stay) |
+| `FID_PE_OFF=dbginl` | a debug build's inlined calls (BG243): the nops that keep line rows for an inlined body folded away, and the DW_TAG_inlined_subroutine entries |
 
 ## Opt-in parts of the backend
 
@@ -363,6 +365,9 @@ Other run-time switches:
 |----------|--------------|
 | `FID_SWITCH=off` (or `0`) | no `Switch` instructions are formed from compare chains (compiler/ir.fd `ir_switch_on`) |
 | `FID_WASM_SWITCH=1` | `fid wasm`: every function keeps the switch loop instead of structured control flow (TG16) |
+| `FID_NAT_OFF=wpromote` | `fid wasm`: every Alloca stays in the frame (XT39 keeps an Alloca only loaded and stored, at one width, in a local; compiler/wasm.fd "Allocas in locals") |
+| `FID_NAT_OFF=wnoop` | `fid wasm`: the runtime functions that do nothing under WASI (the profiler's start, the stack limit, the signal stack and handlers, a panic's frame values; wasm.fd `wg_wasi_noop`) are compiled as they are (XT39) |
+| `FID_WASM_MEMSTAT=1` | scripts/wasm-run.mjs: the linear memory's size at exit on stderr (its peak; tests/wasm/memory-check.sh, XT31) |
 | `FID_NAT_FAST=1` | the fast allocator of debug builds (RA14), as `--fast-alloc` |
 | `FID_NAT_PAR=<n>` | SP5: nat_ir's functions compiled on n threads (1..16; not with the function cache) |
 | `FID_PE_CT_OFF=1` | pe_ir's machine-code `@constant_time` check off |

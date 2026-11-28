@@ -12,6 +12,30 @@ import { WASI } from 'node:wasi';
 import process from 'node:process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { Worker, isMainThread } from 'node:worker_threads';
+
+// XT28: the program runs on a worker thread with a 64 MB stack. WASM's
+// call stack is the host's, and Node's main thread has about 1 MB: 513
+// nested JSON arrays (test_std_json_depth) overflowed it, where a native
+// build has 8 MB. The program's own output goes straight to fds 1 and 2
+// (WASI), the exit code comes back from the worker.
+// FID_WASM_MAIN_THREAD=1 runs it on the main thread, as before.
+if (isMainThread && !process.env.FID_WASM_MAIN_THREAD) {
+  // (the worker's "WASI is experimental" warning is printed here)
+  process.removeAllListeners('warning');
+  const worker = new Worker(new URL(import.meta.url), {
+    argv: process.argv.slice(2),
+    resourceLimits: { stackSizeMb: 64 },
+  });
+  const code = await new Promise((resolve) => {
+    worker.on('error', (e) => {
+      process.stderr.write('Panic: WebAssembly host: ' + String(e && e.message || e) + String.fromCharCode(10));
+      resolve(1);
+    });
+    worker.on('exit', (c) => resolve(c));
+  });
+  process.exit(code);
+}
 
 const [file, ...args] = process.argv.slice(2);
 if (!file) {
@@ -103,4 +127,10 @@ try {
   else msg = 'WebAssembly trap: ' + msg;
   process.stderr.write('Panic: ' + msg + String.fromCharCode(10));
   process.exitCode = 1;
+}
+// XT31: FID_WASM_MEMSTAT=1 prints the linear memory's size at exit (it
+// never shrinks: the program's peak) for tests/wasm/memory-check.sh
+if (process.env.FID_WASM_MEMSTAT && memory) {
+  const pages = memory.buffer.byteLength / 65536;
+  process.stderr.write('[wasm-run] memory: ' + pages + ' pages (' + Math.round(pages / 16) + ' MB)' + String.fromCharCode(10));
 }

@@ -81,14 +81,19 @@ pub fn bigint_from_i64(x: i64) -> BigInt {
     var v: i64 = x;
     if v < 0 {
         neg = true;
-        v = 0 - v;
     }
     var b: i64 = bi_base();
     if v == 0 {
         l.push(0);
     }
-    while v > 0 {
-        l.push(v % b);
+    // A negative value is split without negating it first: i64::MIN has
+    // no positive counterpart (BG310). `%` truncates, so v % b <= 0 there.
+    while v != 0 {
+        var limb: i64 = v % b;
+        if limb < 0 {
+            limb = 0 - limb;
+        }
+        l.push(limb);
         v = v / b;
     }
     return BigInt {
@@ -132,9 +137,12 @@ pub fn bigint_from_str(s: str) -> BigInt {
     var n: i64 = str_len(t);
     while i < n {
         var c: i64 = str_byte_at(t, i);
-        if c >= 48 && c <= 57 {
-            r = bigint_add_i64(bigint_mul_i64(r, 10), c - 48);
+        if c < 48 || c > 57 {
+            // not a digit: the input is invalid, and invalid input is 0
+            // (BG311; the character was skipped, "12a34" gave 1234)
+            return bigint_zero();
         }
+        r = bigint_add_i64(bigint_mul_i64(r, 10), c - 48);
         i = i + 1;
     }
     if !bigint_is_zero(r) {
@@ -197,12 +205,14 @@ pub fn bigint_to_i64(a: BigInt) -> i64 {
     var v: i64 = 0;
     var b: i64 = bi_base();
     var i: i64 = a.limbs.len() - 1;
+    // A negative value is built negative, so i64::MIN comes back (BG310).
     while i >= 0 {
-        v = v * b + a.limbs.get(i);
+        if a.neg {
+            v = v * b - a.limbs.get(i);
+        } else {
+            v = v * b + a.limbs.get(i);
+        }
         i = i - 1;
-    }
-    if a.neg {
-        v = 0 - v;
     }
     return v;
 }

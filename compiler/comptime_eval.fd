@@ -532,7 +532,7 @@ fn ct_stmt_line(stmt: Stmt) -> i64 {
         Stmt::Let(_, _, _, _, _, _, ln) => {
             return ln;
         }
-        Stmt::LetTuple(_, _, ln) => {
+        Stmt::LetTuple(_, _, ln, _) => {
             return ln;
         }
         Stmt::Assign(_, _, _, ln) => {
@@ -2217,7 +2217,7 @@ fn ct_scan_stmt_sub(stmt: Stmt) -> bool {
         Stmt::Let(_, _, e, _, _, _, _) => {
             return ct_scan_expr_sub(e);
         }
-        Stmt::LetTuple(_, e, _) => {
+        Stmt::LetTuple(_, e, _, _) => {
             return ct_scan_expr_sub(e);
         }
         Stmt::Assign(_, _, e, _) => {
@@ -2570,9 +2570,9 @@ fn substitute_stmt(stmt: &mut Stmt, original: &Program, errs: &mut Vec<str>) {
             }
             * stmt = Stmt::Let(lname, lty, expr, lmut, lpersist, lann, lline);
         }
-        Stmt::LetTuple(tnames, expr, tline) => {
+        Stmt::LetTuple(tnames, expr, tline, tline__m) => {
             substitute_expr(&mut expr, original, errs);
-            *stmt = Stmt::LetTuple(tnames, expr, tline);
+            *stmt = Stmt::LetTuple(tnames, expr, tline, tline__m);
         }
         Stmt::Assign(aname, aop, expr, aline) => {
             substitute_expr(&mut expr, original, errs);
@@ -3634,7 +3634,7 @@ fn ct_stmt_binds(stmt: Stmt, name: str) -> bool {
         Stmt::Let(lname, _, _, _, _, _, _) => {
             return lname == name;
         }
-        Stmt::LetTuple(tnames, _, _) => {
+        Stmt::LetTuple(tnames, _, _, _) => {
             var i: i64 = 0;
             while i < tnames.len() {
                 if tnames.get(i) == name {
@@ -3741,8 +3741,8 @@ fn replace_ident_in_stmt(stmt: Stmt, name: str, replacement: Expr) -> Stmt {
         Stmt::Let(lname, lty, expr, lmut, lpersist, lann, lline) => {
             return Stmt::Let(lname, lty, replace_ident_in_expr(expr, name, replacement), lmut, lpersist, lann, lline);
         }
-        Stmt::LetTuple(tnames, expr, tline) => {
-            return Stmt::LetTuple(tnames, replace_ident_in_expr(expr, name, replacement), tline);
+        Stmt::LetTuple(tnames, expr, tline, tline__m) => {
+            return Stmt::LetTuple(tnames, replace_ident_in_expr(expr, name, replacement), tline, tline__m);
         }
         Stmt::Assign(aname, aop, expr, aline) => {
             return Stmt::Assign(aname, aop, replace_ident_in_expr(expr, name, replacement), aline);
@@ -4104,7 +4104,8 @@ pub fn evaluate(expr: &Expr, original: &Program) -> ResultExpr {
                             return ResultExpr::Err(msg);
                         }
                         ResultExpr::Ok(rv) => {
-                            return eval_binop(op, lv, rv);
+                            // BG266: checked at the operands' i8/i16/i32 width
+                            return ct_narrow_check(op, l, r, lv, rv, eval_binop(op, lv, rv));
                         }
                     }
                 }
@@ -4293,13 +4294,28 @@ pub fn evaluate(expr: &Expr, original: &Program) -> ResultExpr {
             var ai: i64 = 0;
             while ai < args.len() {
                 var a: Expr = args.get(ai);
+                // BG422: a named argument keeps its name (call_comptime_func
+                // puts it at its parameter), its value evaluated here
+                var aname: str = "";
+                match a {
+                    Expr::NamedArg(an, ae) => {
+                        aname = an;
+                        a = ct_box_expr_unbox(ae);
+                    }
+                    _ => {
+                    }
+                }
                 var ar: ResultExpr = evaluate(&a, original);
                 match ar {
                     ResultExpr::Err(msg) => {
                         return ResultExpr::Err(msg);
                     }
                     ResultExpr::Ok(v) => {
-                        arg_values.push(v);
+                        if str_len(aname) > 0 {
+                            arg_values.push(Expr::NamedArg(aname, Box::new(v)));
+                        } else {
+                            arg_values.push(v);
+                        }
                     }
                 }
                 ai = ai + 1;
@@ -4370,6 +4386,14 @@ fn evaluate_block_with_env(stmts: Vec<Stmt>, original: &Program, env: &ComptimeE
 /// outer variables persist (a loop accumulating into `out`), names the
 /// block declares are dropped at its end.
 fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv, returned: &mut Vec<i64>) -> ResultExpr {
+    // BG266: the narrow types the block's `val`s declare end with it
+    var sty_mark: i64 = g_ct_sty_names.len();
+    val res: ResultExpr = evaluate_block_rt_body(stmts, original, env, returned);
+    ct_sty_truncate(sty_mark);
+    return res;
+}
+
+fn evaluate_block_rt_body(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv, returned: &mut Vec<i64>) -> ResultExpr {
     var local_env: ComptimeEnv = ComptimeEnv {
         names: env.names, values: env.values
     };
@@ -4393,14 +4417,33 @@ fn evaluate_block_rt(stmts: Vec<Stmt>, original: &Program, env: &mut ComptimeEnv
                         // BG62: a declared unsigned type tags the value so the
                         // arithmetic on it stays unsigned
                         var sv: Expr = v;
+                        // BG266: the name's i8/i16/i32 type (0: none), from
+                        // its declaration or its value's operands
+                        var lw: i64 = 0;
                         match lty {
                             OptType::Some(dty) => {
                                 if ct_unsigned_ty(dty) {
                                     sv = ct_tag(v, dty);
                                 }
+                                lw = ct_signed_narrow_w(dty);
                             }
                             OptType::None => {
+                                lw = ct_expr_sw(expr);
                             }
+                        }
+                        if lw > 0 {
+                            match sv {
+                                Expr::IntLit(lv0) => {
+                                    if ct_sext(lv0, lw) != lv0 {
+                                        return ct_ovf_ty(int_to_str(lv0) + " (the value of '" + name + "')", "i" + int_to_str(lw));
+                                    }
+                                }
+                                _ => {
+                                }
+                            }
+                        }
+                        if g_ct_call_depth > 0 {
+                            ct_sty_push(name, lw);
                         }
                         ComptimeEnv_declare(&mut local_env, name, sv, n_outer);
                     }
@@ -4858,7 +4901,8 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
                             return ResultExpr::Err(msg);
                         }
                         ResultExpr::Ok(rv) => {
-                            return eval_binop(op, lv, rv);
+                            // BG266: checked at the operands' i8/i16/i32 width
+                            return ct_narrow_check(op, l, r, lv, rv, eval_binop(op, lv, rv));
                         }
                     }
                 }
@@ -5099,13 +5143,28 @@ fn evaluate_with_env(expr: &Expr, env: &ComptimeEnv, original: &Program) -> Resu
             var ai: i64 = 0;
             while ai < args.len() {
                 var a: Expr = args.get(ai);
+                // BG422: a named argument keeps its name (call_comptime_func
+                // puts it at its parameter), its value evaluated here
+                var aname: str = "";
+                match a {
+                    Expr::NamedArg(an, ae) => {
+                        aname = an;
+                        a = ct_box_expr_unbox(ae);
+                    }
+                    _ => {
+                    }
+                }
                 var ar: ResultExpr = evaluate_with_env(&a, env, original);
                 match ar {
                     ResultExpr::Err(msg) => {
                         return ResultExpr::Err(msg);
                     }
                     ResultExpr::Ok(v) => {
-                        arg_values.push(v);
+                        if str_len(aname) > 0 {
+                            arg_values.push(Expr::NamedArg(aname, Box::new(v)));
+                        } else {
+                            arg_values.push(v);
+                        }
                     }
                 }
                 ai = ai + 1;
@@ -5512,11 +5571,111 @@ fn ct_stmt_uses_gensym(stmt: Stmt) -> bool {
     return false;
 }
 
-fn call_comptime_func(func: Func, args: Vec<Expr>, original: &Program) -> ResultExpr {
-    if args.len() != func.params.len() {
-        return ResultExpr::Err("comptime function '" + func.name + "' expects " + int_to_str(func.params.len()) + " args, got " + int_to_str(args.len()));
+/// BG422: the arguments of a comptime call in parameter order: a named
+/// argument (`h(b: 3, a: 4)`) goes to its parameter, a parameter with no
+/// argument takes its default (evaluated with the parameters before it, as
+/// lowering supplies it). The error message, or "" with `out` filled.
+fn ct_resolve_args(func: Func, args0: Vec<Expr>, original: &Program, out: &mut Vec<Expr>) -> str {
+    var n: i64 = func.params.len();
+    var named: bool = false;
+    var i: i64 = 0;
+    while i < args0.len() {
+        match args0.get(i) {
+            Expr::NamedArg(_, _) => {
+                named = true;
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    if !named && args0.len() == n {
+        i = 0;
+        while i < n {
+            out.push(args0.get(i));
+            i = i + 1;
+        }
+        return "";
+    }
+    var too_many: str = "comptime function '" + func.name + "' expects " + int_to_str(n) + " args, got " + int_to_str(args0.len());
+    var vals: Vec<Expr> = Vec::new();
+    var given: Vec<bool> = Vec::new();
+    i = 0;
+    while i < n {
+        vals.push(Expr::IntLit(0));
+        given.push(false);
+        i = i + 1;
+    }
+    var pos: i64 = 0;
+    i = 0;
+    while i < args0.len() {
+        match args0.get(i) {
+            Expr::NamedArg(an, ae) => {
+                var pi: i64 = 0 - 1;
+                var q: i64 = 0;
+                while q < n {
+                    if func.params.get(q).name == an {
+                        pi = q;
+                    }
+                    q = q + 1;
+                }
+                if pi < 0 {
+                    return "comptime function '" + func.name + "' has no parameter '" + an + "'";
+                }
+                if given.get(pi) {
+                    return "comptime function '" + func.name + "': parameter '" + an + "' is given twice";
+                }
+                vals.set(pi, ct_box_expr_unbox(ae));
+                given.set(pi, true);
+            }
+            _ => {
+                while pos < n && given.get(pos) {
+                    pos = pos + 1;
+                }
+                if pos >= n {
+                    return too_many;
+                }
+                vals.set(pos, args0.get(i));
+                given.set(pos, true);
+                pos = pos + 1;
+            }
+        }
+        i = i + 1;
+    }
+    var denv: ComptimeEnv = ComptimeEnv_new();
+    i = 0;
+    while i < n {
+        if !given.get(i) {
+            if !func.params.get(i).has_default {
+                return too_many;
+            }
+            var dex: Expr = func.params.get(i).default_expr;
+            match evaluate_with_env(&dex, &denv, original) {
+                ResultExpr::Err(dm) => {
+                    return dm;
+                }
+                ResultExpr::Ok(dv) => {
+                    vals.set(i, dv);
+                }
+            }
+        }
+        ComptimeEnv_set(&mut denv, func.params.get(i).name, vals.get(i));
+        out.push(vals.get(i));
+        i = i + 1;
+    }
+    return "";
+}
+
+fn call_comptime_func(func: Func, args0: Vec<Expr>, original: &Program) -> ResultExpr {
+    var args: Vec<Expr> = Vec::new();
+    var rerr: str = ct_resolve_args(func, args0, original, &mut args);
+    if str_len(rerr) > 0 {
+        return ResultExpr::Err(rerr);
     }
     var env: ComptimeEnv = ComptimeEnv_new();
+    // BG266: the parameters' i8/i16/i32 types, for the arithmetic of the
+    // body (dropped again when the call returns)
+    var sty_mark: i64 = g_ct_sty_names.len();
     var i: i64 = 0;
     while i < args.len() {
         // A parameter declared unsigned tags the argument's value (BG62)
@@ -5555,8 +5714,34 @@ fn call_comptime_func(func: Func, args: Vec<Expr>, original: &Program) -> Result
     }
     g_ct_call_depth = g_ct_call_depth + 1;
     g_ct_call_stack.push("in comptime fn '" + func.name + "' (defined at line " + int_to_str(func.line) + ")");
-    val cres: ResultExpr = evaluate_block_rt(func.body, original, &mut env, &mut returned);
+    i = 0;
+    while i < func.params.len() {
+        ct_sty_push(func.params.get(i).name, ct_signed_narrow_w(func.params.get(i).ty));
+        i = i + 1;
+    }
+    val cres0: ResultExpr = evaluate_block_rt(func.body, original, &mut env, &mut returned);
+    var cres: ResultExpr = cres0;
+    ct_sty_truncate(sty_mark);
     g_ct_call_depth = g_ct_call_depth - 1;
+    // BG266: the result must fit the declared i8/i16/i32 return type
+    var rw: i64 = ct_signed_narrow_w(func.ret_ty);
+    if rw > 0 {
+        match cres0 {
+            ResultExpr::Ok(rv0) => {
+                match rv0 {
+                    Expr::IntLit(rn) => {
+                        if ct_sext(rn, rw) != rn {
+                            cres = ct_ovf_ty(int_to_str(rn) + " (the result of '" + func.name + "')", "i" + int_to_str(rw));
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            ResultExpr::Err(_) => {
+            }
+        }
+    }
     // The frame is popped only on success: on an error it stays, so the
     // trace of the boundary error shows the whole failing chain (the
     // boundary clears the stack before the next evaluation).
@@ -5589,16 +5774,16 @@ fn ce_assign(env: &ComptimeEnv, target: str, op: AssignOp, v: Expr) -> ResultExp
             return ResultExpr::Ok(v);
         }
         AssignOp::AddAssign => {
-            return eval_binop(BinOp::Add, current, v);
+            return ct_narrow_check(BinOp::Add, Expr::Ident(target), v, current, v, eval_binop(BinOp::Add, current, v));
         }
         AssignOp::SubAssign => {
-            return eval_binop(BinOp::Sub, current, v);
+            return ct_narrow_check(BinOp::Sub, Expr::Ident(target), v, current, v, eval_binop(BinOp::Sub, current, v));
         }
         AssignOp::MulAssign => {
-            return eval_binop(BinOp::Mul, current, v);
+            return ct_narrow_check(BinOp::Mul, Expr::Ident(target), v, current, v, eval_binop(BinOp::Mul, current, v));
         }
         AssignOp::DivAssign => {
-            return eval_binop(BinOp::Div, current, v);
+            return ct_narrow_check(BinOp::Div, Expr::Ident(target), v, current, v, eval_binop(BinOp::Div, current, v));
         }
         AssignOp::ModAssign => {
             return eval_binop(BinOp::Mod, current, v);
@@ -5613,7 +5798,7 @@ fn ce_assign(env: &ComptimeEnv, target: str, op: AssignOp, v: Expr) -> ResultExp
             return eval_binop(BinOp::BitXor, current, v);
         }
         AssignOp::ShlAssign => {
-            return eval_binop(BinOp::Shl, current, v);
+            return ct_narrow_check(BinOp::Shl, Expr::Ident(target), v, current, v, eval_binop(BinOp::Shl, current, v));
         }
         AssignOp::ShrAssign => {
             return eval_binop(BinOp::Shr, current, v);
@@ -5631,6 +5816,186 @@ fn ce_assign(env: &ComptimeEnv, target: str, op: AssignOp, v: Expr) -> ResultExp
 // of exactly 2^63 from other factors is rejected too).
 fn ct_ovf(expr: str) -> ResultExpr {
     return ResultExpr::Err("comptime arithmetic overflow: " + expr + " does not fit in i64");
+}
+
+/// The overflow error naming the type the value had to fit (BG266: a u8
+/// sum said "does not fit in i64").
+fn ct_ovf_ty(expr: str, tyname: str) -> ResultExpr {
+    return ResultExpr::Err("comptime arithmetic overflow: " + expr + " does not fit in " + tyname + "\n    Fix: the same operation overflows when the program runs; compute it in a wider type (as i64) or keep the values in range");
+}
+
+/// BG266: the width of a narrow signed type (i8/i16/i32), 0 for any other.
+fn ct_signed_narrow_w(t: Type) -> i64 {
+    match t {
+        Type::I8 => {
+            return 8;
+        }
+        Type::I16 => {
+            return 16;
+        }
+        Type::I32 => {
+            return 32;
+        }
+        _ => {
+        }
+    }
+    return 0;
+}
+
+// BG266: comptime values carry no type, and signed arithmetic was checked
+// at i64 only (unsigned values are tagged, BG62). The names of the comptime
+// function being run that are declared i8/i16/i32 (parameters, typed `val`s,
+// and untyped ones whose value is such an expression) are kept here with
+// their width; an arithmetic result whose operand is one of them must fit
+// that width, as it must when the program runs. call_comptime_func drops a
+// call's names when it returns.
+var g_ct_sty_names: Vec<str> = Vec::new();
+var g_ct_sty_ws: Vec<i64> = Vec::new();
+
+fn ct_sty_push(name: str, w: i64) {
+    g_ct_sty_names.push(name);
+    g_ct_sty_ws.push(w);
+}
+
+fn ct_sty_truncate(n: i64) {
+    while g_ct_sty_names.len() > n {
+        g_ct_sty_names.pop();
+        g_ct_sty_ws.pop();
+    }
+}
+
+fn ct_sty_of(name: str) -> i64 {
+    var i: i64 = g_ct_sty_names.len() - 1;
+    while i >= 0 {
+        if g_ct_sty_names.get(i) == name {
+            return g_ct_sty_ws.get(i);
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+/// The narrow signed width of an expression's type, as the type checker
+/// would give it (an operator's type is its operands'), 0 when unknown or
+/// not i8/i16/i32.
+fn ct_expr_sw(e: Expr) -> i64 {
+    match e {
+        Expr::Ident(n) => {
+            return ct_sty_of(n);
+        }
+        Expr::Cast(_, t) => {
+            return ct_signed_narrow_w(t);
+        }
+        Expr::Binary(op, a, b) => {
+            match op {
+                BinOp::Add => {
+                }
+                BinOp::Sub => {
+                }
+                BinOp::Mul => {
+                }
+                BinOp::Div => {
+                }
+                BinOp::Mod => {
+                }
+                BinOp::Shl => {
+                }
+                BinOp::Shr => {
+                }
+                BinOp::BitAnd => {
+                }
+                BinOp::BitOr => {
+                }
+                BinOp::BitXor => {
+                }
+                _ => {
+                    return 0;
+                }
+            }
+            var wa: i64 = ct_expr_sw(ct_box_expr_unbox(a));
+            if wa > 0 {
+                return wa;
+            }
+            return ct_expr_sw(ct_box_expr_unbox(b));
+        }
+        Expr::Unary(_, a2) => {
+            return ct_expr_sw(ct_box_expr_unbox(a2));
+        }
+        _ => {
+        }
+    }
+    return 0;
+}
+
+/// `res`, the value of `l op r`, checked against the narrow signed type of
+/// its operands (BG266: `x * x` of an i32 50000 gave 2500000000).
+fn ct_narrow_check(op: BinOp, l: Expr, r: Expr, lv: Expr, rv: Expr, res: ResultExpr) -> ResultExpr {
+    var sym: str = "";
+    match op {
+        BinOp::Add => {
+            sym = " + ";
+        }
+        BinOp::Sub => {
+            sym = " - ";
+        }
+        BinOp::Mul => {
+            sym = " * ";
+        }
+        BinOp::Div => {
+            sym = " / ";
+        }
+        BinOp::Shl => {
+            sym = " << ";
+        }
+        _ => {
+            return res;
+        }
+    }
+    match res {
+        ResultExpr::Ok(v) => {
+            match v {
+                Expr::IntLit(n) => {
+                    var w: i64 = ct_expr_sw(l);
+                    if w == 0 {
+                        w = ct_expr_sw(r);
+                    }
+                    if w > 0 && ct_sext(n, w) != n {
+                        var ls: str = "?";
+                        var rs: str = "?";
+                        match lv {
+                            Expr::IntLit(a) => {
+                                ls = int_to_str(a);
+                            }
+                            _ => {
+                            }
+                        }
+                        match rv {
+                            Expr::IntLit(b) => {
+                                rs = int_to_str(b);
+                            }
+                            _ => {
+                            }
+                        }
+                        return ct_ovf_ty(ls + sym + rs, "i" + int_to_str(w));
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        ResultExpr::Err(_) => {
+        }
+    }
+    return res;
+}
+
+/// "u8", "u16", "u32", "u64" for an unsigned comptime type.
+fn ct_uty_name(t: Type) -> str {
+    var w: i64 = ct_int_width(t);
+    if w >= 64 || w <= 0 {
+        return "u64";
+    }
+    return "u" + int_to_str(w);
 }
 
 fn ct_add_checked(a: i64, b: i64) -> ResultExpr {
@@ -5709,20 +6074,20 @@ fn ct_eval_uint_binop(op: BinOp, a: i64, b: i64, ty: Type) -> ResultExpr {
         BinOp::Add => {
             ur = (ua + ub) & um;
             if ur < ua || ur > um {
-                return ct_ovf(u64_to_str(ua) + " + " + u64_to_str(ub));
+                return ct_ovf_ty(u64_to_str(ua) + " + " + u64_to_str(ub), ct_uty_name(ty));
             }
             return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(ur as i64)), ty));
         }
         BinOp::Sub => {
             if ua < ub {
-                return ct_ovf(u64_to_str(ua) + " - " + u64_to_str(ub));
+                return ct_ovf_ty(u64_to_str(ua) + " - " + u64_to_str(ub), ct_uty_name(ty));
             }
             return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(((ua - ub) & um) as i64)), ty));
         }
         BinOp::Mul => {
             ur = (ua * ub) & um;
             if ua != 0 && (ur / ua) != (ub & um) {
-                return ct_ovf(u64_to_str(ua) + " * " + u64_to_str(ub));
+                return ct_ovf_ty(u64_to_str(ua) + " * " + u64_to_str(ub), ct_uty_name(ty));
             }
             return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(ur as i64)), ty));
         }
@@ -5781,7 +6146,7 @@ fn ct_eval_uint_binop(op: BinOp, a: i64, b: i64, ty: Type) -> ResultExpr {
             }
             var shraw: u64 = ua << (ub & 63);
             if (shraw >> (ub & 63)) != ua || shraw > um {
-                return ct_ovf(u64_to_str(ua) + " << " + int_to_str(b) + " (bits shifted out)");
+                return ct_ovf_ty(u64_to_str(ua) + " << " + int_to_str(b) + " (bits shifted out)", ct_uty_name(ty));
             }
             ur = shraw & um;
             return ResultExpr::Ok(Expr::Cast(Box::new(Expr::IntLit(ur as i64)), ty));

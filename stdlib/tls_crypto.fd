@@ -281,14 +281,36 @@ pub fn chacha20poly_encrypt(@secret key: Vec, nonce: Vec, aad: Vec, pt: Vec) -> 
     return ct;
 }
 
-/// AEAD decrypt: returns plaintext Vec, or empty on tag mismatch.
+/// BG473: what a ChaCha20-Poly1305 open gives: `ok` is whether the tag
+/// verified, `plain` the plaintext (empty when not ok). An authenticated
+/// empty message (ok, no bytes) is told apart from a forgery here, which
+/// an empty Vec from chacha20poly_decrypt cannot do.
+pub struct TlsAeadOpened {
+    pub ok: bool,
+    pub plain: Vec,
+}
+
+/// AEAD decrypt: returns plaintext Vec, or empty on tag mismatch. An empty
+/// plaintext gives an empty Vec too: when one is legal, use
+/// chacha20poly_open, which reports the tag check (BG473).
 /// `key` is `@secret` (CO1); the plaintext goes to the key holder
 /// (`@declassify`: mark the result `@secret` yourself when it is one).
 @declassify
 pub fn chacha20poly_decrypt(@secret key: Vec, nonce: Vec, aad: Vec, cttag: Vec) -> Vec {
+    return chacha20poly_open(key, nonce, aad, cttag).plain;
+}
+
+/// AEAD open (BG473): ciphertext || 16-byte tag in, the tag check and the
+/// plaintext out (TlsAeadOpened).
+/// `key` is `@secret` (CO1); the plaintext goes to the key holder
+/// (`@declassify`: mark the result `@secret` yourself when it is one).
+@declassify
+pub fn chacha20poly_open(@secret key: Vec, nonce: Vec, aad: Vec, cttag: Vec) -> TlsAeadOpened {
     var out: Vec = Vec::new();
     if cttag.len() < 16 {
-        return out;
+        return TlsAeadOpened {
+            ok: false, plain: out
+        };
     }
     var ct: Vec = Vec::new();
     var i: i64 = 0;
@@ -317,9 +339,13 @@ pub fn chacha20poly_decrypt(@secret key: Vec, nonce: Vec, aad: Vec, cttag: Vec) 
         i = i + 1;
     }
     if diff != 0 {
-        return out;
+        return TlsAeadOpened {
+            ok: false, plain: out
+        };
     }
-    return chacha20_encrypt(key, nonce, 1, ct);
+    return TlsAeadOpened {
+        ok: true, plain: chacha20_encrypt(key, nonce, 1, ct)
+    };
 }
 
 // ─── HKDF-SHA256 (RFC 5869) ─────────────────────────────────────────────

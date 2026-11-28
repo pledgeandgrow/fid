@@ -1,0 +1,59 @@
+// BG451 (docs/roadmap/bugs-roadmap.md): an INI key or section name that
+// ini_parse could not read back as written (a key with '=' or ':', a line
+// break, edge blanks, a leading ';' '#' or '['; a section with ']' or a
+// line break) is refused: ini_set does not add it and ini_serialize leaves
+// it out, so it can no longer split a key or inject sections and keys
+// (BG191 closed the same hole for values). ini_valid_key and
+// ini_valid_section say which names are kept.
+//
+// Expected output:
+// 1 prefs
+// ok = 1
+// admin role: false
+// a: false
+// prefs.c: false
+// false false false false false false false true true
+// false false false true true
+// 2 prefs serialize-only
+// keep = 2
+// x = 3
+use ini;
+
+fn yn(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn main() -> i64 {
+    // the entry's trigger
+    var doc: Vec<IniEntry> = Vec::new();
+    ini_set(&mut doc, "prefs", "c:path", "1");
+    ini_set(&mut doc, "prefs", "nick\n[admin]\nrole", "x");
+    ini_set(&mut doc, "a]b", "k", "v");
+    ini_set(&mut doc, "prefs", "ok", "1");
+    val back: Vec<IniEntry> = ini_parse(ini_serialize(doc));
+    val secs: Vec<str> = ini_sections(back);
+    println(f"{secs.len()} " + secs.get(0));
+    println("ok = " + ini_get(back, "prefs", "ok"));
+    println("admin role: " + yn(ini_has(back, "admin", "role")));
+    println("a: " + yn(ini_has(back, "a", "k")));
+    println("prefs.c: " + yn(ini_has(back, "prefs", "c")));
+    // which names are kept
+    println(yn(ini_valid_key("a=b")) + " " + yn(ini_valid_key("a\rb")) + " " + yn(ini_valid_key(" a")) + " " + yn(ini_valid_key("a\t")) + " " + yn(ini_valid_key(";a")) + " " + yn(ini_valid_key("[a")) + " " + yn(ini_valid_key("")) + " " + yn(ini_valid_key("a b")) + " " + yn(ini_valid_key("a;b")));
+    println(yn(ini_valid_section("a\nb")) + " " + yn(ini_valid_section(" a")) + " " + yn(ini_valid_section("a]")) + " " + yn(ini_valid_section("a.b c")) + " " + yn(ini_valid_section("")));
+    // entries pushed by hand: ini_serialize leaves the bad ones out
+    var raw: Vec<IniEntry> = Vec::new();
+    raw.push(IniEntry { section: "prefs", key: "keep", value: "2" });
+    raw.push(IniEntry { section: "prefs", key: "bad=key", value: "1" });
+    raw.push(IniEntry { section: "x]\n[evil", key: "k", value: "v" });
+    raw.push(IniEntry { section: "serialize-only", key: "x", value: "3" });
+    val text: str = ini_serialize(raw);
+    val raw_back: Vec<IniEntry> = ini_parse(text);
+    val rs: Vec<str> = ini_sections(raw_back);
+    println(f"{rs.len()} " + rs.get(0) + " " + rs.get(1));
+    println("keep = " + ini_get(raw_back, "prefs", "keep"));
+    println("x = " + ini_get(raw_back, "serialize-only", "x"));
+    return 0;
+}

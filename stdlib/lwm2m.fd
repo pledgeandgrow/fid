@@ -617,12 +617,40 @@ fn lw_store_bytes(s: &mut Lwm2mStore, obj: i64, inst: i64, res: i64, ri: i64, v:
 
 /// Write TLV resources into /obj/inst (a Write; `replace` first removes
 /// the resources the TLV holds instances of). False on malformed or
-/// untyped data.
+/// untyped data, or an Object Instance TLV for another instance than
+/// `inst`.
 pub fn lwm2m_tlv_write(s: &mut Lwm2mStore, obj: i64, inst: i64, b: &Vec<i64>, replace: bool) -> bool {
+    return lwm2m_tlv_write_at(s, obj, inst, -1, b, replace);
+}
+
+/// A Write of TLV data to the URI /obj/inst (res < 0) or /obj/inst/res
+/// (OMA LwM2M 1.1 §6.3: the Write targets the URI's object instance or
+/// resource). False, with nothing written, when a top-level entry is an
+/// Object Instance other than `inst`, or (res >= 0) anything but resource
+/// `res`.
+pub fn lwm2m_tlv_write_at(s: &mut Lwm2mStore, obj: i64, inst: i64, res: i64, b: &Vec<i64>, replace: bool) -> bool {
     val t: Lwm2mTlv = lwm2m_tlv_parse(b);
     if !t.ok {
         return false;
     }
+    var i: i64 = 0;
+    while i < t.kinds.len() {
+        val kind: i64 = t.kinds.get(i);
+        if kind == LWM2M_TLV_OBJ_INST {
+            if res >= 0 || t.ids.get(i) != inst {
+                return false;
+            }
+        } else if kind == LWM2M_TLV_RES || kind == LWM2M_TLV_MULTI_RES {
+            if res >= 0 && t.ids.get(i) != res {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    return lw_tlv_write_entries(s, obj, inst, &t, replace);
+}
+
+fn lw_tlv_write_entries(s: &mut Lwm2mStore, obj: i64, inst: i64, t: &Lwm2mTlv, replace: bool) -> bool {
     var i: i64 = 0;
     while i < t.kinds.len() {
         val kind: i64 = t.kinds.get(i);
@@ -761,81 +789,139 @@ fn lw_digits(s: str) -> bool {
 }
 
 /// Write a SenML JSON pack into the store (names resolve to full paths
-/// /O/I/R or /O/I/R/RI). False on bad JSON, paths or types.
+/// /O/I/R or /O/I/R/RI). False on bad JSON, paths or types; then nothing is
+/// written.
 pub fn lwm2m_senml_write(s: &mut Lwm2mStore, text: str) -> bool {
+    return lwm2m_senml_write_at(s, text, -1, -1, -1, -1);
+}
+
+// The type a value of /obj/inst/res/ri must have: its definition's, else
+// that of the value already there; -1 when neither exists.
+fn lw_value_type(s: &Lwm2mStore, obj: i64, inst: i64, res: i64, ri: i64) -> i64 {
+    val d: i64 = lw_def(s, obj, res);
+    if d >= 0 {
+        return s.def_type.get(d);
+    }
+    var k: i64 = lwm2m_find(s, obj, inst, res, ri);
+    if k < 0 {
+        k = lwm2m_find(s, obj, inst, res, -1);
+    }
+    if k >= 0 {
+        return s.types.get(k);
+    }
+    return -1;
+}
+
+/// A Write of a SenML JSON pack to the URI /obj/inst[/res[/ri]] (-1 = any
+/// at that level; OMA LwM2M 1.1 §6.3: the Write targets the URI). False,
+/// with nothing written, when a record names a path outside the URI, its
+/// value kind (vs/vb/vlo/vd/v) does not match the resource's type, or the
+/// JSON or a path is bad: the whole pack is checked before any record is
+/// applied.
+pub fn lwm2m_senml_write_at(s: &mut Lwm2mStore, text: str, obj: i64, inst: i64, res: i64, ri: i64) -> bool {
     val d: JsonDoc = json_index(text);
     if !d.ok || jd_kind(&d, jd_root(&d)) != JSON_ARRAY {
         return false;
     }
-    var bn: str = "";
-    var i: i64 = 0;
-    while i < jd_len(&d, jd_root(&d)) {
-        val r: i64 = jd_at(&d, jd_root(&d), i);
-        if jd_kind(&d, r) != JSON_OBJECT {
-            return false;
-        }
-        val b: i64 = jd_get(&d, r, "bn");
-        if b >= 0 {
-            bn = jd_str(&d, b);
-        }
-        val path: Vec<i64> = lwm2m_parse_path(bn + jd_str(&d, jd_get(&d, r, "n")));
-        if path.len() < 3 {
-            return false;
-        }
-        var ri: i64 = -1;
-        if path.len() == 4 {
-            ri = path.get(3);
-        }
-        val o: i64 = path.get(0);
-        val inst: i64 = path.get(1);
-        val res: i64 = path.get(2);
-        val dd: i64 = lw_def(s, o, res);
-        var ty: i64 = -1;
-        if dd >= 0 {
-            ty = s.def_type.get(dd);
-        }
-        if jd_get(&d, r, "vs") >= 0 {
-            lwm2m_set_str(s, o, inst, res, ri, jd_str(&d, jd_get(&d, r, "vs")));
-        } else if jd_get(&d, r, "vb") >= 0 {
-            lwm2m_set_bool(s, o, inst, res, ri, jd_bool(&d, jd_get(&d, r, "vb"), false));
-        } else if jd_get(&d, r, "vlo") >= 0 {
-            val lo: Vec<str> = str_split(jd_str(&d, jd_get(&d, r, "vlo")), ":");
-            if lo.len() != 2 {
+    // pass 0 checks every record, pass 1 applies them
+    var pass: i64 = 0;
+    while pass < 2 {
+        val apply: bool = pass == 1;
+        var bn: str = "";
+        var i: i64 = 0;
+        while i < jd_len(&d, jd_root(&d)) {
+            val r: i64 = jd_at(&d, jd_root(&d), i);
+            if jd_kind(&d, r) != JSON_OBJECT {
                 return false;
             }
-            lwm2m_set_objlnk(s, o, inst, res, ri, str_parse_int(lo.get(0)), str_parse_int(lo.get(1)));
-        } else if jd_get(&d, r, "vd") >= 0 {
-            var std: str = "";
-            val raw: str = jd_str(&d, jd_get(&d, r, "vd"));
-            var j: i64 = 0;
-            while j < str_len(raw) {
-                val c: i64 = str_byte_at(raw, j);
-                if c == 45 {
-                    std = std + "+";
-                } else if c == 95 {
-                    std = std + "/";
-                } else {
-                    std = std + char_to_str(c);
+            val b: i64 = jd_get(&d, r, "bn");
+            if b >= 0 {
+                bn = jd_str(&d, b);
+            }
+            val path: Vec<i64> = lwm2m_parse_path(bn + jd_str(&d, jd_get(&d, r, "n")));
+            if path.len() < 3 || path.len() > 4 {
+                return false;
+            }
+            var rri: i64 = -1;
+            if path.len() == 4 {
+                rri = path.get(3);
+            }
+            val o: i64 = path.get(0);
+            val pinst: i64 = path.get(1);
+            val pres: i64 = path.get(2);
+            if (obj >= 0 && o != obj) || (inst >= 0 && pinst != inst) || (res >= 0 && pres != res) || (ri >= 0 && rri != ri) {
+                return false;
+            }
+            val ty: i64 = lw_value_type(s, o, pinst, pres, rri);
+            if jd_get(&d, r, "vs") >= 0 {
+                if ty >= 0 && ty != LWM2M_STRING {
+                    return false;
                 }
-                j = j + 1;
-            }
-            while str_len(std) % 4 != 0 {
-                std = std + "=";
-            }
-            lwm2m_set_opaque(s, o, inst, res, ri, b64_decode_bytes(std));
-        } else if jd_get(&d, r, "v") >= 0 {
-            val vn: i64 = jd_get(&d, r, "v");
-            if ty == LWM2M_FLOAT || (ty < 0 && str_contains(jd_raw(&d, vn), ".")) {
-                lwm2m_set_float(s, o, inst, res, ri, jd_num(&d, vn, 0.0));
-            } else if ty == LWM2M_TIME {
-                lwm2m_set_time(s, o, inst, res, ri, jd_int(&d, vn, 0));
+                if apply {
+                    lwm2m_set_str(s, o, pinst, pres, rri, jd_str(&d, jd_get(&d, r, "vs")));
+                }
+            } else if jd_get(&d, r, "vb") >= 0 {
+                if ty >= 0 && ty != LWM2M_BOOL {
+                    return false;
+                }
+                if apply {
+                    lwm2m_set_bool(s, o, pinst, pres, rri, jd_bool(&d, jd_get(&d, r, "vb"), false));
+                }
+            } else if jd_get(&d, r, "vlo") >= 0 {
+                if ty >= 0 && ty != LWM2M_OBJLNK {
+                    return false;
+                }
+                val lo: Vec<str> = str_split(jd_str(&d, jd_get(&d, r, "vlo")), ":");
+                if lo.len() != 2 {
+                    return false;
+                }
+                if apply {
+                    lwm2m_set_objlnk(s, o, pinst, pres, rri, str_parse_int(lo.get(0)), str_parse_int(lo.get(1)));
+                }
+            } else if jd_get(&d, r, "vd") >= 0 {
+                if ty >= 0 && ty != LWM2M_OPAQUE {
+                    return false;
+                }
+                if apply {
+                    var std: str = "";
+                    val raw: str = jd_str(&d, jd_get(&d, r, "vd"));
+                    var j: i64 = 0;
+                    while j < str_len(raw) {
+                        val c: i64 = str_byte_at(raw, j);
+                        if c == 45 {
+                            std = std + "+";
+                        } else if c == 95 {
+                            std = std + "/";
+                        } else {
+                            std = std + char_to_str(c);
+                        }
+                        j = j + 1;
+                    }
+                    while str_len(std) % 4 != 0 {
+                        std = std + "=";
+                    }
+                    lwm2m_set_opaque(s, o, pinst, pres, rri, b64_decode_bytes(std));
+                }
+            } else if jd_get(&d, r, "v") >= 0 {
+                if ty >= 0 && ty != LWM2M_INT && ty != LWM2M_FLOAT && ty != LWM2M_TIME {
+                    return false;
+                }
+                if apply {
+                    val vn: i64 = jd_get(&d, r, "v");
+                    if ty == LWM2M_FLOAT || (ty < 0 && str_contains(jd_raw(&d, vn), ".")) {
+                        lwm2m_set_float(s, o, pinst, pres, rri, jd_num(&d, vn, 0.0));
+                    } else if ty == LWM2M_TIME {
+                        lwm2m_set_time(s, o, pinst, pres, rri, jd_int(&d, vn, 0));
+                    } else {
+                        lwm2m_set_int(s, o, pinst, pres, rri, jd_int(&d, vn, 0));
+                    }
+                }
             } else {
-                lwm2m_set_int(s, o, inst, res, ri, jd_int(&d, vn, 0));
+                return false;
             }
-        } else {
-            return false;
+            i = i + 1;
         }
-        i = i + 1;
+        pass = pass + 1;
     }
     return true;
 }
@@ -902,6 +988,10 @@ pub fn lwm2m_handle_request(s: &mut Lwm2mStore, req: &CoapMsg) -> CoapMsg {
     if path.len() >= 3 {
         res = path.get(2);
     }
+    var ri: i64 = -1;
+    if path.len() >= 4 {
+        ri = path.get(3);
+    }
     if inst >= 0 && !lwm2m_has_instance(s, obj, inst) {
         resp.code = COAP_NOT_FOUND;
         return resp;
@@ -962,9 +1052,9 @@ pub fn lwm2m_handle_request(s: &mut Lwm2mStore, req: &CoapMsg) -> CoapMsg {
         val cf: i64 = coap_get_uint(req, COAP_O_CONTENT_FORMAT, LWM2M_CF_TLV);
         var ok: bool = false;
         if cf == LWM2M_CF_TLV {
-            ok = lwm2m_tlv_write(s, obj, inst, &req.payload, req.code == COAP_PUT);
+            ok = lwm2m_tlv_write_at(s, obj, inst, res, &req.payload, req.code == COAP_PUT);
         } else if cf == LWM2M_CF_SENML_JSON {
-            ok = lwm2m_senml_write(s, str_from_bytes(req.payload));
+            ok = lwm2m_senml_write_at(s, str_from_bytes(req.payload), obj, inst, res, ri);
         } else {
             resp.code = 143;  // 4.15 Unsupported Content-Format
             return resp;

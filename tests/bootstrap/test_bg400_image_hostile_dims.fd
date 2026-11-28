@@ -1,0 +1,180 @@
+// BG400 (docs/roadmap/bugs-roadmap.md): the PNG and BMP decoders panicked on
+// hostile dimensions (a checked i64 overflow in `w * bpp`, `h * (stride +
+// 1)`, `row * h`) instead of failing with width 0, and PNG inflated IDAT
+// with zlib's fixed 256 MB cap although it knows the size it needs. Now
+// such files fail (width 0), and IDAT is inflated no further than the
+// scanlines need: a stream that inflates to more is bad. Valid files still
+// decode.
+//
+// Expected output:
+// png 2147483647 x 2147483647: 0
+// png 4294967295 x 1: 0
+// png 1 x 4294967295: 0
+// png 65536 x 65536: 0
+// png 1x1, IDAT inflating to 1000 bytes: 0
+// png 1x1, IDAT short: 0
+// png 2x2: 2 2
+// 169090815 674380928
+// 16909060 84281096
+// png round trip: 3 1 4278190335 16711935 65535
+// bmp 4294967295 x 2147483647: 0
+// bmp 2147483647 x 2147483647: 0
+// bmp 1 x 2147483647: 0
+// bmp 1x2: 1 2 65535 4278190335
+use image;
+use compress;
+
+fn put_u32be(v: &mut Vec<i64>, x: i64) {
+    v.push((x >> 24) & 255);
+    v.push((x >> 16) & 255);
+    v.push((x >> 8) & 255);
+    v.push(x & 255);
+}
+
+fn put_u32le(v: &mut Vec<i64>, x: i64) {
+    v.push(x & 255);
+    v.push((x >> 8) & 255);
+    v.push((x >> 16) & 255);
+    v.push((x >> 24) & 255);
+}
+
+fn put_u16le(v: &mut Vec<i64>, x: i64) {
+    v.push(x & 255);
+    v.push((x >> 8) & 255);
+}
+
+// a PNG chunk: length, type, data, CRC-32 of type and data
+fn put_chunk(v: &mut Vec<i64>, ty: i64, data: &Vec<i64>) {
+    put_u32be(v, data.len());
+    var td: Vec<i64> = Vec::new();
+    put_u32be(&mut td, ty);
+    var i: i64 = 0;
+    while i < data.len() {
+        td.push(data.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < td.len() {
+        v.push(td.get(i));
+        i = i + 1;
+    }
+    put_u32be(v, crc32_bytes(td));
+}
+
+// an 8-bit RGBA PNG of w x h whose IDAT is zlib(raw)
+fn png(w: i64, h: i64, raw: &Vec<i64>) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(137);
+    v.push(80);
+    v.push(78);
+    v.push(71);
+    v.push(13);
+    v.push(10);
+    v.push(26);
+    v.push(10);
+    var ihdr: Vec<i64> = Vec::new();
+    put_u32be(&mut ihdr, w);
+    put_u32be(&mut ihdr, h);
+    ihdr.push(8);
+    ihdr.push(6);
+    ihdr.push(0);
+    ihdr.push(0);
+    ihdr.push(0);
+    put_chunk(&mut v, 0x49484452, &ihdr);
+    val idat: Vec<i64> = zlib_compress_bytes(raw.clone());
+    put_chunk(&mut v, 0x49444154, &idat);
+    val none: Vec<i64> = Vec::new();
+    put_chunk(&mut v, 0x49454E44, &none);
+    return v;
+}
+
+// a 24-bit BI_RGB BMP header (54 bytes) with the given biWidth/biHeight
+// words, then `pixels`
+fn bmp(w: i64, h: i64, pixels: &Vec<i64>) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(66);
+    v.push(77);
+    put_u32le(&mut v, 54 + pixels.len());
+    put_u32le(&mut v, 0);
+    put_u32le(&mut v, 54);
+    put_u32le(&mut v, 40);
+    put_u32le(&mut v, w);
+    put_u32le(&mut v, h);
+    put_u16le(&mut v, 1);
+    put_u16le(&mut v, 24);
+    put_u32le(&mut v, 0);
+    put_u32le(&mut v, pixels.len());
+    put_u32le(&mut v, 2835);
+    put_u32le(&mut v, 2835);
+    put_u32le(&mut v, 0);
+    put_u32le(&mut v, 0);
+    var i: i64 = 0;
+    while i < pixels.len() {
+        v.push(pixels.get(i));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn zeros(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(0);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn main() {
+    val tiny: Vec<i64> = zeros(5);
+    // the entry's PNG trigger, and other sizes past the arithmetic or the cap
+    println(f"png 2147483647 x 2147483647: {image_png_decode(png(2147483647, 2147483647, &tiny)).width}");
+    println(f"png 4294967295 x 1: {image_png_decode(png(4294967295, 1, &tiny)).width}");
+    println(f"png 1 x 4294967295: {image_png_decode(png(1, 4294967295, &tiny)).width}");
+    println(f"png 65536 x 65536: {image_png_decode(png(65536, 65536, &tiny)).width}");
+    // a 1x1 RGBA image needs 5 bytes of scanline
+    println(f"png 1x1, IDAT inflating to 1000 bytes: {image_png_decode(png(1, 1, &zeros(1000))).width}");
+    println(f"png 1x1, IDAT short: {image_png_decode(png(1, 1, &zeros(4))).width}");
+    // a valid 2x2: row 0 unfiltered, row 1 with the Up filter
+    var raw: Vec<i64> = Vec::new();
+    val r0: [i64; 9] = [0, 10, 20, 30, 255, 40, 50, 60, 128];
+    val r1: [i64; 9] = [2, 247, 238, 229, 5, 221, 212, 203, 136];
+    var i: i64 = 0;
+    while i < 9 {
+        raw.push(r0[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 9 {
+        raw.push(r1[i]);
+        i = i + 1;
+    }
+    val ok: Image = image_png_decode(png(2, 2, &raw));
+    println(f"png 2x2: {ok.width} {ok.height}");
+    println(f"{image_get_pixel(&ok, 0, 0)} {image_get_pixel(&ok, 1, 0)}");
+    println(f"{image_get_pixel(&ok, 0, 1)} {image_get_pixel(&ok, 1, 1)}");
+    // the module's own encoder
+    var src: Image = image_create(3, 1, 4);
+    image_set_pixel(&mut src, 0, 0, 255, 0, 0, 255);
+    image_set_pixel(&mut src, 1, 0, 0, 255, 0, 255);
+    image_set_pixel(&mut src, 2, 0, 0, 0, 255, 255);
+    val rt: Image = image_png_decode(image_png_encode(&src));
+    println(f"png round trip: {rt.width} {rt.height} {image_get_pixel(&rt, 0, 0)} {image_get_pixel(&rt, 1, 0)} {image_get_pixel(&rt, 2, 0)}");
+    // BMP: the entry's trigger, then sizes whose row * height overflows or
+    // passes the file
+    val few: Vec<i64> = zeros(8);
+    println(f"bmp 4294967295 x 2147483647: {image_bmp_decode(bmp(4294967295, 2147483647, &few)).width}");
+    println(f"bmp 2147483647 x 2147483647: {image_bmp_decode(bmp(2147483647, 2147483647, &few)).width}");
+    println(f"bmp 1 x 2147483647: {image_bmp_decode(bmp(1, 2147483647, &few)).width}");
+    // a valid 1x2 bottom-up BMP: the file's first row is the bottom one
+    var px: Vec<i64> = Vec::new();
+    val rows: [i64; 8] = [0, 0, 255, 0, 255, 0, 0, 0];
+    i = 0;
+    while i < 8 {
+        px.push(rows[i]);
+        i = i + 1;
+    }
+    val b: Image = image_bmp_decode(bmp(1, 2, &px));
+    println(f"bmp 1x2: {b.width} {b.height} {image_get_pixel(&b, 0, 0)} {image_get_pixel(&b, 0, 1)}");
+}

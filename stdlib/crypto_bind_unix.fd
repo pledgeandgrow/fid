@@ -351,19 +351,42 @@ pub fn cb_gcm_encrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, pt: &Vec) -> Ve
     return out;
 }
 
+/// BG473: what an AES-GCM open gives: `ok` is whether the tag verified,
+/// `plain` the plaintext (empty when not ok). An authenticated empty
+/// message (ok, no bytes) is told apart from a forgery here, which an
+/// empty Vec from cb_gcm_decrypt cannot do.
+pub struct CbGcmOpened {
+    pub ok: bool,
+    pub plain: Vec<i64>,
+}
+
 /// AES-GCM decrypt: input is ciphertext || 16-byte tag; empty Vec on failure
-/// (tag mismatch included).
+/// (tag mismatch included). An empty plaintext gives an empty Vec too: when
+/// one is legal, use cb_gcm_open, which reports the tag check (BG473).
 /// The key is `@secret` (complaint CO1): this body may not print, log,
 /// send or store it; the result is an audited release (`@declassify`).
 @declassify
 pub fn cb_gcm_decrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -> Vec<i64> {
+    return cb_gcm_open(key, nonce, aad, ct_tag).plain;
+}
+
+/// AES-GCM open (BG473): ciphertext || 16-byte tag in, the tag check and
+/// the plaintext out (CbGcmOpened).
+/// The key is `@secret` (complaint CO1): this body may not print, log,
+/// send or store it; the result is an audited release (`@declassify`).
+@declassify
+pub fn cb_gcm_open(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -> CbGcmOpened {
     var out: Vec<i64> = Vec::new();
     if ct_tag.len() < 16 {
-        return out;
+        return CbGcmOpened {
+            ok: false, plain: out
+        };
     }
     val cipher: i64 = cu_gcm_cipher(key.len());
     if cipher == 0 || nonce.len() == 0 {
-        return out;
+        return CbGcmOpened {
+            ok: false, plain: out
+        };
     }
     var ctx: i64 = 0;
     // SAFETY: EVP_CIPHER_CTX_new takes nothing and returns a new context
@@ -372,7 +395,9 @@ pub fn cb_gcm_decrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -
         ctx = cu_ctx_new();
     }
     if ctx == 0 {
-        return out;
+        return CbGcmOpened {
+            ok: false, plain: out
+        };
     }
     val n: i64 = ct_tag.len() - 16;
     val kb: i64 = cu_buf(key);
@@ -428,7 +453,9 @@ pub fn cb_gcm_decrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -
     unsafe {
         p_free(outl);
     }
-    return out;
+    return CbGcmOpened {
+        ok: ok, plain: out
+    };
 }
 
 // ─── PBKDF2-HMAC-SHA256 ───────────────────────────────────────────────────

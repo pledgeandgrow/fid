@@ -872,6 +872,13 @@ pub fn a64_fcvt_sd(e: &mut NatEnc, d: i64, n: i64) {
 pub fn a64_scvtf(e: &mut NatEnc, d: i64, n: i64) {
     NatEnc_word(e, 0x9E620000 | (n << 5) | d);
 }
+// BG337: scvtf s<d>, x<n> / ucvtf s<d>, x<n> (one rounding to single)
+pub fn a64_scvtf_s(e: &mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x9E220000 | (n << 5) | d);
+}
+pub fn a64_ucvtf_s(e: &mut NatEnc, d: i64, n: i64) {
+    NatEnc_word(e, 0x9E230000 | (n << 5) | d);
+}
 pub fn a64_fcvtzs(e: &mut NatEnc, d: i64, n: i64) {
     NatEnc_word(e, 0x9E780000 | (n << 5) | d);
 }
@@ -1282,6 +1289,14 @@ pub fn rv_fle_d(e: &mut NatEnc, rd: i64, a: i64, b: i64) {
 }
 pub fn rv_fcvt_dl(e: &mut NatEnc, fd: i64, rs: i64) {
     NatEnc_word(e, 0xD2200053 | (rs << 15) | (7 << 12) | (fd << 7));
+}
+// BG337: fcvt.s.l / fcvt.s.lu fd, rs (one rounding to single; dynamic
+// rounding)
+pub fn rv_fcvt_sl(e: &mut NatEnc, fd: i64, rs: i64) {
+    NatEnc_word(e, 0xD0200053 | (rs << 15) | (7 << 12) | (fd << 7));
+}
+pub fn rv_fcvt_slu(e: &mut NatEnc, fd: i64, rs: i64) {
+    NatEnc_word(e, 0xD0300053 | (rs << 15) | (7 << 12) | (fd << 7));
 }
 // fcvt.l.d with rtz (round toward zero), as a C cast
 pub fn rv_fcvt_ld(e: &mut NatEnc, rd: i64, fs: i64) {
@@ -2706,6 +2721,84 @@ pub var g_nat_ldyn_dyn_len: i64 = 0;
 /// runtime's thread block); -1: none.
 pub var g_nat_elf_tls: i64 = 0 - 1;
 
+// --- XT44/XT54/XT64: the system an ELF of the machine layer is for --------
+// FreeBSD, OpenBSD and Android run an ELF only when it says it is theirs:
+// FreeBSD by EI_OSABI or its ABI note, OpenBSD by its identification note,
+// Android's tools by .note.android.ident. A Linux image is unchanged.
+
+/// XT44/XT54/XT64: "" (Linux), "freebsd", "openbsd" or "android"; main.fd
+/// sets it for each machine-layer build (cmd_build, from --target).
+pub var g_nat_elf_os: str = "";
+/// The note's word: __FreeBSD_version on FreeBSD (1400097, 14.0-RELEASE),
+/// the API level on Android (34 when the target names none); OpenBSD's
+/// note carries 0.
+pub var g_nat_elf_os_ver: i64 = 0;
+
+/// The file offset of the identification note: in the header page, which
+/// the first PT_LOAD maps (R), at its end, so the room after the program
+/// headers stays free for nat_elf_eh_frame's PT_GNU_EH_FRAME.
+pub const NAT_ELF_NOTE_AT: i64 = 0xF00;
+
+/// EI_OSABI: ELFOSABI_FREEBSD (9) for FreeBSD (its kernel brands a static
+/// executable by it or by the note); System V (0) otherwise: OpenBSD's own
+/// linker writes 0 there and its kernel reads the note, Android's are 0.
+pub fn nat_elf_osabi() -> i64 {
+    if g_nat_elf_os == "freebsd" {
+        return 9;
+    }
+    return 0;
+}
+
+/// The note's owner ("" for a Linux image: no note).
+pub fn nat_elf_note_name() -> str {
+    if g_nat_elf_os == "freebsd" {
+        return "FreeBSD";
+    }
+    if g_nat_elf_os == "openbsd" {
+        return "OpenBSD";
+    }
+    if g_nat_elf_os == "android" {
+        return "Android";
+    }
+    return "";
+}
+
+/// The section the note is in (as each system's crt objects name it).
+pub fn nat_elf_note_section() -> str {
+    if g_nat_elf_os == "freebsd" {
+        return ".note.tag";
+    }
+    if g_nat_elf_os == "openbsd" {
+        return ".note.openbsd.ident";
+    }
+    return ".note.android.ident";
+}
+
+/// The identification note (empty for Linux): namesz, descsz 4, type 1
+/// (FreeBSD's NT_FREEBSD_ABI_TAG, OpenBSD's ELF_NOTE_TYPE_OSVERSION,
+/// Android's NT_TYPE_IDENT), the owner NUL-terminated and padded to 4, the
+/// 4-byte word (g_nat_elf_os_ver; 0 on OpenBSD).
+pub fn nat_elf_note() -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var name: str = nat_elf_note_name();
+    if str_len(name) == 0 {
+        return out;
+    }
+    var desc: i64 = g_nat_elf_os_ver;
+    if g_nat_elf_os == "openbsd" {
+        desc = 0;
+    }
+    img_u32(&mut out, str_len(name) + 1);
+    img_u32(&mut out, 4);
+    img_u32(&mut out, 1);
+    img_cstr(&mut out, name);
+    while (out.len() & 3) != 0 {
+        out.push(0);
+    }
+    img_u32(&mut out, desc);
+    return out;
+}
+
 /// A static Linux executable of `image`, entered at image offset `entry`
 /// (CI2: dynamically linked when g_nat_ldyn_dyn is set: PT_INTERP and
 /// PT_DYNAMIC around the one PT_LOAD).
@@ -3085,11 +3178,33 @@ pub fn nat_elf_img(arch: i64, image: &Vec<i64>, entry: i64) -> Vec<i64> {
     // TG14: a position-independent executable with a dynamic loader needs
     // PT_PHDR: glibc's ld.so takes the program's load bias from it (AT_PHDR
     // minus its p_vaddr) and, without one, relocates nothing by the bias
-    var phdr_seg: bool = g_nat_pie && ldyn;
+    // XT54: OpenBSD's kernel refuses an ET_DYN with no PT_PHDR at exec
+    // (EINVAL, exec_elf.c "need phdr and load sections for PIE"), loader or
+    // not: an OpenBSD image always has one (found on OpenBSD 8.0, Nov 28)
+    var phdr_seg: bool = g_nat_pie && (ldyn || g_nat_elf_os == "openbsd");
     if phdr_seg {
         phnum = phnum + 1;
     }
+    // XT44/XT54/XT64: a FreeBSD, OpenBSD or Android image's identification
+    // note (PT_NOTE); OpenBSD's PT_OPENBSD_NOBTCFI (the code has no endbr64
+    // or BTI landing pads, so the kernel must not enforce IBT/BTI) and, only
+    // when code and data share one RWX segment (FID_NAT_OFF=wxsplit),
+    // PT_OPENBSD_WXNEEDED. No PT_OPENBSD_RANDOMIZE: the image has no
+    // .openbsd.randomdata section.
+    var note: Vec<i64> = nat_elf_note();
+    if note.len() > 0 {
+        phnum = phnum + 1;
+    }
+    var obsd: bool = g_nat_elf_os == "openbsd";
+    if obsd {
+        phnum = phnum + 1;
+        if dsplit <= 0 {
+            phnum = phnum + 1;
+        }
+    }
     img_elf_header(&mut out, etype, nat_elf_machine(arch), base + entry, 64, 0, nat_elf_flags(arch), 56, phnum, 0, 0);
+    // XT44: EI_OSABI (ELFOSABI_FREEBSD on FreeBSD, else System V)
+    out.set(7, nat_elf_osabi());
     if phdr_seg {
         // PT_PHDR, read-only: the program headers at file offset 64, inside
         // the first PT_LOAD (which maps file offset 0 at base - 0x1000)
@@ -3121,6 +3236,24 @@ pub fn nat_elf_img(arch: i64, image: &Vec<i64>, entry: i64) -> Vec<i64> {
         // PT_TLS, read-only template of no bytes, 8 bytes of TLS (the
         // executable's block: fs - 8 on x86-64), 8-aligned
         img_elf_phdr(&mut out, 7, 4, 0x1000 + g_nat_elf_tls, base + g_nat_elf_tls, 0, 8, 8);
+    }
+    if note.len() > 0 {
+        // PT_NOTE, read-only, 4-aligned: the note at NAT_ELF_NOTE_AT, in the
+        // header page the first PT_LOAD maps (FreeBSD's kernel reads a note
+        // in the first page from the header buffer)
+        img_elf_phdr(&mut out, 4, 4, NAT_ELF_NOTE_AT, base - 0x1000 + NAT_ELF_NOTE_AT, note.len(), note.len(), 4);
+    }
+    if obsd {
+        // PT_OPENBSD_NOBTCFI (0x65a3dbe8)
+        img_elf_phdr(&mut out, 0x65A3DBE8, 0, 0, 0, 0, 0, 0);
+        if dsplit <= 0 {
+            // PT_OPENBSD_WXNEEDED (0x65a3dbe7): one RWX segment
+            img_elf_phdr(&mut out, 0x65A3DBE7, 0, 0, 0, 0, 0, 0);
+        }
+    }
+    if note.len() > 0 {
+        img_pad_to(&mut out, NAT_ELF_NOTE_AT);
+        img_append(&mut out, &note);
     }
     img_pad_to(&mut out, 0x1000);
     img_append(&mut out, image);
@@ -4381,6 +4514,24 @@ pub var g_nat_dbg_ext: bool = false;
 /// given by a line "B", id, parent id (0: the function), start and end
 /// from the function's start (ng_dbg_scope_blocks; nat_dbg_put_vars).
 pub var g_nat_dbg_vars: Vec<str> = Vec::new();
+/// BG243: per function of nat_dwarf_build's `names` (same order; shorter
+/// or empty: none), the calls inlined into it, one per line: "I", the
+/// callee (as a debugger shows it), the call's line, the callee's `fn`
+/// line, and the start and end of the inlined code (offsets from the
+/// function's start), separated by tabs. Each callee gets an abstract
+/// DW_TAG_subprogram (DW_AT_inline, no code of its own: abbreviation 21)
+/// and each call a DW_TAG_inlined_subroutine in its caller (22:
+/// abstract_origin, low_pc, high_pc, call_file, call_line), as other
+/// compilers describe inlined code, so a debugger names the callee at a
+/// stop in it and `break <callee>` finds its inlined copies. Set by
+/// compiler/pe_ir_enc.fd pe_add_dwarf (pe_ir, from iropt.fd's records of
+/// the calls it inlined); the machine layer gives none yet.
+pub var g_nat_dbg_inl: Vec<str> = Vec::new();
+/// BG243: callee -> offset in .debug_info of its abstract entry, for the
+/// image nat_dwarf_build is writing (0: none).
+var g_nat_dbg_inl_at: i64 = 0;
+/// BG243: the caller's declaration file (the inlined calls' call_file).
+var g_nat_dbg_inl_file: i64 = 1;
 
 // --- DB2: a function's declaration line is its `fn` line -------------------
 // The line rows start at the body (lower.fd gives what is lowered outside
@@ -5226,7 +5377,123 @@ fn nat_dbg_put_vars(info: &mut Vec<i64>, fi: i64, type_at: i64, fpc: i64, dloc: 
             open.pop();
         }
     }
+    // BG243: the calls inlined into it
+    nat_dbg_put_inl(info, fi, upc + fpc, flen);
     info.push(0);
+}
+
+// --- BG243: inlined calls ---------------------------------------------------
+
+/// BG243: does any function have an inlined call (g_nat_dbg_inl)?
+fn nat_dbg_inl_any() -> bool {
+    var i: i64 = 0;
+    while i < g_nat_dbg_inl.len() {
+        if str_len(g_nat_dbg_inl.get(i)) > 0 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// BG243: abbreviations 21, an inlined function's abstract entry (name,
+/// decl_file, decl_line, inline), and 22, one inlined call of it
+/// (abstract_origin, low_pc, high_pc a length, call_file, call_line).
+fn nat_dbg_abbrevs_inl(abbrev: &mut Vec<i64>) {
+    abbrev.push(21);
+    abbrev.push(0x2E);
+    abbrev.push(0);
+    abbrev.push(0x03);
+    abbrev.push(0x08);
+    abbrev.push(0x3A);
+    abbrev.push(0x05);
+    abbrev.push(0x3B);
+    abbrev.push(0x06);
+    abbrev.push(0x20);
+    abbrev.push(0x0B);
+    // inline, data1 (DW_INL_inlined)
+    abbrev.push(0);
+    abbrev.push(0);
+    abbrev.push(22);
+    abbrev.push(0x1D);
+    abbrev.push(0);
+    abbrev.push(0x31);
+    abbrev.push(0x13);
+    // abstract_origin, ref4
+    abbrev.push(0x11);
+    abbrev.push(0x01);
+    abbrev.push(0x12);
+    abbrev.push(0x07);
+    abbrev.push(0x58);
+    abbrev.push(0x05);
+    // call_file, data2
+    abbrev.push(0x59);
+    abbrev.push(0x06);
+    // call_line, data4
+    abbrev.push(0);
+    abbrev.push(0);
+}
+
+/// BG243: the abstract entry of each callee g_nat_dbg_inl names (its
+/// declaration in file 1, the input file's, where pe_ir's callees are);
+/// returns callee -> its offset in `info`.
+fn nat_dbg_inl_abstract(info: &mut Vec<i64>) -> i64 {
+    var at: i64 = HashMap_new();
+    var i: i64 = 0;
+    while i < g_nat_dbg_inl.len() {
+        var lines: Vec<str> = str_split(g_nat_dbg_inl.get(i), "\n");
+        var j: i64 = 0;
+        while j < lines.len() {
+            var p: Vec<str> = str_split(lines.get(j), "\t");
+            j = j + 1;
+            if p.len() < 6 || p.get(0) != "I" || HashMap_contains(at, p.get(1)) {
+                continue;
+            }
+            HashMap_insert(at, p.get(1), info.len());
+            info.push(21);
+            nat_put_str(info, p.get(1));
+            nat_put_u16(info, 1);
+            nat_put_u32(info, str_parse_int(p.get(3)));
+            info.push(1);
+        }
+        i = i + 1;
+    }
+    return at;
+}
+
+/// BG243: the inlined calls of function `fi` (at address `pc0`, `flen`
+/// bytes long): a DW_TAG_inlined_subroutine each, its range cut to the
+/// function.
+fn nat_dbg_put_inl(info: &mut Vec<i64>, fi: i64, pc0: i64, flen: i64) {
+    if g_nat_dbg_inl_at == 0 || fi >= g_nat_dbg_inl.len() || str_len(g_nat_dbg_inl.get(fi)) == 0 {
+        return;
+    }
+    var lines: Vec<str> = str_split(g_nat_dbg_inl.get(fi), "\n");
+    var j: i64 = 0;
+    while j < lines.len() {
+        var p: Vec<str> = str_split(lines.get(j), "\t");
+        j = j + 1;
+        if p.len() < 6 || p.get(0) != "I" || !HashMap_contains(g_nat_dbg_inl_at, p.get(1)) {
+            continue;
+        }
+        var s: i64 = str_parse_int(p.get(4));
+        var e: i64 = str_parse_int(p.get(5));
+        if s < 0 {
+            s = 0;
+        }
+        if e > flen {
+            e = flen;
+        }
+        if e <= s {
+            continue;
+        }
+        info.push(22);
+        nat_put_u32(info, HashMap_get(g_nat_dbg_inl_at, p.get(1)));
+        nat_put_u64(info, pc0 + s);
+        nat_put_u64(info, e - s);
+        nat_put_u16(info, g_nat_dbg_inl_file);
+        nat_put_u32(info, str_parse_int(p.get(2)));
+    }
 }
 
 /// DB4: one parameter (`pass` 0) or variable (1) of g_nat_dbg_vars, its
@@ -5377,7 +5644,7 @@ pub fn nat_elf_debug(arch: i64, image: Vec<i64>, entry: i64, names: Vec<str>, st
     // TG13: the sections and their headers from image_writer (the old
     // body, checked byte for byte against it on Nov 17 with
     // FID_NAT_OFF=ehframe, is gone: docs/reference/image-writer.md)
-    return nat_elf_debug_sections(out, image.len(), base, symtab, strtab, abbrev, info, frame, file, lrows, dloc, eh);
+    return nat_elf_debug_sections(arch, out, image.len(), base, symtab, strtab, abbrev, info, frame, file, lrows, dloc, eh);
 }
 
 /// CT6: the DWARF of a native image that an ELF (nat_elf_debug) and a
@@ -5450,6 +5717,11 @@ pub fn nat_dwarf_build(arch: i64, image: Vec<i64>, base: i64, names: Vec<str>, s
     if g_nat_dbg_ext {
         nat_dbg_abbrevs_ext(&mut abbrev);
     }
+    // BG243: inlined calls (none: the sections are what they were)
+    var inl_on: bool = g_nat_dbg_ext && nat_dbg_inl_any();
+    if inl_on {
+        nat_dbg_abbrevs_inl(&mut abbrev);
+    }
     abbrev.push(0);
     // .debug_info (DWARF 4)
     var info: Vec<i64> = Vec::new();
@@ -5491,6 +5763,11 @@ pub fn nat_dwarf_build(arch: i64, image: Vec<i64>, base: i64, names: Vec<str>, s
     var dloc: Vec<i64> = Vec::new();
     if g_nat_dbg_ext {
         dbg_vat = nat_dbg_var_types(&mut info, g_nat_dbg_vars, dbg_sat);
+    }
+    // BG243: an abstract entry per inlined callee, before the functions
+    g_nat_dbg_inl_at = 0;
+    if inl_on {
+        g_nat_dbg_inl_at = nat_dbg_inl_abstract(&mut info);
     }
     // DB2: the line rows, in image order, give each function its
     // declaration file (the first row inside it) and, read from that
@@ -5554,6 +5831,7 @@ pub fn nat_dwarf_build(arch: i64, image: Vec<i64>, base: i64, names: Vec<str>, s
             if has_decl {
                 nat_put_u16(&mut info, dfile);
                 nat_put_u32(&mut info, dline);
+                g_nat_dbg_inl_file = dfile;
                 nat_dbg_put_vars(&mut info, i, dbg_vat, starts.get(i) - lo, &mut dloc, lists, base + lo, ends.get(i) - starts.get(i));
             }
         }
@@ -5698,11 +5976,29 @@ pub fn nat_dwarf_build(arch: i64, image: Vec<i64>, base: i64, names: Vec<str>, s
 /// DB6: `eh`, when not empty, places .eh_frame_hdr and .eh_frame in the
 /// loaded image (nat_elf_eh_frame's [hdr offset, length, address, frame
 /// offset, length, address]); their headers come last.
-fn nat_elf_debug_sections(elf: Vec<i64>, image_len: i64, base: i64, symtab: Vec<i64>, strtab: Vec<i64>, abbrev: Vec<i64>, info: Vec<i64>, frame: Vec<i64>, file: str, lrows: Vec<i64>, dloc: Vec<i64>, eh: Vec<i64>) -> Vec<i64> {
+fn nat_elf_debug_sections(arch: i64, elf: Vec<i64>, image_len: i64, base: i64, symtab: Vec<i64>, strtab: Vec<i64>, abbrev: Vec<i64>, info: Vec<i64>, frame: Vec<i64>, file: str, lrows: Vec<i64>, dloc: Vec<i64>, eh: Vec<i64>) -> Vec<i64> {
     var out: Vec<i64> = elf;
+    // BG234: an image nat_elf_img maps as two PT_LOADs (TG14: the code R+X,
+    // the data RW from g_nat_elf_data_off, the same test as there) gets a
+    // section per segment: .text (ALLOC | EXECINSTR) over the code, .data
+    // (WRITE | ALLOC) over the data. One .text flagged WAX over the whole
+    // image mapped to no segment (readelf -l) and objdump -d took the data
+    // for code. Without the split, .text is the one RWX segment as before.
+    var dsplit: i64 = g_nat_elf_data_off;
+    if dsplit <= 0 || dsplit >= image_len || ((0x1000 + dsplit) & (nat_elf_page(arch) - 1)) != 0 {
+        dsplit = 0 - 1;
+    }
+    // .data is section 2 when there is one: the later sections move up one
+    var sh_after: i64 = 0;
+    if dsplit > 0 {
+        sh_after = 1;
+    }
     var shnames: Vec<str> = Vec::new();
     shnames.push("");
     shnames.push(".text");
+    if dsplit > 0 {
+        shnames.push(".data");
+    }
     shnames.push(".symtab");
     shnames.push(".strtab");
     shnames.push(".debug_abbrev");
@@ -5739,6 +6035,13 @@ fn nat_elf_debug_sections(elf: Vec<i64>, image_len: i64, base: i64, symtab: Vec<
         }
         shnames.push(".dynamic");
     }
+    // XT44/XT54/XT64: the identification note nat_elf_img put in the header
+    // page, as an SHT_NOTE section too (readelf -n reads a file's notes from
+    // its sections when it has any); last, so no index above moves
+    var note_len: i64 = nat_elf_note().len();
+    if note_len > 0 {
+        shnames.push(nat_elf_note_section());
+    }
     var fname: str = file;
     if fname == "" {
         fname = "fides";
@@ -5757,10 +6060,18 @@ fn nat_elf_debug_sections(elf: Vec<i64>, image_len: i64, base: i64, symtab: Vec<
     var offs: Vec<i64> = img_place_parts(&mut out, &parts, 8);
     var secs: Vec<ImgSec> = Vec::new();
     secs.push(img_sec("", 0, 0, 0, 0, 0, 0, 0, 0, 0));
-    secs.push(img_sec(".text", 1, 7, base, 0x1000, image_len, 0, 0, 16, 0));
-    // PROGBITS, WRITE | ALLOC | EXECINSTR: the loaded image
-    secs.push(img_sec(".symtab", 2, 0, 0, offs.get(0), parts.get(0).len(), 3, 1, 8, 24));
-    // SYMTAB, names in 3, every symbol global (sh_info 1)
+    if dsplit > 0 {
+        // PROGBITS, ALLOC | EXECINSTR: the code segment's image bytes;
+        // PROGBITS, WRITE | ALLOC: the data segment's (BG234)
+        secs.push(img_sec(".text", 1, 6, base, 0x1000, dsplit, 0, 0, 16, 0));
+        secs.push(img_sec(".data", 1, 3, base + dsplit, 0x1000 + dsplit, image_len - dsplit, 0, 0, 16, 0));
+    } else {
+        secs.push(img_sec(".text", 1, 7, base, 0x1000, image_len, 0, 0, 16, 0));
+        // PROGBITS, WRITE | ALLOC | EXECINSTR: the loaded image
+    }
+    secs.push(img_sec(".symtab", 2, 0, 0, offs.get(0), parts.get(0).len(), 3 + sh_after, 1, 8, 24));
+    // SYMTAB, names in .strtab (3, or 4 after .data), every symbol global
+    // (sh_info 1)
     secs.push(img_sec(".strtab", 3, 0, 0, offs.get(1), parts.get(1).len(), 0, 0, 1, 0));
     secs.push(img_sec(".debug_abbrev", 1, 0, 0, offs.get(2), parts.get(2).len(), 0, 0, 1, 0));
     secs.push(img_sec(".debug_info", 1, 0, 0, offs.get(3), parts.get(3).len(), 0, 0, 1, 0));
@@ -5780,13 +6091,17 @@ fn nat_elf_debug_sections(elf: Vec<i64>, image_len: i64, base: i64, symtab: Vec<
         // bytes of PT_INTERP and PT_DYNAMIC (file offset 0x1000 + image
         // offset, as nat_elf_img's program headers say)
         secs.push(img_sec(".interp", 1, 2, base + g_nat_ldyn_interp, 0x1000 + g_nat_ldyn_interp, g_nat_ldyn_interp_len, 0, 0, 1, 0));
-        var dlink: i64 = 3;
+        var dlink: i64 = 3 + sh_after;
         if dstr_off >= 0 {
             // STRTAB, ALLOC
             dlink = secs.len();
             secs.push(img_sec(".dynstr", 3, 2, base + dstr_off, 0x1000 + dstr_off, dstr_len, 0, 0, 1, 0));
         }
         secs.push(img_sec(".dynamic", 6, 3, base + g_nat_ldyn_dyn, 0x1000 + g_nat_ldyn_dyn, g_nat_ldyn_dyn_len, dlink, 0, 8, 16));
+    }
+    if note_len > 0 {
+        // NOTE, ALLOC, 4-aligned: inside the first PT_LOAD (the header page)
+        secs.push(img_sec(nat_elf_note_section(), 7, 2, base - 0x1000 + NAT_ELF_NOTE_AT, NAT_ELF_NOTE_AT, note_len, 0, 0, 4, 0));
     }
     img_elf_sections(&mut out, &secs);
     return out;
@@ -7597,6 +7912,16 @@ pub fn x64_cvtsi2sd(e: &mut NatEnc, x: i64, r: i64) {
     x64_modrm_rr(e, x, r);
 }
 
+/// BG337: cvtsi2ss xmm, r64 (F3 REX.W 0F 2A: one rounding to single; the
+/// upper bits of xmm are kept)
+pub fn x64_cvtsi2ss(e: &mut NatEnc, x: i64, r: i64) {
+    NatEnc_byte(e, 0xF3);
+    x64_rex(e, true, x, 0, r, false);
+    NatEnc_byte(e, 0x0F);
+    NatEnc_byte(e, 0x2A);
+    x64_modrm_rr(e, x, r);
+}
+
 pub fn x64_cvttsd2si(e: &mut NatEnc, r: i64, x: i64) {
     NatEnc_byte(e, 0xF2);
     x64_rex(e, true, r, 0, x, false);
@@ -7883,6 +8208,46 @@ fn nat_macho_dylinker(out: &mut Vec<i64>) {
 
 fn nat_macho_dylib(out: &mut Vec<i64>) {
     nat_macho_dylib_named(out, "/usr/lib/libSystem.B.dylib");
+}
+
+// --- XT77: the platform a Mach-O is for -------------------------------------
+// LC_BUILD_VERSION names the platform dyld and the kernel check (1
+// PLATFORM_MACOS, 2 PLATFORM_IOS, 7 PLATFORM_IOSSIMULATOR), the minimum OS
+// version and the SDK version, each as xxxx.yy.zz in nibbles (0x000F0000
+// is 15.0). The rest of the image is the same for iOS: libSystem from
+// /usr/lib, dyld's classic rebase/bind opcodes, LC_MAIN, the ad-hoc
+// signature (a device needs a real one, target roadmap XT81).
+
+/// XT77: the platform, minimum OS and SDK of the next Mach-O images
+/// (nat_macho, nat_macho_object). macOS 11.0, SDK 13.0 by default.
+pub var g_nat_macho_platform: i64 = 1;
+pub var g_nat_macho_minos: i64 = 0x000B0000;
+pub var g_nat_macho_sdkv: i64 = 0x000D0000;
+
+/// XT77: set the platform of the Mach-O images that follow; platform 0 (or
+/// 1) puts back macOS 11.0, SDK 13.0, so a build after an iOS one in the
+/// same process (fid serve, the LSP) writes a macOS image again.
+pub fn nat_macho_set_platform(platform: i64, minos: i64, sdk: i64) {
+    if platform <= 1 {
+        g_nat_macho_platform = 1;
+        g_nat_macho_minos = 0x000B0000;
+        g_nat_macho_sdkv = 0x000D0000;
+        return;
+    }
+    g_nat_macho_platform = platform;
+    g_nat_macho_minos = minos;
+    g_nat_macho_sdkv = sdk;
+}
+
+/// XT77: LC_BUILD_VERSION (0x32, 24 bytes): the platform, minos and sdk
+/// set by nat_macho_set_platform, no tool entries.
+fn nat_macho_build_version(out: &mut Vec<i64>) {
+    img_u32(out, 0x32);
+    img_u32(out, 24);
+    img_u32(out, g_nat_macho_platform);
+    img_u32(out, g_nat_macho_minos);
+    img_u32(out, g_nat_macho_sdkv);
+    img_u32(out, 0);
 }
 
 /// TG15: the dylib dyld loads for `extern "C" link "<lib>"` on macOS ("",
@@ -8335,13 +8700,9 @@ pub fn nat_macho_img(arch: i64, image: &Vec<i64>, entry: i64, data_off: i64, reb
     // the opcodes' names)
     img_macho_dysymtab_cmd(&mut lc, 0, nsyms, nsyms, 0, nsyms, 0);
     nat_macho_dylinker(&mut lc);
-    // LC_BUILD_VERSION: macOS, minos 11.0, sdk 13.0, 0 tools
-    img_u32(&mut lc, 0x32);
-    img_u32(&mut lc, 24);
-    img_u32(&mut lc, 1);
-    img_u32(&mut lc, 0x000B0000);
-    img_u32(&mut lc, 0x000D0000);
-    img_u32(&mut lc, 0);
+    // LC_BUILD_VERSION: macOS, minos 11.0, sdk 13.0, 0 tools (XT77: or
+    // the iOS device / simulator platform nat_macho_set_platform chose)
+    nat_macho_build_version(&mut lc);
     // LC_MAIN
     img_u32(&mut lc, 0x80000028);
     img_u32(&mut lc, 24);
@@ -9524,13 +9885,9 @@ pub fn nat_macho_object(arch: i64, e: &NatEnc, entry: i64, data_off: i64, imp_na
     // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
     img_macho_section_rel(&mut out, "__text", "__TEXT", 0, data_off, text_at, align, trel_at, trel.len() / 8, 0x80000400);
     img_macho_section_rel(&mut out, "__data", "__DATA", data_off, len - data_off, text_at + data_off, align, drel_at, drel.len() / 8, 0);
-    // LC_BUILD_VERSION: macOS, minos 11.0, sdk 13.0 (as nat_macho)
-    img_u32(&mut out, 0x32);
-    img_u32(&mut out, 24);
-    img_u32(&mut out, 1);
-    img_u32(&mut out, 0x000B0000);
-    img_u32(&mut out, 0x000D0000);
-    img_u32(&mut out, 0);
+    // LC_BUILD_VERSION: macOS, minos 11.0, sdk 13.0 (as nat_macho; XT77:
+    // the iOS platform when one was set)
+    nat_macho_build_version(&mut out);
     img_macho_symtab_cmd(&mut out, sym_at, nsyms, str_at, strtab.len());
     img_macho_dysymtab_cmd(&mut out, 0, nlocal, ext_ix, 1 + xsyms.len(), undef_ix, nsyms - undef_ix);
     img_pad_to(&mut out, text_at);
@@ -11128,6 +11485,36 @@ pub fn nsf_i2f(v: i64) -> i64 {
     return p_f64_to_bits(x);
 }
 
+/// BG337: the f32 pattern (zero-extended) of integer v, rounded once
+/// (cvtsi2ss, scvtf s, fcvt.s.l): the bits below the 53 an f64 holds are
+/// folded into one sticky bit (round to odd), so the narrowing is the only
+/// rounding. v = MIN goes through the unsigned shift.
+@wrapping
+pub fn nsf_i2s(v: i64) -> i64 {
+    var neg: bool = v < 0;
+    var m: i64 = v;
+    if neg {
+        m = 0 - v;
+    }
+    var scale: f64 = 1.0;
+    var sticky: i64 = 0;
+    if m < 0 {
+        sticky = m & 1;
+        m = nsel_shr(m, 1);
+        scale = 2.0;
+    }
+    while m >= 9007199254740992 {
+        sticky = sticky | (m & 1);
+        m = m >> 1;
+        scale = scale * 2.0;
+    }
+    var x: f64 = ((m | sticky) as f64) * scale;
+    if neg {
+        x = 0.0 - x;
+    }
+    return nsf_narrow(p_f64_to_bits(x));
+}
+
 /// RISC-V: the f32 in a float register's 64 bits: its low 32 when
 /// NaN-boxed (the upper 32 all ones), else the canonical NaN.
 @wrapping
@@ -11870,12 +12257,20 @@ fn nsx_sse(code: &Vec<i64>, p0: i64, at: i64, pfx: i64, rex: i64, regs: &mut Vec
         return "";
     }
     if op == 0x2A && pfx == 0xF2 {
-        // cvtsi2sd xmm, r64 (cvtsi2ss, one rounding to single, is not
-        // emitted: an integer becomes an f32 through f64)
+        // cvtsi2sd xmm, r64
         if !w {
             return "a 32-bit integer conversion (not evaluated) at byte " + int_to_str(at);
         }
         regs.set(xr, nsf_i2f(regs.get(rm)));
+        return "";
+    }
+    if op == 0x2A && pfx == 0xF3 {
+        // BG337: cvtsi2ss xmm, r64: one rounding to single, the low 32
+        // bits only
+        if !w {
+            return "a 32-bit integer conversion (not evaluated) at byte " + int_to_str(at);
+        }
+        regs.set(xr, (regs.get(xr) & (0 - 4294967296)) | nsf_i2s(regs.get(rm)));
         return "";
     }
     if op == 0x2C && (pfx == 0xF2 || pfx == 0xF3) {
@@ -12366,6 +12761,11 @@ fn nsa_more(w: i64, at: i64, regs: &mut Vec<i64>, st: &mut NselM) -> str {
         regs.set(fd, nsf_i2f(nsa_r(regs, n)));
         return "";
     }
+    if mov == 0x9E220000 {
+        // BG337: scvtf s, x (one rounding to single)
+        regs.set(fd, nsf_i2s(nsa_r(regs, n)));
+        return "";
+    }
     if mov == 0x9E780000 {
         nsa_set(regs, d, nsa_f2i(regs.get(fnn)));
         return "";
@@ -12792,6 +13192,14 @@ fn nsr_more(w: i64, at: i64, regs: &mut Vec<i64>, st: &mut NselM) -> str {
         regs.set(32 + rd, nsf_i2f(x));
         return "";
     }
+    if f7 == 0x68 && rs2 == 2 {
+        // BG337: fcvt.s.l (one rounding to single, NaN-boxed)
+        if f3 != 7 && f3 != 0 {
+            return "RISC-V conversion with a static rounding mode (not evaluated) at byte " + int_to_str(at);
+        }
+        regs.set(32 + rd, nsf_rv_box(nsf_i2s(x)));
+        return "";
+    }
     if (f7 == 0x61 || f7 == 0x60) && rs2 == 2 {
         if f3 != 1 {
             return "RISC-V float to integer not toward zero (not evaluated) at byte " + int_to_str(at);
@@ -13034,9 +13442,10 @@ pub fn nat_sel_fref(op: i64, imm: i64, is32: bool, a: i64, b: i64, ok: &mut Vec<
         return 0;
     }
     if op == NSEL_I2F {
-        // an integer becomes an f32 through f64 (the MIR's meaning)
+        // BG337: an integer becomes an f32 in one rounding (semantics-2
+        // §10 F32-cast), not through f64
         if is32 {
-            return nsf_narrow(nsf_i2f(a));
+            return nsf_i2s(a);
         }
         return nsf_i2f(a);
     }

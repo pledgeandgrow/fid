@@ -7504,7 +7504,7 @@ fn rast_stmt(s: Stmt, depth: i64, out: &mut Vec<str>) {
             out.push(ind + head);
             rast_expr(init, depth + 1, out);
         }
-        Stmt::LetTuple(names, init, _) => {
+        Stmt::LetTuple(names, init, _, _) => {
             out.push(ind + "LetTuple (" + str_join(names, ", ") + ")");
             rast_expr(init, depth + 1, out);
         }
@@ -8890,7 +8890,7 @@ fn lint_perf_stmt(s: Stmt, fname: str, depth: i64, site: i64, str_names: Vec<str
         Stmt::Let(n, oty, e, _, _, _, _) => {
             lint_perf_expr(e, fname, depth, site, str_names.clone(), warnings);
         }
-        Stmt::LetTuple(_, e, _) => {
+        Stmt::LetTuple(_, e, _, _) => {
             lint_perf_expr(e, fname, depth, site, str_names.clone(), warnings);
         }
         Stmt::LetUninit(_, _, _, _) => {
@@ -9439,6 +9439,19 @@ pub fn run_set_env(name: str, value: str) {
 /// not set (interp.fd interp_limit_defaults).
 pub fn run_limit_defaults(mem_bytes: i64, cpu_ms: i64) {
     interp_limit_defaults(mem_bytes, cpu_ms);
+}
+
+/// BG329: `fid run --timeout <seconds>` (0: none): the next interpreted
+/// run's wall-clock limit (interp.fd interp_wall_timeout).
+pub fn run_wall_timeout(secs: i64) {
+    interp_wall_timeout(secs);
+}
+
+/// BG486: run an already lowered module in the interpreter (what
+/// interpret_source_with_path does after lowering), so `fid run
+/// --crash-report` can mark where compiling ends and the program starts.
+pub fn run_ir_module(ir_mod: IrModule, max_recursion: i64, max_steps: i64, max_memory: i64, verbose: bool) -> i64 {
+    return interpret_ir_module_with_options(ir_mod, max_recursion, max_steps, max_memory, verbose);
 }
 
 /// CT7: record the effect calls of the next interpreted run into `path`
@@ -10034,6 +10047,111 @@ fn cc_find_duplicate_funcs(prog: Program, module: str, errors: &mut Vec<str>) {
         fi = fi + 1;
     }
     HashMap_drop(seen);
+    // BG372: a struct or enum defined twice (the type checker used the
+    // first, lowering the last); BG412: a const or global defined twice
+    // (the first won), a method defined twice for one type, in one impl
+    // block or in two (the last won). A @cfg variant is not a duplicate.
+    var tseen: i64 = HashMap_new();
+    var si: i64 = 0;
+    while si < prog.structs.len() {
+        var sd: StructDef = prog.structs.get(si);
+        if !cc_has_cfg_ann(sd.annotations) {
+            if HashMap_get(tseen, sd.name) != 0 {
+                errors.push("Duplicate definition: struct '" + sd.name + "' is defined twice in module '" + module + "'\n    Fix: remove one definition or rename it");
+            } else {
+                HashMap_insert(tseen, sd.name, 1);
+            }
+        }
+        si = si + 1;
+    }
+    var ei: i64 = 0;
+    while ei < prog.enums.len() {
+        var en: str = prog.enums.get(ei).name;
+        if HashMap_get(tseen, en) != 0 {
+            errors.push("Duplicate definition: enum '" + en + "' is defined twice in module '" + module + "'\n    Fix: remove one definition or rename it (a struct and an enum cannot share a name either)");
+        } else {
+            HashMap_insert(tseen, en, 1);
+        }
+        ei = ei + 1;
+    }
+    var vseen: i64 = HashMap_new();
+    var ci: i64 = 0;
+    while ci < prog.consts.len() {
+        var cn: str = prog.consts.get(ci).name;
+        if HashMap_get(vseen, cn) != 0 {
+            errors.push("Duplicate definition: const '" + cn + "' is defined twice in module '" + module + "'\n    Fix: remove one definition or rename it");
+        } else {
+            HashMap_insert(vseen, cn, 1);
+        }
+        ci = ci + 1;
+    }
+    var gi: i64 = 0;
+    while gi < prog.globals.len() {
+        var gn: str = prog.globals.get(gi).name;
+        if HashMap_get(vseen, gn) != 0 {
+            errors.push("Duplicate definition: global '" + gn + "' is defined twice in module '" + module + "'\n    Fix: remove one definition or rename it (a const and a global cannot share a name either)");
+        } else {
+            HashMap_insert(vseen, gn, 1);
+        }
+        gi = gi + 1;
+    }
+    // methods: the impls of a type that is not generic (a generic type's
+    // narrower impls specialize its methods, parser.fd
+    // pd_impl_specializations)
+    var mseen: i64 = HashMap_new();
+    var ii: i64 = 0;
+    while ii < prog.impls.len() {
+        var imp: ImplDef = prog.impls.get(ii);
+        if imp.type_params.len() == 0 && !cc_type_is_generic(prog, imp.struct_name) {
+            var mi: i64 = 0;
+            while mi < imp.methods.len() {
+                var m: Func = imp.methods.get(mi);
+                if !cc_has_cfg_ann(m.annotations) {
+                    var mk: str = imp.struct_name + "." + m.name;
+                    if HashMap_get(mseen, mk) != 0 {
+                        errors.push("Duplicate definition: method '" + m.name + "' of '" + imp.struct_name + "' is defined twice in module '" + module + "'\n    Fix: remove one definition or rename it (in one impl block or across several, a type has one method of a name)");
+                    } else {
+                        HashMap_insert(mseen, mk, 1);
+                    }
+                }
+                mi = mi + 1;
+            }
+        }
+        ii = ii + 1;
+    }
+    HashMap_drop(tseen);
+    HashMap_drop(vseen);
+    HashMap_drop(mseen);
+}
+
+fn cc_has_cfg_ann(anns: Vec<Annotation>) -> bool {
+    var i: i64 = 0;
+    while i < anns.len() {
+        if anns.get(i).name == "cfg" {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Whether struct or enum `name` of `prog` has type parameters.
+fn cc_type_is_generic(prog: Program, name: str) -> bool {
+    var i: i64 = 0;
+    while i < prog.structs.len() {
+        if prog.structs.get(i).name == name && prog.structs.get(i).type_params.len() > 0 {
+            return true;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < prog.enums.len() {
+        if prog.enums.get(i).name == name && prog.enums.get(i).type_params.len() > 0 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
 }
 
 pub fn merge_programs(stdlib: Program, user: Program) -> Program {
@@ -13191,7 +13309,7 @@ fn cc_vr_stmts(stmts: Vec<Stmt>) -> Vec<Stmt> {
             Stmt::Let(sbname, _, _, _, _, _, _) => {
                 cc_vr_bind(sbname);
             }
-            Stmt::LetTuple(sbnames, _, _) => {
+            Stmt::LetTuple(sbnames, _, _, _) => {
                 cc_vr_bind_all(sbnames);
             }
             Stmt::LetUninit(sbuname, _, _, _) => {
@@ -13212,8 +13330,8 @@ fn cc_vr_stmt(s: Stmt) -> Stmt {
         Stmt::Let(slname, slty, slexpr, slmut, slpersist, slann, slline) => {
             return Stmt::Let(slname, cc_vr_opt_type(slty), cc_vr_expr(slexpr), slmut, slpersist, slann, slline);
         }
-        Stmt::LetTuple(sltnames, sltexpr, sltline) => {
-            return Stmt::LetTuple(sltnames, cc_vr_expr(sltexpr), sltline);
+        Stmt::LetTuple(sltnames, sltexpr, sltline, sltline__m) => {
+            return Stmt::LetTuple(sltnames, cc_vr_expr(sltexpr), sltline, sltline__m);
         }
         Stmt::LetUninit(sluname, sluty, sluann, sluline) => {
             return Stmt::LetUninit(sluname, cc_vr_type(sluty), sluann, sluline);

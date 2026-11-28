@@ -35,7 +35,7 @@ pub fn new() -> Memo {
 ### get_or_compute
 
 ```fides
-pub fn get_or_compute(self, key: i64, compute: fn(i64) -> i64) -> i64 {
+pub fn get_or_compute(self: &mut Memo, key: i64, compute: fn(i64) -> i64) -> i64 {
 ```
 
 ### size
@@ -47,7 +47,7 @@ pub fn size(self) -> i64 {
 ### clear
 
 ```fides
-pub fn clear(self) {
+pub fn clear(self: &mut Memo) {
 ```
 
 *Defined at line 15*

@@ -1,0 +1,56 @@
+// BG443 (docs/roadmap/bugs-roadmap.md): lw_data_decode checks the MIC with
+// the caller's full 32-bit frame counter (the B0 block covers all 32 bits:
+// LoRaWAN's replay protection). A counter that does not end in the frame's
+// 16-bit FCnt, or lw_fcnt_extend's -1 (replay / gap too large), gives
+// ok=false and mic_ok=false instead of falling back to the 16-bit FCnt.
+//
+// Expected output:
+// extend(70000, 100): -1
+// fcnt -1: ok=false mic=false
+// fcnt 70100: ok=false mic=false
+// fcnt 100: ok=true mic=true fcnt=100 payload hi
+// fcnt 65636: ok=true mic=false fcnt=65636
+// fcnt 2^32+100: ok=false mic=false
+// known uplink fcnt 2: ok=true mic=true fcnt=2 payload test
+// known uplink fcnt -1: ok=false mic=false
+// known uplink fcnt 65538: ok=true mic=false fcnt=65538
+use lorawan;
+use encoding;
+
+fn bs(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn show(name: str, d: LwFrame) {
+    var s: str = name + ": ok=" + bs(d.ok) + " mic=" + bs(d.mic_ok);
+    if d.ok && d.mic_ok {
+        s = s + " fcnt=" + int_to_str(d.fcnt) + " payload " + str_from_bytes(d.payload);
+    } else if d.ok {
+        s = s + " fcnt=" + int_to_str(d.fcnt);
+    }
+    println(s);
+}
+
+fn main() {
+    val nk: Vec<i64> = hex_decode_bytes("44024241ed4ce9a68c6a8bc055233fd3");
+    val ak: Vec<i64> = hex_decode_bytes("ec925802ae430ca77fd3dd73cb2cc588");
+    // the entry's trigger: an uplink sent at FCnt 100, seen again after 70000
+    val fr: LwFrame = lw_frame(LW_UNCONFIRMED_UP, 0x26011BDA, 100, 1, str_bytes("hi"));
+    val b: Vec<i64> = lw_data_encode(&nk, &ak, &fr);
+    val ext: i64 = lw_fcnt_extend(70000, 100);
+    println("extend(70000, 100): " + int_to_str(ext));
+    show("fcnt -1", lw_data_decode(&nk, &ak, &b, ext));
+    show("fcnt 70100", lw_data_decode(&nk, &ak, &b, 70100));
+    show("fcnt 100", lw_data_decode(&nk, &ak, &b, 100));
+    show("fcnt 65636", lw_data_decode(&nk, &ak, &b, 65636));
+    show("fcnt 2^32+100", lw_data_decode(&nk, &ak, &b, 4294967396));
+
+    // lora-packet's known uplink 40F17DBE49..., FCnt 2, "test"
+    val pkt: Vec<i64> = hex_decode_bytes("40F17DBE4900020001954378762B11FF0D");
+    show("known uplink fcnt 2", lw_data_decode(&nk, &ak, &pkt, 2));
+    show("known uplink fcnt -1", lw_data_decode(&nk, &ak, &pkt, 0 - 1));
+    show("known uplink fcnt 65538", lw_data_decode(&nk, &ak, &pkt, 65538));
+}

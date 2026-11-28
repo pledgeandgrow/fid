@@ -278,9 +278,57 @@ pub fn ini_keys(doc: Vec<IniEntry>, section: str) -> Vec<str> {
 
 // ─── Mutation + serialization ───────────────────────────────────────────
 
+// Holds a byte ini_parse treats as the end of a line?
+fn ini_has_break(s: str) -> bool {
+    return str_contains(s, "\n") || str_contains(s, "\r");
+}
+
+// Starts or ends with a blank str_trim would drop?
+fn ini_edge_blank(s: str) -> bool {
+    var n: i64 = str_len(s);
+    return n > 0 && (str_len(str_trim(s)) != n);
+}
+
+/// Whether `key` can be written as `key = value` and read back as the same
+/// key: not empty, no '=' ':' or line break, no blank at either end, not
+/// starting with ';' '#' or '['. ini_set refuses other keys and
+/// ini_serialize leaves them out (BG451: "c:path" came back as key "c",
+/// a key holding "\n[admin]\n" injected a section).
+///
+/// Example:
+///   assert(ini_valid_key("port"));
+///   assert(!ini_valid_key("c:path"));
+pub fn ini_valid_key(key: str) -> bool {
+    if str_len(key) == 0 || ini_has_break(key) || ini_edge_blank(key) {
+        return false;
+    }
+    if str_contains(key, "=") || str_contains(key, ":") {
+        return false;
+    }
+    val c0: i64 = str_byte_at(key, 0);
+    return c0 != 59 && c0 != 35 && c0 != 91;
+}
+
+/// Whether `name` can be written as `[name]` and read back as the same
+/// section: no ']' or line break, no blank at either end ("" is the global
+/// section). ini_set refuses other names and ini_serialize leaves their
+/// keys out (BG451: section "a]b" came back as "a").
+///
+/// Example:
+///   assert(ini_valid_section("server"));
+///   assert(!ini_valid_section("a]b"));
+pub fn ini_valid_section(name: str) -> bool {
+    return !ini_has_break(name) && !ini_edge_blank(name) && !str_contains(name, "]");
+}
+
 /// Set `key` in `section` to `value`; replaces the first existing entry
-/// in-place, appends at the end otherwise.
+/// in-place, appends at the end otherwise. A key or section ini_serialize
+/// could not write back (see ini_valid_key, ini_valid_section) is refused:
+/// the document is left as it is.
 pub fn ini_set(doc: &mut Vec<IniEntry>, section: str, key: str, value: str) -> void {
+    if !ini_valid_key(key) || !ini_valid_section(section) {
+        return;
+    }
     var i: i64 = 0;
     while i < doc.len() {
         var e: IniEntry = doc.get(i);
@@ -340,13 +388,15 @@ fn ini_quote(v: str) -> str {
 
 /// Serialize back to INI text. Global keys come first; entries keep the
 /// order they appear in `doc`, grouped under section headers as they occur.
+/// An entry whose key or section could not be read back as written (see
+/// ini_valid_key, ini_valid_section) is left out (BG451).
 pub fn ini_serialize(doc: Vec<IniEntry>) -> str {
     var out: str = "";
     // Global section first.
     var i: i64 = 0;
     while i < doc.len() {
         var e: IniEntry = doc.get(i);
-        if str_len(e.section) == 0 {
+        if str_len(e.section) == 0 && ini_valid_key(e.key) {
             var v: str = e.value;
             if ini_needs_quotes(v) {
                 v = ini_quote(v);
@@ -358,11 +408,15 @@ pub fn ini_serialize(doc: Vec<IniEntry>) -> str {
     var secs: Vec<str> = ini_sections(doc);
     var s: i64 = 0;
     while s < secs.len() {
+        if !ini_valid_section(secs.get(s)) {
+            s = s + 1;
+            continue;
+        }
         out = out + "\n[" + secs.get(s) + "]\n";
         var j: i64 = 0;
         while j < doc.len() {
             var e2: IniEntry = doc.get(j);
-            if ini_eq_key(e2.section, secs.get(s)) {
+            if ini_eq_key(e2.section, secs.get(s)) && ini_valid_key(e2.key) {
                 var v2: str = e2.value;
                 if ini_needs_quotes(v2) {
                     v2 = ini_quote(v2);

@@ -1,0 +1,89 @@
+// Bugs roadmap BG225: the interpreter's p_mutex_lock only set a flag, so a
+// task that held the mutex across task_sleep let every other task in: the
+// three holders below each read the total, slept and wrote it back plus
+// one, and `fid run` printed 5 (want 15). Now (compiler/interp.fd
+// `p_mutex_lock`) a task that finds the mutex held gives its turn to the
+// others until it is unlocked.
+//   - three async fn holders, each 5 x lock / load / sleep / store / unlock;
+//   - the same with task_go tasks and task_run;
+//   - main and a spawned function, each holding it across a yield.
+// One worker, as test_mutex_tasks.fd (the C runtime's mutex, BG148) and
+// test_bg195_mutex_task_sleep.fd (pe_runtime's, BG195) run it.
+//@ env: FIDES_WORKERS=1
+//
+// Expected output:
+// 6
+// 15
+// 15
+// 40
+
+use task;
+
+var M: i64 = 0;
+var TOTAL: i64 = 0;
+
+async fn holder(m: i64, total: i64, id: i64) -> Future<i64> {
+    var i: i64 = 0;
+    while i < 5 {
+        p_mutex_lock(m);
+        val v = p_atomic_load(total);
+        task_sleep(2);
+        p_atomic_store(total, v + 1);
+        p_mutex_unlock(m);
+        i = i + 1;
+    }
+    return id;
+}
+
+fn go_holder(id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < 5 {
+        p_mutex_lock(M);
+        val v = p_atomic_load(TOTAL);
+        task_sleep(2);
+        p_atomic_store(TOTAL, v + 1);
+        p_mutex_unlock(M);
+        i = i + 1;
+    }
+    return id;
+}
+
+fn yielder(id: i64) -> i64 {
+    var i: i64 = 0;
+    while i < 20 {
+        p_mutex_lock(M);
+        val v = p_atomic_load(TOTAL);
+        task_yield();
+        p_atomic_store(TOTAL, v + 1);
+        p_mutex_unlock(M);
+        i = i + 1;
+    }
+    return id;
+}
+
+fn main() -> i64 {
+    val m = p_mutex_init();
+    val total = p_shared_alloc(8);
+    p_atomic_store(total, 0);
+    val a = holder(m, total, 1);
+    val b = holder(m, total, 2);
+    val c = holder(m, total, 3);
+    println(await a + await b + await c);
+    println(p_atomic_load(total));
+
+    M = p_mutex_init();
+    TOTAL = p_shared_alloc(8);
+    p_atomic_store(TOTAL, 0);
+    task_go("go_holder", 1);
+    task_go("go_holder", 2);
+    task_go("go_holder", 3);
+    task_run();
+    println(p_atomic_load(TOTAL));
+
+    p_atomic_store(TOTAL, 0);
+    val t = spawn yielder(1);
+    yielder(0);
+    await t;
+    println(p_atomic_load(TOTAL));
+    return 0;
+}

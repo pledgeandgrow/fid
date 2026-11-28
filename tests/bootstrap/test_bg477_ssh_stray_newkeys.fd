@@ -1,0 +1,69 @@
+// Bugs roadmap BG477: stdlib/ssh.fd never cleared pending_in_key after a
+// key exchange, so ssh_on_newkeys's guard ("NEWKEYS before the key
+// exchange") worked only for the first one: a NEWKEYS with no re-key in
+// progress (or before a re-key's ECDH) re-installed the old keys as new,
+// bumped kex_count and, with strict KEX, reset the sequence number. RFC
+// 4253 §7.3: NEWKEYS outside a key exchange is a protocol error. The
+// pending keys are now cleared when an exchange ends and when a KEXINIT
+// is sent. Sessions as in test_std_ssh (seeded, in memory). The x25519 and
+// ed25519 work is too slow for the interpreter, so compiled backends only.
+//@ backends: ccompile,emit
+//
+// Expected output:
+// ready true true
+// stray NEWKEYS: ready false kex 1 err NEWKEYS before the key exchange
+// rekey then stray NEWKEYS: ready false kex 1 err NEWKEYS before the key exchange
+
+use ssh;
+use vec;
+use encoding;
+
+fn hb(s: str) -> Vec<i64> {
+    return hex_decode_bytes(s);
+}
+
+fn pump(c: &mut SshSession, s: &mut SshSession, first_c: Vec<i64>, first_s: Vec<i64>) {
+    var to_s: Vec<i64> = first_c;
+    var to_c: Vec<i64> = first_s;
+    var rounds: i64 = 0;
+    while (to_s.len() > 0 || to_c.len() > 0) && rounds < 10 {
+        val a: Vec<i64> = ssh_feed(s, to_s);
+        val b: Vec<i64> = ssh_feed(c, to_c);
+        to_c = a;
+        to_s = b;
+        rounds = rounds + 1;
+    }
+}
+
+fn pair(c: &mut SshSession, s: &mut SshSession) {
+    ssh_set_kex_seed(c, str_bytes("client seed"));
+    ssh_set_kex_seed(s, str_bytes("server seed"));
+    val c0: Vec<i64> = ssh_start(c);
+    val s0: Vec<i64> = ssh_start(s);
+    pump(c, s, c0, s0);
+}
+
+fn newkeys() -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    p.push(21);
+    return p;
+}
+
+fn main() {
+    val host_seed: Vec<i64> = hb("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+    var c: SshSession = ssh_client_new("SSH-2.0-FidesSSH_1.0");
+    var s: SshSession = ssh_server_new("SSH-2.0-FidesSSHD_1.0", host_seed);
+    pair(&mut c, &mut s);
+    println(f"ready {ssh_ready(&c)} {ssh_ready(&s)}");
+    // no re-key in progress: a NEWKEYS from the client
+    val o1: Vec<i64> = ssh_feed(&mut s, ssh_send(&mut c, newkeys()));
+    println(f"stray NEWKEYS: ready {ssh_ready(&s)} kex {s.kex_count} err {s.err}");
+    // a re-key started by the client: its KEXINIT, then NEWKEYS before ECDH
+    var c2: SshSession = ssh_client_new("SSH-2.0-FidesSSH_1.0");
+    var s2: SshSession = ssh_server_new("SSH-2.0-FidesSSHD_1.0", host_seed);
+    pair(&mut c2, &mut s2);
+    val rk: Vec<i64> = ssh_rekey(&mut c2);
+    val o2: Vec<i64> = ssh_feed(&mut s2, rk);
+    val o3: Vec<i64> = ssh_feed(&mut s2, ssh_send(&mut c2, newkeys()));
+    println(f"rekey then stray NEWKEYS: ready {ssh_ready(&s2)} kex {s2.kex_count} err {s2.err}");
+}

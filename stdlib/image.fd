@@ -226,7 +226,8 @@ pub fn image_png_decode(d: Vec<i64>) -> Image {
         }
         pos = pos + 12 + len;
     }
-    if w <= 0 || h <= 0 || bd != 8 || interlace != 0 || idat.len() == 0 {
+    // PNG dimensions are at most 2^31 - 1 (PNG §11.2.2)
+    if w <= 0 || h <= 0 || w > 2147483647 || h > 2147483647 || bd != 8 || interlace != 0 || idat.len() == 0 {
         return bad;
     }
     var bpp: i64 = 0;
@@ -248,8 +249,16 @@ pub fn image_png_decode(d: Vec<i64>) -> Image {
         return bad;
     }
     val stride: i64 = w * bpp;
-    val raw: Vec<i64> = zlib_decompress(idat);
-    if raw.len() < h * (stride + 1) {
+    // h * (stride + 1) bytes of scanlines, past i64 for hostile sizes
+    // (BG400): no more than zlib_decompress's 256 MB cap, and IDAT is
+    // inflated only that far (a stream that inflates to more is bad).
+    val zcap: i64 = 268435456;
+    if stride + 1 > zcap / h {
+        return bad;
+    }
+    val need: i64 = h * (stride + 1);
+    val raw: Vec<i64> = zlib_decompress_max(idat, need);
+    if raw.len() < need {
         return bad;
     }
     // Unfilter every scanline into `px` (stride bytes per row).
@@ -366,15 +375,15 @@ pub fn image_bmp_decode(d: Vec<i64>) -> Image {
     val off: i64 = img_u32le(&d, 10);
     var w: i64 = img_u32le(&d, 18);
     var h: i64 = img_u32le(&d, 22);
-    // 32-bit negatives: top-down rows
+    // biHeight is signed: a negative one (read here as 2^31 and up) means
+    // top-down rows, of -biHeight (BG447); a negative width is invalid.
     var top_down: bool = false;
-    if h < 0 {
-        top_down = true;
-        h = 0 - h;
-    }
     if h > 2147483647 {
-        h = h - 4294967296;
+        h = 4294967296 - h;
         top_down = true;
+    }
+    if w > 2147483647 {
+        return bad;
     }
     val planes: i64 = img_u16le(&d, 26);
     val bpp: i64 = img_u16le(&d, 28);
@@ -384,7 +393,8 @@ pub fn image_bmp_decode(d: Vec<i64>) -> Image {
     }
     val bytes_px: i64 = bpp / 8;
     val row: i64 = (w * bytes_px + 3) / 4 * 4;
-    if off + row * h > d.len() {
+    // row * h overflows for hostile sizes (BG400): compare by division
+    if off > d.len() || row > (d.len() - off) / h {
         return bad;
     }
     var img: Image = image_create(w, h, 4);

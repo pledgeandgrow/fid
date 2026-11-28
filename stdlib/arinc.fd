@@ -180,8 +180,16 @@ pub fn arinc_queuing_port_create(name: str, max_nb_message: i64, max_message_siz
 }
 
 /// Send a message through a queuing port.
-/// Returns ARINC_NO_ERROR on success, ARINC_PORT_FULL if the queue is full.
+/// Returns ARINC_NO_ERROR on success, ARINC_INVALID_MODE on a destination
+/// port, ARINC_INVALID_CONFIG for a message longer than max_message_size
+/// (ARINC 653 SEND_QUEUING_MESSAGE), ARINC_PORT_FULL if the queue is full.
 pub fn arinc_queuing_port_send(port: &mut QueuingPort, message: Vec<i64>) -> i64 {
+    if port.direction != ARINC_PORT_SOURCE {
+        return ARINC_INVALID_MODE;
+    }
+    if message.len() > port.max_message_size {
+        return ARINC_INVALID_CONFIG;
+    }
     if port.count >= port.max_nb_message {
         return ARINC_PORT_FULL;
     }
@@ -196,10 +204,10 @@ pub fn arinc_queuing_port_send(port: &mut QueuingPort, message: Vec<i64>) -> i64
     return ARINC_NO_ERROR;
 }
 
-/// Receive a message from a queuing port.
+/// Peek at the oldest message of a queuing port.
 /// Returns the message as a Vec of bytes, or an empty Vec if empty.
-/// Reads the first (oldest) message. Does not remove from queue
-/// (Fides Vec API limitation — use count to track depth).
+/// Does not remove it: arinc_queuing_port_receive_message does (ARINC 653
+/// RECEIVE_QUEUING_MESSAGE).
 pub fn arinc_queuing_port_receive(port: QueuingPort) -> Vec<i64> {
     if port.count == 0 {
         return Vec::new();
@@ -211,6 +219,80 @@ pub fn arinc_queuing_port_receive(port: QueuingPort) -> Vec<i64> {
         result.push(port.msg_data.get(offset + i));
     }
     return result;
+}
+
+/// Drop the oldest message of a queuing port (it must hold one).
+fn arinc_queuing_port_drop_first(port: &mut QueuingPort) {
+    val first_len: i64 = port.msg_lengths.get(0);
+    var lengths: Vec<i64> = Vec::new();
+    var offsets: Vec<i64> = Vec::new();
+    var data: Vec<i64> = Vec::new();
+    var m: i64 = 1;
+    while m < port.count {
+        lengths.push(port.msg_lengths.get(m));
+        offsets.push(port.msg_offsets.get(m) - first_len);
+        m = m + 1;
+    }
+    var j: i64 = first_len;
+    while j < port.data_tail {
+        data.push(port.msg_data.get(j));
+        j = j + 1;
+    }
+    port.msg_lengths = lengths;
+    port.msg_offsets = offsets;
+    port.msg_data = data;
+    port.data_tail = port.data_tail - first_len;
+    port.count = port.count - 1;
+}
+
+/// Receive (and remove) the oldest message of a destination queuing port
+/// into `out` (cleared first), as ARINC 653 RECEIVE_QUEUING_MESSAGE.
+/// Returns ARINC_NO_ERROR, ARINC_INVALID_MODE on a source port, or
+/// ARINC_PORT_EMPTY when there is no message.
+pub fn arinc_queuing_port_receive_message(port: &mut QueuingPort, out: &mut Vec<i64>) -> i64 {
+    out.clear();
+    if port.direction != ARINC_PORT_DESTINATION {
+        return ARINC_INVALID_MODE;
+    }
+    if port.count == 0 {
+        return ARINC_PORT_EMPTY;
+    }
+    val len: i64 = port.msg_lengths.get(0);
+    val offset: i64 = port.msg_offsets.get(0);
+    var i: i64 = 0;
+    while i < len {
+        out.push(port.msg_data.get(offset + i));
+        i = i + 1;
+    }
+    arinc_queuing_port_drop_first(port);
+    return ARINC_NO_ERROR;
+}
+
+/// The channel between a source and a destination queuing port (the
+/// transfer the OS does): move the oldest messages of `src` into `dst`
+/// while `dst` has room and the message fits its max_message_size.
+/// Returns the number of messages moved.
+pub fn arinc_queuing_channel_transfer(src: &mut QueuingPort, dst: &mut QueuingPort) -> i64 {
+    var moved: i64 = 0;
+    while src.count > 0 && dst.count < dst.max_nb_message {
+        val len: i64 = src.msg_lengths.get(0);
+        if len > dst.max_message_size {
+            return moved;
+        }
+        val offset: i64 = src.msg_offsets.get(0);
+        dst.msg_lengths.push(len);
+        dst.msg_offsets.push(dst.data_tail);
+        var i: i64 = 0;
+        while i < len {
+            dst.msg_data.push(src.msg_data.get(offset + i));
+            i = i + 1;
+        }
+        dst.data_tail = dst.data_tail + len;
+        dst.count = dst.count + 1;
+        arinc_queuing_port_drop_first(src);
+        moved = moved + 1;
+    }
+    return moved;
 }
 
 /// Get the number of messages currently in the queue.
@@ -259,7 +341,16 @@ pub fn arinc_sampling_port_create(name: str, max_message_size: i64, direction: i
 }
 
 /// Write a message to a sampling port (overwrites previous).
+/// Returns ARINC_NO_ERROR, ARINC_INVALID_MODE on a destination port, or
+/// ARINC_INVALID_CONFIG for a message longer than max_message_size (ARINC
+/// 653 WRITE_SAMPLING_MESSAGE); on an error the port is unchanged.
 pub fn arinc_sampling_port_write(port: &mut SamplingPort, message: Vec<i64>, current_time: i64) -> i64 {
+    if port.direction != ARINC_PORT_SOURCE {
+        return ARINC_INVALID_MODE;
+    }
+    if message.len() > port.max_message_size {
+        return ARINC_INVALID_CONFIG;
+    }
     port.last_message = message;
     port.valid = true;
     port.last_update_time = current_time;
@@ -282,6 +373,26 @@ pub fn arinc_sampling_port_is_valid(port: SamplingPort, current_time: i64) -> bo
 /// Invalidate the sampling port data (mark as stale).
 pub fn arinc_sampling_port_invalidate(port: &mut SamplingPort) -> void {
     port.valid = false;
+}
+
+/// The channel between a source and a destination sampling port (the
+/// transfer the OS does): copy the source's message, validity and time to
+/// `dst`. Returns ARINC_INVALID_CONFIG (and leaves `dst`) when the message
+/// is longer than dst's max_message_size.
+pub fn arinc_sampling_channel_transfer(src: &SamplingPort, dst: &mut SamplingPort) -> i64 {
+    if src.last_message.len() > dst.max_message_size {
+        return ARINC_INVALID_CONFIG;
+    }
+    var copy: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < src.last_message.len() {
+        copy.push(src.last_message.get(i));
+        i = i + 1;
+    }
+    dst.last_message = copy;
+    dst.valid = src.valid;
+    dst.last_update_time = src.last_update_time;
+    return ARINC_NO_ERROR;
 }
 
 /// Get the port name.

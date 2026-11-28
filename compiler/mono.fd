@@ -1281,6 +1281,11 @@ fn subst_expr_part2(expr: Expr, subst: Vec<SubstEntry>, renames: Vec<RenameEntry
                 var p: Param = Param_new(params.get(i).name, subst_type(params.get(i).ty, subst), params.get(i).is_pub);
                 p.annotations = params.get(i).annotations;
                 p.is_variadic = params.get(i).is_variadic;
+                // BG391: a default value is kept (it was dropped: 0)
+                p.has_default = params.get(i).has_default;
+                if p.has_default {
+                    p.default_expr = subst_expr(params.get(i).default_expr, subst, renames, method_renames);
+                }
                 new_params.push(p);
                 i = i + 1;
             }
@@ -1412,8 +1417,8 @@ pub fn subst_stmt(stmt: Stmt, subst: Vec<SubstEntry>, renames: Vec<RenameEntry>,
         Stmt::LetUninit(name, ty, annotations, line) => {
             return Stmt::LetUninit(name, subst_type(ty, subst), annotations, line);
         }
-        Stmt::LetTuple(names, expr, line) => {
-            return Stmt::LetTuple(names, subst_expr(expr, subst, renames, method_renames), line);
+        Stmt::LetTuple(names, expr, line, line__m) => {
+            return Stmt::LetTuple(names, subst_expr(expr, subst, renames, method_renames), line, line__m);
         }
         Stmt::Assign(target, op, expr, line) => {
             return Stmt::Assign(target, op, subst_expr(expr, subst, renames, method_renames), line);
@@ -3172,12 +3177,60 @@ fn mn_fill_struct_defaults(name: str, fields: Vec<FieldInit>) -> Vec<FieldInit> 
                 j = j + 1;
             }
             if !written {
-                out.push(FieldInit_new(f.name, f.default_expr));
+                // BG425: a default that names anything is evaluated in the
+                // struct's scope, not the literal's (a local `PORT` hid
+                // the global `PORT` of `port: i64 = PORT`): it is the
+                // result of a function of its own, called here (once per
+                // literal, as reference §2.2 says). A literal is written
+                // in as it is; a generic struct's default stays inline.
+                if s.type_params.len() == 0 && !mn_default_is_literal(f.default_expr) {
+                    var dfn: str = "__sdef_" + sname + "_" + f.name;
+                    if !str_vec_contains(g_mono_sdef_fn_names, dfn) {
+                        g_mono_sdef_fn_names.push(dfn);
+                        var df: Func = Func_new(dfn, f.ty);
+                        var dbody: Vec<Stmt> = Vec::new();
+                        dbody.push(Stmt::Return(OptBoxExpr::Some(Box::new(f.default_expr)), 0));
+                        df.body = dbody;
+                        g_mono_sdef_fns.push(df);
+                    }
+                    out.push(FieldInit_new(f.name, Expr::Call(dfn, Vec::new())));
+                } else {
+                    out.push(FieldInit_new(f.name, f.default_expr));
+                }
             }
         }
         fi = fi + 1;
     }
     return out;
+}
+
+// BG425: the functions that compute struct field defaults
+// (mn_fill_struct_defaults), added to the program by monomorphize
+var g_mono_sdef_fn_names: Vec<str> = Vec::new();
+var g_mono_sdef_fns: Vec<Func> = Vec::new();
+
+/// Whether a field default is a literal (no name in it to resolve).
+fn mn_default_is_literal(e: Expr) -> bool {
+    match e {
+        Expr::IntLit(_) => {
+            return true;
+        }
+        Expr::FloatLit(_) => {
+            return true;
+        }
+        Expr::StringLit(_) => {
+            return true;
+        }
+        Expr::BoolLit(_) => {
+            return true;
+        }
+        Expr::Unary(_, inner) => {
+            return mn_default_is_literal(mn_box_expr_deref(inner));
+        }
+        _ => {
+        }
+    }
+    return false;
 }
 
 // --- F45 @redundant: dual-channel execution with a voter ------------------
@@ -3671,6 +3724,130 @@ fn mono_gm_ret_type(rt: Type, method: str, args: Vec<Expr>, func: Func) -> Type 
     val sub: Vec<SubstEntry> = method_subst(gen.func, gen.type_params, arg_types, rt);
     return subst_type(gen.func.ret_ty, sub);
 }
+
+// BG490: the result types of the methods of impls with no type parameters,
+// "Type::method" -> 1 + index into g_mono_im_rets (0 outside monomorphize)
+var g_mono_im_index: i64 = 0;
+var g_mono_im_rets: Vec<Type> = Vec::new();
+
+fn mono_im_add(type_name: str, methods: Vec<Func>) {
+    var j: i64 = 0;
+    while j < methods.len() {
+        val m: Func = methods.get(j);
+        val key: str = type_name + "::" + m.name;
+        if m.type_params.len() == 0 && HashMap_get(g_mono_im_index, key) == 0 {
+            g_mono_im_rets.push(m.ret_ty);
+            HashMap_insert(g_mono_im_index, key, g_mono_im_rets.len());
+        }
+        j = j + 1;
+    }
+}
+
+fn mono_im_setup(program: Program) {
+    if g_mono_im_index != 0 {
+        HashMap_drop(g_mono_im_index);
+    }
+    g_mono_im_index = HashMap_new();
+    g_mono_im_rets = Vec::new();
+    var i: i64 = 0;
+    while i < program.impls.len() {
+        val imp: ImplDef = program.impls.get(i);
+        if imp.type_params.len() == 0 {
+            mono_im_add(imp.struct_name, imp.methods);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < program.trait_impls.len() {
+        val ti: TraitImpl = program.trait_impls.get(i);
+        if ti.type_params.len() == 0 {
+            mono_im_add(ti.type_name, ti.methods);
+        }
+        i = i + 1;
+    }
+}
+
+/// BG490: the result type of `recv.method(..)` when the method's result
+/// does not depend on the call: a builtin Vec/HashMap/Option/Result/Rc
+/// method with a fixed result (`len` an i64, `contains` a bool; the type
+/// checker rejects methods on a str), or a method
+/// of a non-generic impl of a named type. Type::Infer when not known (the
+/// caller keeps its old answer). Before, `same(0, q.len())` with q a
+/// Vec<str> took the receiver's type for the length and instantiated
+/// `same__Vec__str`, which compared the 0 and the length as vectors.
+fn mono_known_method_ret(recv_ty: Type, method: str) -> Type {
+    var r: Type = recv_ty;
+    match recv_ty {
+        Type::Ref(inner, _) => {
+            r = box_type_deref(inner);
+        }
+        _ => {
+        }
+    }
+    match r {
+        Type::Generic(gn, gargs) => {
+            if gn == "Vec" {
+                if method == "len" || method == "capacity" || method == "find" || method == "position" || method == "index_of" {
+                    return Type::I64;
+                }
+                if method == "is_empty" || method == "contains" || method == "any" || method == "all" || method == "contains_val" {
+                    return Type::Bool;
+                }
+            }
+            if gn == "HashMap" {
+                if method == "len" {
+                    return Type::I64;
+                }
+                if method == "is_empty" || method == "contains" || method == "contains_key" {
+                    return Type::Bool;
+                }
+                if gargs.len() > 1 && (method == "keys" || method == "values") {
+                    var kv: Vec<Type> = Vec::new();
+                    if method == "keys" {
+                        kv.push(gargs.get(0));
+                    } else {
+                        kv.push(gargs.get(1));
+                    }
+                    return Type::Generic("Vec", kv);
+                }
+            }
+            if gn == "Option" && (method == "is_some" || method == "is_none") {
+                return Type::Bool;
+            }
+            if gn == "Result" && (method == "is_ok" || method == "is_err") {
+                return Type::Bool;
+            }
+            if (gn == "Rc" || gn == "Arc") && method == "count" {
+                return Type::I64;
+            }
+        }
+        Type::Named(tn) => {
+            if g_mono_im_index != 0 {
+                val at: i64 = HashMap_get(g_mono_im_index, tn + "::" + method);
+                if at > 0 && at <= g_mono_im_rets.len() {
+                    val mrt: Type = g_mono_im_rets.get(at - 1);
+                    match mrt {
+                        Type::Void => {
+                            return Type::Infer;
+                        }
+                        Type::Infer => {
+                            return Type::Infer;
+                        }
+                        _ => {
+                        }
+                    }
+                    if mono_type_mentions(mrt, "Self") {
+                        return Type::Infer;
+                    }
+                    return mrt;
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return Type::Infer;
+}
 var g_mono_dyn_ms: Vec<Vec<str>> = Vec::new();
 
 /// BG183: the methods a generic impl of `trait_name` for `type_name`
@@ -3714,6 +3891,8 @@ pub fn monomorphize(program: Program) -> Program {
         }
         ri = ri + 1;
     }
+    // BG490: what a method call gives (infer_expr_type)
+    mono_im_setup(program);
     var ctx: MonoCtx = MonoCtx_new();
 
     // Separate generic and non-generic functions. An instantiation already
@@ -3893,6 +4072,15 @@ pub fn monomorphize(program: Program) -> Program {
         i = i + 1;
     }
 
+    // BG425: the struct field default functions (a default's own literal
+    // with `..` may add more while they are processed)
+    var sdi: i64 = 0;
+    while sdi < g_mono_sdef_fns.len() {
+        new_funcs.push(process_func(g_mono_sdef_fns.get(sdi), &mut ctx));
+        sdi = sdi + 1;
+    }
+    g_mono_sdef_fn_names = Vec::new();
+    g_mono_sdef_fns = Vec::new();
     // Add all instantiated functions
     i = 0;
     while i < ctx.instantiated.len() {
@@ -3953,8 +4141,8 @@ pub fn fixup_generic_calls_stmt(stmt: Stmt, generics: GenericFuncMap, gm: Generi
             }
             return Stmt::Let(name, ty, fixup_generic_calls_expr(expr, generics, gm, current_func), is_mut, is_persist, annotations, line);
         }
-        Stmt::LetTuple(names, expr, line) => {
-            return Stmt::LetTuple(names, fixup_generic_calls_expr(expr, generics, gm, current_func), line);
+        Stmt::LetTuple(names, expr, line, line__m) => {
+            return Stmt::LetTuple(names, fixup_generic_calls_expr(expr, generics, gm, current_func), line, line__m);
         }
         Stmt::Return(opt, line) => {
             match opt {
@@ -4127,6 +4315,21 @@ pub fn method_subst(gen_func: Func, type_params: Vec<str>, arg_types: Vec<Type>,
         while sk < ssub.len() {
             if !subst_contains(subst, ssub.get(sk).key) {
                 subst_set(&mut subst, ssub.get(sk).key, ssub.get(sk).val);
+            } else {
+                // BG271: an argument bound the parameter to a literal's
+                // default type (i64 / f64: `o.unwrap_or(1.5)`) where the
+                // receiver says a narrower number (`Option<f32>`): the
+                // receiver's wins, as the type checker took it (the f64
+                // instance read the f32 payload as a double)
+                match subst_get(subst, ssub.get(sk).key) {
+                    OptType::Some(at) => {
+                        if mn_literal_widened(at, ssub.get(sk).val) {
+                            subst_set(&mut subst, ssub.get(sk).key, ssub.get(sk).val);
+                        }
+                    }
+                    OptType::None => {
+                    }
+                }
             }
             sk = sk + 1;
         }
@@ -4808,6 +5011,13 @@ pub fn instantiate(gen_func: Func, subst: Vec<SubstEntry>, mangled_name: str, ct
         var p: Param = Param_new(gen_func.params.get(i).name, resolved, gen_func.params.get(i).is_pub);
         p.annotations = gen_func.params.get(i).annotations;
         p.is_variadic = gen_func.params.get(i).is_variadic;
+        // BG391: the instance keeps the parameter's default value
+        // (Lowerer_resolve_call_args fills a short call from the instance's
+        // defaults: with `has_default` dropped, `idd(1)` passed 0)
+        p.has_default = gen_func.params.get(i).has_default;
+        if p.has_default {
+            p.default_expr = subst_expr(gen_func.params.get(i).default_expr, subst, rename_new(), rename_new());
+        }
         new_params.push(p);
         i = i + 1;
     }
@@ -4880,7 +5090,7 @@ pub fn collect_generic_calls_stmt_with_hint(stmt: Stmt, generics: GenericFuncMap
         }
         Stmt::LetUninit(name, ty, _annotations, line) => {
         }
-        Stmt::LetTuple(names, expr, line) => {
+        Stmt::LetTuple(names, expr, line, _) => {
             collect_generic_calls_expr_with_hint(expr, generics, generic_methods, calls, method_calls, current_func, OptType::None);
         }
         Stmt::Assign(target, op, expr, line) => {
@@ -5530,6 +5740,63 @@ fn mn_gstructs_setup(program: Program) {
 
 /// Whether `t`, inferred for a field's value, is a type mono knows (a
 /// variable's unknown type is Named(<its name>)).
+/// BG271: whether `arg_t` (what an argument bound a type parameter to) is
+/// the default type of a literal, i64 or f64, and `recv_t` (what the
+/// receiver binds it to) another number of the same kind: the literal took
+/// the receiver's type in the type checker.
+fn mn_literal_widened(arg_t: Type, recv_t: Type) -> bool {
+    var arg_f64: bool = false;
+    var arg_i64: bool = false;
+    match arg_t {
+        Type::F64 => {
+            arg_f64 = true;
+        }
+        Type::I64 => {
+            arg_i64 = true;
+        }
+        _ => {
+        }
+    }
+    if arg_f64 {
+        match recv_t {
+            Type::F32 => {
+                return true;
+            }
+            _ => {
+            }
+        }
+        return false;
+    }
+    if arg_i64 {
+        match recv_t {
+            Type::I8 => {
+                return true;
+            }
+            Type::I16 => {
+                return true;
+            }
+            Type::I32 => {
+                return true;
+            }
+            Type::U8 => {
+                return true;
+            }
+            Type::U16 => {
+                return true;
+            }
+            Type::U32 => {
+                return true;
+            }
+            Type::U64 => {
+                return true;
+            }
+            _ => {
+            }
+        }
+    }
+    return false;
+}
+
 fn mn_lit_arg_known(t: Type, value: Expr) -> bool {
     match t {
         Type::Named(_) => {
@@ -5767,6 +6034,16 @@ pub fn infer_expr_type(expr: Expr, func: Func) -> Type {
             // For associated function calls like Point::new(x, y),
             // the receiver is Expr::Ident("Point"); a variable has its type
             var rt: Type = infer_expr_type(mn_box_expr_deref(receiver), func);
+            // BG490: a method whose result is known gives that result, not
+            // the receiver's type (`q.len()` is an i64, not a Vec<str>)
+            val kmr: Type = mono_known_method_ret(rt, method);
+            match kmr {
+                Type::Infer => {
+                }
+                _ => {
+                    return kmr;
+                }
+            }
             match rt {
                 Type::Generic(gn, gargs) => {
                     if gargs.len() > 0 {

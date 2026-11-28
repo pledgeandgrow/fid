@@ -287,6 +287,70 @@ fn esc_collect_lt_structs(program: Program) {
         }
         sj = sj + 1;
     }
+    esc_collect_ref_aliases(program);
+}
+
+// BG252: an alias of a reference type (`type Ref = &A;`) is a reference to
+// the checks here as `&A` is. Alias name -> flags of what it resolves to:
+// 1 holds a reference (esc_contains_ref), 2 is one (esc_is_ref_type), 4 is
+// read through (esc_reads_through_type); 8 marks an alias with none of
+// them. Built by EscapeChecker_new; the parallel workers only read it.
+var g_esc_ref_aliases: i64 = 0;
+
+fn esc_alias_flags(name: str) -> i64 {
+    if g_esc_ref_aliases == 0 {
+        return 0;
+    }
+    return HashMap_get(g_esc_ref_aliases, name);
+}
+
+fn esc_collect_ref_aliases(program: Program) {
+    if g_esc_ref_aliases == 0 {
+        g_esc_ref_aliases = HashMap_new();
+    } else {
+        HashMap_clear(g_esc_ref_aliases);
+    }
+    // the alias chain is followed by name (at most 64 steps: a cycle is
+    // the type checker's error, BG240); the target's flags come from the
+    // same functions a declared type goes through
+    var ai: i64 = 0;
+    while ai < program.type_aliases.len() {
+        var target: Type = program.type_aliases.get(ai).alias_for;
+        var hops: i64 = 0;
+        var following: bool = true;
+        while following && hops < 64 {
+            following = false;
+            match target {
+                Type::Named(n) => {
+                    var aj: i64 = 0;
+                    while aj < program.type_aliases.len() && !following {
+                        if program.type_aliases.get(aj).name == n {
+                            target = program.type_aliases.get(aj).alias_for;
+                            following = true;
+                        }
+                        aj = aj + 1;
+                    }
+                }
+                _ => {
+                }
+            }
+            hops = hops + 1;
+        }
+        var flags: i64 = 8;
+        if esc_contains_ref(target) {
+            flags = flags + 1;
+        }
+        if esc_is_ref_type(target) {
+            flags = flags + 2;
+        }
+        if esc_reads_through_type(target) {
+            flags = flags + 4;
+        }
+        if flags != 8 {
+            HashMap_insert(g_esc_ref_aliases, program.type_aliases.get(ai).name, flags);
+        }
+        ai = ai + 1;
+    }
 }
 
 /// Whether `t` holds a reference anywhere (function types do not hold their
@@ -298,7 +362,8 @@ pub fn esc_contains_ref(t: Type) -> bool {
         }
         Type::Named(sn) => {
             // LG3: a struct with lifetime parameters holds references
-            return esc_is_lt_struct(sn);
+            // (BG252: so does an alias of a type that holds one)
+            return esc_is_lt_struct(sn) || esc_alias_flags(sn) % 2 == 1;
         }
         Type::Generic(gn, args) => {
             if esc_is_lt_struct(gn) {
@@ -719,6 +784,10 @@ fn esc_reads_through_type(t: Type) -> bool {
                 }
             }
         }
+        Type::Named(an) => {
+            // BG252: an alias of `&Vec`, `&HashMap` or `&str`
+            return (esc_alias_flags(an) / 4) % 2 == 1;
+        }
         _ => {
             return false;
         }
@@ -923,6 +992,10 @@ fn esc_is_ref_type(t: Type) -> bool {
     match t {
         Type::Ref(_, _) => {
             return true;
+        }
+        Type::Named(an) => {
+            // BG252: an alias of a reference type
+            return (esc_alias_flags(an) / 2) % 2 == 1;
         }
         _ => {
             return false;
@@ -1368,7 +1441,7 @@ fn esc_stmt(self: &mut EscapeChecker, s: Stmt) {
             }
             esc_declare_fn(self, name, r, is_ref, fn_noref);
         }
-        Stmt::LetTuple(names, expr, _) => {
+        Stmt::LetTuple(names, expr, _, _) => {
             var tr: Vec<EscRoot> = esc_expr(self, expr);
             var ni: i64 = 0;
             while ni < names.len() {
@@ -2100,7 +2173,7 @@ fn esc_idents_stmt(s: Stmt, out: &mut Vec<str>) {
         Stmt::Let(_, _, expr, _, _, _, _) => {
             esc_idents_expr(expr, out);
         }
-        Stmt::LetTuple(_, expr, _) => {
+        Stmt::LetTuple(_, expr, _, _) => {
             esc_idents_expr(expr, out);
         }
         Stmt::Assign(_, _, expr, _) => {

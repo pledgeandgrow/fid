@@ -1,0 +1,67 @@
+// Bugs roadmap BG473: stdlib/tls_crypto.fd chacha20poly_decrypt returned
+// an empty Vec both for a forged ciphertext and for a genuine empty
+// plaintext, so an authentication failure could not be told from an
+// authenticated empty message. chacha20poly_open reports the tag check
+// (TlsAeadOpened.ok) apart from the plaintext; decrypt keeps its form.
+// Key 0..31, nonce 0..11, empty AAD.
+//
+// Expected output:
+// sealed 16
+// genuine empty: ok true len 0
+// forged empty: ok false len 0
+// genuine abc: ok true len 3 97
+// forged abc: ok false len 0
+// short: ok false
+// decrypt empty 0
+
+use tls_crypto;
+
+fn main() {
+    var key: Vec = Vec::new();
+    var i: i64 = 0;
+    while i < 32 {
+        key.push(i);
+        i = i + 1;
+    }
+    var nonce: Vec = Vec::new();
+    i = 0;
+    while i < 12 {
+        nonce.push(i);
+        i = i + 1;
+    }
+    val aad: Vec = Vec::new();
+    val empty: Vec = Vec::new();
+    val sealed: Vec = chacha20poly_encrypt(key, nonce, aad, empty);
+    println(f"sealed {sealed.len()}");
+    val g: TlsAeadOpened = chacha20poly_open(key, nonce, aad, sealed);
+    println(f"genuine empty: ok {g.ok} len {g.plain.len()}");
+    var forged: Vec = Vec::new();
+    i = 0;
+    while i < sealed.len() {
+        forged.push(sealed.get(i));
+        i = i + 1;
+    }
+    forged.set(0, forged.get(0) ^ 1);
+    val f: TlsAeadOpened = chacha20poly_open(key, nonce, aad, forged);
+    println(f"forged empty: ok {f.ok} len {f.plain.len()}");
+    var pt: Vec = Vec::new();
+    pt.push(97);
+    pt.push(98);
+    pt.push(99);
+    val s2: Vec = chacha20poly_encrypt(key, nonce, aad, pt);
+    val g2: TlsAeadOpened = chacha20poly_open(key, nonce, aad, s2);
+    println(f"genuine abc: ok {g2.ok} len {g2.plain.len()} {g2.plain.get(0)}");
+    var f2v: Vec = Vec::new();
+    i = 0;
+    while i < s2.len() {
+        f2v.push(s2.get(i));
+        i = i + 1;
+    }
+    f2v.set(s2.len() - 1, f2v.get(s2.len() - 1) ^ 128);
+    val f2: TlsAeadOpened = chacha20poly_open(key, nonce, aad, f2v);
+    println(f"forged abc: ok {f2.ok} len {f2.plain.len()}");
+    var short: Vec = Vec::new();
+    short.push(1);
+    println(f"short: ok {chacha20poly_open(key, nonce, aad, short).ok}");
+    println(f"decrypt empty {chacha20poly_decrypt(key, nonce, aad, sealed).len()}");
+}

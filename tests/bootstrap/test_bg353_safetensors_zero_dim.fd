@@ -1,0 +1,75 @@
+// BG353 (docs/roadmap/bugs-roadmap.md): st_tensor loads a tensor with a
+// zero-length dimension (shape [0, 4], data_offsets [a, a]) with found=true
+// and 0 elements; the format allows empty tensors and real checkpoints have
+// them. As in the reference loader (Rust safetensors: the element count is
+// a checked product over the shape, in order), a zero-length tensor must
+// have no data, and a product that overflows before the zero is still
+// refused (BG320). A dimension that is not a whole number, or does not fit
+// in i64 (which str_parse_int would read as 0), is refused.
+//
+// Expected output:
+// true 0 0
+// true 0 0
+// true 0 0
+// true 0 0
+// false
+// false
+// false
+// false
+// false
+// true 6 24
+use safetensors;
+use vec;
+
+// A safetensors file: u64le header length, the JSON header, `data` bytes.
+fn st_file(header: str, data: i64) -> Vec<i64> {
+    var b: Vec<i64> = Vec::new();
+    var n: i64 = str_len(header);
+    var i: i64 = 0;
+    while i < 8 {
+        b.push((n >> (i * 8)) & 255);
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        b.push(str_byte_at(header, i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < data {
+        b.push(0);
+        i = i + 1;
+    }
+    return b;
+}
+
+fn show(header: str, data: i64) {
+    val b = st_file(header, data);
+    val s = st_open(b);
+    val t = st_tensor(b, s, "z");
+    if t.found {
+        println(f"true {st_elems(t)} {t.data_end - t.data_begin}");
+    } else {
+        println("false");
+    }
+}
+
+fn main() -> i64 {
+    // the entry's trigger
+    show("{\"z\":{\"dtype\":\"F32\",\"shape\":[0,4],\"data_offsets\":[0,0]}}", 0);
+    // the zero last, alone, and at an offset past other data
+    show("{\"z\":{\"dtype\":\"F32\",\"shape\":[4,0],\"data_offsets\":[0,0]}}", 0);
+    show("{\"z\":{\"dtype\":\"U8\",\"shape\":[0],\"data_offsets\":[0,0]}}", 0);
+    show("{\"z\":{\"dtype\":\"F64\",\"shape\":[3,0,7],\"data_offsets\":[16,16]}}", 16);
+    // an empty tensor that claims data
+    show("{\"z\":{\"dtype\":\"F32\",\"shape\":[0,4],\"data_offsets\":[0,4]}}", 4);
+    // a product that overflows before the zero (BG320)
+    show("{\"z\":{\"dtype\":\"F32\",\"shape\":[4294967296,4294967296,0],\"data_offsets\":[0,0]}}", 0);
+    // dimensions that are not whole numbers in i64
+    show("{\"z\":{\"dtype\":\"F32\",\"shape\":[99999999999999999999,4],\"data_offsets\":[0,0]}}", 0);
+    show("{\"z\":{\"dtype\":\"F32\",\"shape\":[-1,4],\"data_offsets\":[0,0]}}", 0);
+    show("{\"z\":{\"dtype\":\"F32\",\"shape\":[0.5,4],\"data_offsets\":[0,0]}}", 0);
+    // an ordinary tensor still loads
+    show("{\"z\":{\"dtype\":\"F32\",\"shape\":[2,3],\"data_offsets\":[0,24]}}", 24);
+    return 0;
+}

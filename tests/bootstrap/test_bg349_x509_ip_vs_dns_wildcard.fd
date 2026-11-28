@@ -1,0 +1,73 @@
+// BG349 (docs/roadmap/bugs-roadmap.md): x509_matches_host matches a host
+// that is an IP address (x509_ip_parse) against iPAddress SANs only, never
+// against a dNSName or the subject CN (RFC 6125 §6.2.1, RFC 9525 §6.3), so
+// a dNSName "*.0.0.1" or "1.0.0.2" no longer authenticates the address.
+// Certificates made with openssl 3.5: one with subjectAltName =
+// DNS:*.0.0.1, DNS:1.0.0.2, IP:10.0.0.9, DNS:host.example.test (CN
+// 1.0.0.4), one with no SAN and CN 1.0.0.3.
+//
+// Expected output:
+// parsed true true
+// 1.0.0.1 false
+// 1.0.0.2 false
+// 1.0.0.4 false
+// 10.0.0.9 true
+// ::ffff:10.0.0.9 false
+// host.example.test true
+// a.0.0.1 true
+// 1.0.0.3 false
+// other.test false
+use x509;
+use string;
+
+fn ipdns_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+        "MIIBizCCATCgAwIBAgIULaN3oO3RSUW2t4oYdFqHg2F+l2swCgYIKoZIzj0EAwIw\n" +
+        "EjEQMA4GA1UEAwwHMS4wLjAuNDAgFw0yNjExMjcyMDE1NDBaGA8yMTI2MTEwMzIw\n" +
+        "MTU0MFowEjEQMA4GA1UEAwwHMS4wLjAuNDBZMBMGByqGSM49AgEGCCqGSM49AwEH\n" +
+        "A0IABINCqBwFau0+3FWd+BgnhrogUuw+SrIOcVUVg0SfEKRfWNBNaXuzlNE4pn+s\n" +
+        "oZFHrm4rq2f2wiU7SMI6w+U/HtqjYjBgMAkGA1UdEwQCMAAwNAYDVR0RBC0wK4IH\n" +
+        "Ki4wLjAuMYIHMS4wLjAuMocECgAACYIRaG9zdC5leGFtcGxlLnRlc3QwHQYDVR0O\n" +
+        "BBYEFHNPvVpSYapmpRazeO2kyhT0wvzyMAoGCCqGSM49BAMCA0kAMEYCIQDhXh8S\n" +
+        "3zh7KyNh9g6rgPnguoPRKqcUzjZzXegbEchMYwIhAMx/A1cxqiPg46fG07cmT3JW\n" +
+        "bT0Rz/cBZYBmKaA00jcA\n" +
+        "-----END CERTIFICATE-----\n";
+}
+
+fn cnip_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+        "MIIBVDCB+qADAgECAhRdS4tKBDZQ78yEhvHuvmwHZcsoQjAKBggqhkjOPQQDAjAS\n" +
+        "MRAwDgYDVQQDDAcxLjAuMC4zMCAXDTI2MTEyNzIwMTU0MFoYDzIxMjYxMTAzMjAx\n" +
+        "NTQwWjASMRAwDgYDVQQDDAcxLjAuMC4zMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcD\n" +
+        "QgAEg0KoHAVq7T7cVZ34GCeGuiBS7D5Ksg5xVRWDRJ8QpF9Y0E1pe7OU0Timf6yh\n" +
+        "kUeubiurZ/bCJTtIwjrD5T8e2qMsMCowCQYDVR0TBAIwADAdBgNVHQ4EFgQUc0+9\n" +
+        "WlJhqmalFrN47aTKFPTC/PIwCgYIKoZIzj0EAwIDSQAwRgIhAIAq9bRPrVAcGw/J\n" +
+        "33XLHoiwrUNU1eoFH6cVmtZ9HzJHAiEAntuatCs6qrBrZb46j+VWPDQTEdG37N9+\n" +
+        "YgNzwhYL0vA=\n" +
+        "-----END CERTIFICATE-----\n";
+}
+
+fn host(c: X509Cert, h: str) -> void {
+    println(h + " " + bool_to_str(x509_matches_host(c, h)));
+}
+
+fn main() -> i64 {
+    val c: X509Cert = x509_parse_pem(ipdns_pem());
+    val cn: X509Cert = x509_parse_pem(cnip_pem());
+    println("parsed " + bool_to_str(c.ok) + " " + bool_to_str(cn.ok));
+    // the entry's trigger: the wildcard dNSName "*.0.0.1"
+    host(c, "1.0.0.1");
+    // a dNSName and a CN written as the address
+    host(c, "1.0.0.2");
+    host(c, "1.0.0.4");
+    // the iPAddress SAN still matches; IPv4 and IPv4-mapped IPv6 differ
+    host(c, "10.0.0.9");
+    host(c, "::ffff:10.0.0.9");
+    // DNS names are unchanged, the wildcard included
+    host(c, "host.example.test");
+    host(c, "a.0.0.1");
+    // a SAN-less certificate whose CN is an address
+    host(cn, "1.0.0.3");
+    host(cn, "other.test");
+    return 0;
+}

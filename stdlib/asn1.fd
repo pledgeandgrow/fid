@@ -517,6 +517,11 @@ pub fn asn1_get_time(buf: &Vec<i64>, t: Asn1Tlv) -> Option<i64> {
     val mi: i64 = asn1_digits(buf, p + 6, 2);
     p = p + 8;
     var s: i64 = 0;
+    // BG355: DER / RFC 5280 §4.1.2.5.2: a GeneralizedTime has its seconds
+    // (YYYYMMDDHHMMSSZ); "202503030000Z" was read as 00 seconds
+    if t.tag == ASN1_GENERALIZED_TIME && p + 2 >= end {
+        return Option::None;
+    }
     if p + 2 < end || (p + 2 == end && (buf.get(p) & 255) != 90) {
         s = asn1_digits(buf, p, 2);
         p = p + 2;
@@ -531,6 +536,20 @@ pub fn asn1_get_time(buf: &Vec<i64>, t: Asn1Tlv) -> Option<i64> {
         return Option::None;
     }
     if mo < 1 || mo > 12 || d < 1 || d > 31 || h < 0 || h > 23 || mi < 0 || mi > 59 || s < 0 || s > 60 {
+        return Option::None;
+    }
+    // BG355: the day must exist in its month (Feb 31 and Apr 31 were
+    // normalised into the next month)
+    var dim: i64 = 31;
+    if mo == 4 || mo == 6 || mo == 9 || mo == 11 {
+        dim = 30;
+    } else if mo == 2 {
+        dim = 28;
+        if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            dim = 29;
+        }
+    }
+    if d > dim {
         return Option::None;
     }
     return Option::Some(asn1_unix_time(y, mo, d, h, mi, s));

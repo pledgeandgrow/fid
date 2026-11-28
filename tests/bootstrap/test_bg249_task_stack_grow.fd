@@ -1,0 +1,69 @@
+// Bugs roadmap BG249: on `--nat` Windows each task's stack (PE_TASK_STACK
+// + PE_GUARD, 320 KB) was committed whole when the task was made
+// (VirtualAlloc MEM_COMMIT), so 100,000 sleeping tasks asked for 32.8 GB
+// and the next stack was refused ("Panic: out of memory (327680 bytes
+// requested)", tests/bootstrap/bench_sleepers.fd). Now
+// (stdlib/linux_runtime/conc.fd pe_task_stack_new, win.fd
+// pe_win_task_stack) such a stack is reserved, its top 16 KB committed
+// with a PAGE_GUARD page under it, and the TEB's stack fields describe it:
+// the system commits the rest as it is used, as for a fiber.
+//
+// This checks the growth: tasks whose recursion needs far more than the
+// 16 KB committed at the start (about 150 KB each), several alive at once,
+// run to the end with the right results; and many small tasks alive
+// together still run. (bench_sleepers is the test of the commit charge.)
+//
+// Expected output:
+// deep 1500 1500 1500 1500
+// small 20000 199990000
+use task;
+
+fn rec(n: i64, depth: i64) -> i64 {
+    var buf: Vec<i64> = Vec::new();
+    buf.push(n);
+    buf.push(depth);
+    if n == 0 {
+        return depth;
+    }
+    return rec(n - 1, depth + 1) + buf.get(0) - n;
+}
+
+async fn deep(n: i64) -> Future<i64> {
+    task_sleep(20);
+    return rec(n, 0);
+}
+
+async fn small(id: i64) -> Future<i64> {
+    task_sleep(50);
+    return id;
+}
+
+fn main() -> i64 {
+    var fs: Vec<Future<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < 4 {
+        fs.push(deep(1500));
+        i = i + 1;
+    }
+    var line: str = "deep";
+    i = 0;
+    while i < fs.len() {
+        line = line + " " + int_to_str(await fs.get(i));
+        i = i + 1;
+    }
+    println(line);
+    var ss: Vec<Future<i64>> = Vec::new();
+    i = 0;
+    while i < 20000 {
+        ss.push(small(i));
+        i = i + 1;
+    }
+    var sum: i64 = 0;
+    i = 0;
+    while i < ss.len() {
+        sum = sum + await ss.get(i);
+        i = i + 1;
+    }
+    println("small " + int_to_str(ss.len()) + " " + int_to_str(sum));
+    return 0;
+}

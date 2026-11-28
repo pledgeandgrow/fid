@@ -1,0 +1,41 @@
+// Bugs roadmap BG256: `use parallel;` did not compile on its own:
+// stdlib/parallel.fd's par_map, par_for_each, par_reduce and par_sum_by
+// gave their function value to spawned workers, and a function value is
+// not @send (reference.md 10.1), so every program importing the module was
+// rejected ("argument 5 of the spawned call has type fn(i64) -> i64, which
+// is not @send"). Those four now run sequentially (a closure's captures
+// would be shared with the thread); par_sum and par_dot still use threads.
+// Inputs past PAR_THRESHOLD (10,000) take what was the parallel path
+// (par_sum and par_dot are given small inputs: under `fid run` a thread's
+// copy of a 20,000-element Vec takes over a minute).
+//
+// Expected output:
+// 16 9 100000000
+// 50005000
+// 50005000
+// 10000
+// 10 30
+
+use parallel;
+
+var SEEN: i64 = 0;
+
+fn count(x: i64) -> i64 {
+    SEEN = SEEN + 1;
+    return x;
+}
+
+fn main() -> i64 {
+    val big = par_range(1, 10001);
+    val small = par_range(1, 5);
+    val sq = par_map(small, fn(x: i64) -> i64 { return x * x; });
+    val bsq = par_map(big, fn(x: i64) -> i64 { return x * x; });
+    println(int_to_str(sq.get(3)) + " " + int_to_str(sq.get(2)) + " " + int_to_str(bsq.get(9999)));
+    println(par_reduce(big, 0, fn(a: i64, x: i64) -> i64 { return a + x; }));
+    val off: i64 = 0;
+    println(par_sum_by(big, fn(x: i64) -> i64 { return x + off; }));
+    par_for_each(big, count);
+    println(SEEN);
+    println(int_to_str(par_sum(small)) + " " + int_to_str(par_dot(small, small)));
+    return 0;
+}

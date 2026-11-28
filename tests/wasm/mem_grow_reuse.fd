@@ -1,0 +1,70 @@
+// XT31: the linear memory grows on demand (memory.grow) and what is freed
+// is reused (stdlib/linux_runtime/wasi.fd: munmap gives whole pages to a
+// free list, mmap takes from it before growing the memory). Each round
+// holds 200 MB at once, in blocks of another size (large blocks with
+// mappings of their own, blocks bumped from the allocator's 4 MB chunks,
+// many small strings), checks every block's contents, then frees it all.
+// tests/wasm/memory-check.sh runs it under Node and checks the output and
+// that the memory at exit (it never shrinks: its peak) stays under 260 MB:
+// without the reuse every round grew the memory by its 200 MB again.
+//
+// Expected output: tests/wasm/mem_grow_reuse.expected
+
+fn fill_round(round: i64, words: i64, count: i64) -> i64 {
+    var blocks: Vec<Vec<i64>> = Vec::new();
+    var i: i64 = 0;
+    while i < count {
+        var v: Vec<i64> = Vec::filled(words, round * 1000 + i);
+        v.set(words - 1, i);
+        blocks.push(v);
+        i = i + 1;
+    }
+    // every block holds what was written to it (no two share memory)
+    var bad: i64 = 0;
+    i = 0;
+    while i < count {
+        var b: Vec<i64> = blocks.get(i);
+        if b.get(0) != round * 1000 + i || b.get(words / 2) != round * 1000 + i || b.get(words - 1) != i {
+            bad = bad + 1;
+        }
+        i = i + 1;
+    }
+    return bad;
+}
+
+fn string_round(round: i64) -> i64 {
+    // 200 MB in 200,000 strings of 991 bytes (a 1 KB block each, with
+    // the string's and the block's headers)
+    var keep: Vec<str> = Vec::new();
+    var piece: str = str_repeat("m", 990);
+    var i: i64 = 0;
+    while i < 200000 {
+        keep.push(piece + int_to_str(round));
+        i = i + 1;
+    }
+    var bad: i64 = 0;
+    i = 0;
+    while i < keep.len() {
+        if str_len(keep.get(i)) != 990 + str_len(int_to_str(round)) {
+            bad = bad + 1;
+        }
+        i = i + 1;
+    }
+    return bad;
+}
+
+fn main() -> i64 {
+    var round: i64 = 1;
+    while round <= 3 {
+        // 50 blocks of 4 MB (each a mapping of its own)
+        println("round " + int_to_str(round) + " large: " + int_to_str(fill_round(round, 524288, 50)) + " bad");
+        // 400 blocks of 508 KB (512 KB blocks of the allocator's chunks)
+        println("round " + int_to_str(round) + " medium: " + int_to_str(fill_round(round, 65000, 400)) + " bad");
+        // 25 blocks of 8 MB
+        println("round " + int_to_str(round) + " huge: " + int_to_str(fill_round(round, 1048576, 25)) + " bad");
+        println("round " + int_to_str(round) + " strings: " + int_to_str(string_round(round)) + " bad");
+        round = round + 1;
+    }
+    println("done");
+    return 0;
+}

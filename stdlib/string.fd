@@ -431,6 +431,11 @@ pub fn bool_to_str(b: bool) -> str {
 ///   assert_eq(int_to_str_padded(7, 3), "007");
 pub fn int_to_str_padded(n: i64, width: i64) -> str {
     var s = int_to_str(n);
+    // BG344: the zeros go after the minus sign ("-007", not "00-7"), as
+    // f"{n:04}" does; the width counts the sign
+    if n < 0 {
+        return "-" + str_pad_left(str_slice(s, 1, str_len(s)), width - 1, 48);
+    }
     return str_pad_left(s, width, 48);
     // '0' = 48
 }
@@ -747,13 +752,9 @@ pub fn rope_byte_at(r: Rope, idx: i64) -> i64 {
 /// This is O(log n) for balanced ropes.
 pub fn rope_substring(r: Rope, start: i64, end: i64) -> Rope {
     var s: str = rope_to_str(r);
-    var sub: str = "";
-    // SAFETY: p_string_substring returns a new counted string (AGENTS.md
-    // Known Bugs 25: every runtime string producer does) whose one owner is
-    // handed to `sub` here.
-    unsafe {
-        sub = p_string_substring(s, start, end) as str;
-    }
+    // core's str_slice, not the legacy p_string_substring builtin, which
+    // the default Windows backend (pe_ir) does not have (BG307).
+    var sub: str = str_slice(s, start, end);
     return rope_new(sub);
 }
 
@@ -960,19 +961,28 @@ impl StrView {
         if i >= self.len {
             return fallback;
         }
+        // BG345 (as BG175 in core): built negative, where i64::MIN fits,
+        // each step checked first: a value outside i64 gives `fallback`
+        // instead of panicking on the checked multiply
         var n: i64 = 0;
         while i < self.len {
             var c: i64 = self.byte_at(i);
             if c < 48 || c > 57 {
                 return fallback;
             }
-            n = n * 10 + (c - 48);
+            if n < -922337203685477580 || (n == -922337203685477580 && c - 48 > 8) {
+                return fallback;
+            }
+            n = n * 10 - (c - 48);
             i = i + 1;
         }
         if neg {
-            return 0 - n;
+            return n;
         }
-        return n;
+        if n == -9223372036854775807 - 1 {
+            return fallback;
+        }
+        return 0 - n;
     }
 }
 
@@ -1006,12 +1016,27 @@ pub fn str_parse_int_opt(s: str) -> Option<i64> {
     if start >= n {
         return Option::None;
     }
+    // Accumulate as a negative number, which reaches i64::MIN; a value
+    // outside i64 is None, not str_parse_int's 0 (BG306).
+    var v: i64 = 0;
     var i = start;
     while i < n {
-        if !char_is_digit(str_byte_at(s, i)) {
+        var c: i64 = str_byte_at(s, i);
+        if !char_is_digit(c) {
             return Option::None;
         }
+        var d: i64 = c - 48;
+        if v < -922337203685477580 || (v == -922337203685477580 && d > 8) {
+            return Option::None;
+        }
+        v = v * 10 - d;
         i = i + 1;
     }
-    return Option::Some(str_parse_int(s));
+    if c0 == 45 {
+        return Option::Some(v);
+    }
+    if v == -9223372036854775807 - 1 {
+        return Option::None;
+    }
+    return Option::Some(0 - v);
 }

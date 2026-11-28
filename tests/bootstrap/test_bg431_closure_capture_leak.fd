@@ -1,0 +1,40 @@
+// Bugs roadmap BG431: a closure capturing a str or a Vec leaked the
+// captured value: the env takes an owner of each and no env was ever
+// released. compiler/lower.fd: a variable bound to a closure literal and
+// then only called (Lowerer_rc_note_closure_var: no other use of its name
+// in the rest of its block) owns the env; at its scope's end the captures
+// are dropped and the env freed (Lowerer_rc_drop_env).
+// Leak gate: `fid run tests/bootstrap/test_bg431_closure_capture_leak.fd
+// --leaks` must report "every block was freed".
+//
+// Expected output:
+// pre51
+// 2
+// pre52
+// 3
+
+fn main() {
+    var i: i64 = 5;
+    val pre: str = f"pre{i}";
+    val c = fn(k: i64) -> str {
+        return pre + int_to_str(k);
+    };
+    println(c(1));
+    var v: Vec<i64> = Vec::new();
+    v.push(3);
+    val c2 = fn(k: i64) -> i64 {
+        return v.len() + k;
+    };
+    println(c2(1));
+    var j: i64 = 0;
+    while j < 2 {
+        val c3 = fn(k: i64) -> str {
+            return pre + int_to_str(k);
+        };
+        if j == 1 {
+            println(c3(2));
+        }
+        j = j + 1;
+    }
+    println(c2(2));
+}

@@ -52,15 +52,37 @@ pin="scripts/$asset.sha256"
 if [ ! -f "$pin" ]; then
   # windows-x64 keeps the historical name: scripts/stage0.sha256 pins fid.exe
   [ "$asset" = fid.exe ] && pin="scripts/stage0.sha256" || {
+    [ "${1:-}" = --pin-file ] && { echo "$pin"; exit 1; }
     echo "stage0-fetch: no pin file $pin"; exit 1; }
+fi
+# --pin-file: only print the pin file that applies to this host
+# (bootstrap.sh checks release/stage0/fid against it, BG359)
+if [ "${1:-}" = --pin-file ]; then
+  echo "$pin"
+  exit 0
 fi
 want=$(cut -d' ' -f1 "$pin")
 [ -n "$want" ] || { echo "stage0-fetch: empty pin $pin"; exit 1; }
 
+sha256_of() {
+  if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null; then shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+# Canonical name the scripts look for: release/stage0/fid (POSIX) or
+# fid.exe (Windows). The x64 Windows asset already is fid.exe.
+canon="$DEST/fid"; [ "$osk" = windows ] && canon="$DEST/fid.exe"
+
 out="$DEST/$asset"
-if [ -x "$out" ] && command -v sha256sum >/dev/null; then
-  have=$(sha256sum "$out" | cut -d' ' -f1)
-  if [ "$have" = "$want" ]; then
+if [ -x "$out" ]; then
+  have=$(sha256_of "$out")
+  if [ -n "$have" ] && [ "$have" = "$want" ]; then
+    # BG359: the canonical copy is what bootstrap.sh runs: make sure it is
+    # this binary too (it was left missing or stale)
+    if [ "$out" != "$canon" ] && { [ ! -x "$canon" ] || [ "$(sha256_of "$canon")" != "$want" ]; }; then
+      cp "$out" "$canon" && chmod +x "$canon" 2>/dev/null || true
+    fi
+    cp "$pin" "$canon.sha256"
     echo "stage0-fetch: $out already matches pin"
     exit 0
   fi
@@ -77,11 +99,8 @@ else
 fi
 chmod +x "$out" 2>/dev/null || true
 
-if command -v sha256sum >/dev/null; then
-  have=$(sha256sum "$out" | cut -d' ' -f1)
-elif command -v shasum >/dev/null; then
-  have=$(shasum -a 256 "$out" | cut -d' ' -f1)
-else
+have=$(sha256_of "$out")
+if [ -z "$have" ]; then
   echo "stage0-fetch: no sha256 tool; cannot verify"; exit 1
 fi
 if [ "$have" != "$want" ]; then
@@ -92,9 +111,6 @@ if [ "$have" != "$want" ]; then
   exit 1
 fi
 
-# Canonical name the scripts look for: release/stage0/fid (POSIX) or
-# fid.exe (Windows). The x64 Windows asset already is fid.exe.
-canon="$DEST/fid"; [ "$osk" = windows ] && canon="$DEST/fid.exe"
 if [ "$out" != "$canon" ]; then
   cp "$out" "$canon" && chmod +x "$canon" 2>/dev/null || true
 fi

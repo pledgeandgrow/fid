@@ -1,0 +1,35 @@
+// Bugs roadmap BG354: stdlib/ws.fd ws_handshake accepted a reply when it
+// held "101" anywhere (a "Content-Length: 101" on a 200 reply) and the
+// accept header in any letter case, and refused a correct
+// `Sec-WebSocket-Accept:<value>` without the single space. The check is
+// now ws_handshake_reply_ok (RFC 6455 §4.1): status 101, Upgrade:
+// websocket, Connection: upgrade, and the exact accept value with any
+// optional whitespace. Key and accept value: RFC 6455 §1.3's example.
+//
+// Expected output:
+// good true
+// no space true
+// two spaces true
+// fake 101 false
+// case-folded accept false
+// no upgrade header false
+// no connection header false
+// wrong accept false
+// status 1010 false
+
+use ws;
+
+fn main() {
+    val key: str = "dGhlIHNhbXBsZSBub25jZQ==";
+    val acc: str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+    val head: str = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
+    println(f"good {ws_handshake_reply_ok(head + "Sec-WebSocket-Accept: " + acc + "\r\n\r\n", key)}");
+    println(f"no space {ws_handshake_reply_ok(head + "Sec-WebSocket-Accept:" + acc + "\r\n\r\n", key)}");
+    println(f"two spaces {ws_handshake_reply_ok(head + "sec-websocket-accept:  " + acc + "\r\n\r\n", key)}");
+    println(f"fake 101 {ws_handshake_reply_ok("HTTP/1.1 200 OK\r\nContent-Length: 101\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + acc + "\r\n\r\n", key)}");
+    println(f"case-folded accept {ws_handshake_reply_ok(head + "Sec-WebSocket-Accept: " + str_to_lower(acc) + "\r\n\r\n", key)}");
+    println(f"no upgrade header {ws_handshake_reply_ok("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + acc + "\r\n\r\n", key)}");
+    println(f"no connection header {ws_handshake_reply_ok("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: " + acc + "\r\n\r\n", key)}");
+    println(f"wrong accept {ws_handshake_reply_ok(head + "Sec-WebSocket-Accept: AAAA" + "\r\n\r\n", key)}");
+    println(f"status 1010 {ws_handshake_reply_ok("HTTP/1.1 1010 X\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + acc + "\r\n\r\n", key)}");
+}

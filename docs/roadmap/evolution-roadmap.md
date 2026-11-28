@@ -2,9 +2,10 @@
 
 > Language features that Fides does not have, taken from newer or research
 > languages (Goose, Hylo, Vale, Pony, Swift, Koka/Roc/Lean, Zig, Odin/Jai,
-> Erlang/Gleam, Dafny/SPARK), and ideas no known language has that Fides'
-> own toolchain makes possible (EV17-EV24). Each entry was checked against
-> docs/reference/reference.md and the repo on Nov 24 2026: it is not in the
+> Erlang/Gleam, Dafny/SPARK, Unison), and ideas no known language has that
+> Fides' own toolchain makes possible (EV17-EV24). EV1-EV24 were checked
+> against docs/reference/reference.md and the repo on Nov 24 2026;
+> EV25-EV28 were added Nov 28 after comparing Unison. None is in the
 > language today.
 >
 > Estimates are judgments, not measurements. **First version**: it runs and
@@ -272,6 +273,90 @@ cost into a feature; EV21 is the easiest to explain. All need EV0 first: a
 sandbox or a proof made by a compiler that miscompiles loops proves
 nothing.
 
+## From Unison
+
+Unison (unison-lang.org/docs, checked Nov 28 2026) is not a systems
+language. Its central bet is that code lives in a content-addressed
+database, and its effects are user-defined algebraic effects with typed
+handlers. Do not adopt the whole model: a UCM-style database sits badly
+with files, Git and vendoring; moving arbitrary computations would make
+Fides depend on a managed runtime or cloud, not just a compiler;
+unrestricted multi-shot continuations fight stack ownership and
+predictable native code. These parts fit Fides:
+
+- [ ] EV25. Typed user-defined abilities (L). From Unison; closest also
+      Koka and Frank.
+      Today reference §9.1 infers a fixed set of runtime effects, while
+      §9.4's handlers are local, carry only `i64`, and `do` cannot return
+      a value (docs/book/05-effects.md). An ability declaration gives a
+      named interface of typed operations; a handler interprets one, with
+      the inferred effect set of the handled block losing that ability.
+      Restrict the first version to affine, scoped handlers (resume at
+      most once, no captured continuation escaping the handler): enough
+      for state, exceptions, logging, IO fakes and parsers, without
+      multi-shot continuations fighting ownership and native stack layout.
+      Write a design proposal first. The hard parts are effect
+      polymorphism through generics and function values, and lowering
+      continuations the same way on run, C, pe_ir and nat.
+      First version: 6-8 weeks. Solid: 4-6 months.
+
+- [ ] EV26. Hash-addressed semantic artifacts (M-L). From Unison.
+      Keep files and Git, but hash a normalized AST/typechecked module so
+      semantic identity is separate from bytes. Uses: skip work when only
+      formatting or comments change, key pure-test caches, record
+      dependency identity in `ark.lock`, and drive a semantic rename that
+      does not search text. Builds on `ast_ser.fd`, the checked-library
+      stamp (D9), `.fides-stamp`, `fid qualify` hashes and the LSP. The
+      hard part is the normalization contract: type aliases,
+      comptime-generated code, imports and `@cfg` variants must hash what
+      they mean, not what they happen to parse to. This is not a
+      Unison-style codebase database and does not make names disposable.
+      EV21 records what a dependency may do; this records what the
+      dependency is.
+      First version (module hashes in stamps and the pure-test cache):
+      2-3 weeks. Solid (dependency identity and semantic rename): 1-2
+      months.
+
+- [ ] EV27. Durable schema versions (M). From Unison's typed durable
+      storage, narrowed to files and messages.
+      Builds on EV13 rather than duplicating it. A struct or enum marked
+      `@schema` gets a normalized schema hash; `to_bytes` writes it, and
+      `from_bytes` accepts only an exact hash or a declared migration. No
+      arbitrary functions or references are persisted, and hostile bytes
+      still go through EV13's checked decode. The value over plain
+      serialization is that a file written by an old binary cannot
+      silently mean the wrong thing in a new one. Closest: protobuf and
+      Cap'n Proto schema evolution; the difference is that the schema and
+      its migration rules come from the Fides types and are checked by the
+      same compiler.
+      First version (exact-version structs, no migrations): 1-2 weeks
+      after EV13. Solid (enum/Vec/string schemas and explicit migrations):
+      1-2 months.
+
+- [ ] EV28. Typed service boundaries (M-L). From Unison's typed service
+      calls, without mobile computation.
+      A declaration describes the functions a service exposes; the
+      compiler writes the schema, server dispatch and client stub, so a
+      call across a process is typechecked at both ends and a version
+      mismatch is a build or deployment error rather than a JSON decode
+      error. Deployment stays conventional: `fid emit` writes separate
+      native executables, with no bytecode migration or cloud platform.
+      The schema should carry the exposed functions' effects and required
+      capabilities as well as their types. Builds on stdlib JSON/CBOR,
+      HTTP/2 and gRPC; the hard parts are schema versioning, errors,
+      streaming, and refusing references and function values. Closest:
+      protobuf/gRPC, Cap'n Proto RPC and OpenAPI generators; the
+      difference is one Fides declaration compiling both sides and
+      carrying effect and capability information.
+      First version (unary calls over HTTP/JSON): 2-3 weeks. Solid
+      (schema versions, streaming, errors, generated-code tests): 1-2
+      months.
+
+Not proposed: moving arbitrary computations between machines, typed durable
+storage of closures, or a managed cloud. Those are Unison's own central
+bets and would make Fides a different product. EV26 is the cheapest idea
+to adopt; EV25 is the largest and needs a proposal before any code.
+
 ## Totals
 
 - Phase 1 (EV1-EV4): about a month.
@@ -280,3 +365,5 @@ nothing.
 - EV1-EV16, solid: roughly 9-15 months of serial work.
 - EV17-EV24 first versions: about 4-5 months; solid: roughly 12-18 months
   more. Pick, do not queue them all.
+- EV25-EV28 first versions: about 3-4 months after their dependencies;
+  solid: roughly 7-12 months more. Pick one; EV26 is cheapest, EV25 largest.

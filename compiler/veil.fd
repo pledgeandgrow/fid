@@ -130,17 +130,35 @@ fn line_vec_contains(v: Vec<CovLineEntry>, entry: CovLineEntry) -> bool {
     return false;
 }
 
-fn line_in_set(set: Vec<CovLineEntry>, line_num: i64) -> bool {
+/// Whether `set` holds line `line_num` of the report's source file. BG328:
+/// only entries of the functions that file defines count (`names`, from
+/// vl_source_names; 0: every entry): the entries of core's (and imported
+/// modules') functions carry their own files' line numbers, which painted
+/// dead user lines "covered" and blank lines "uncovered".
+fn line_in_set(set: Vec<CovLineEntry>, line_num: i64, names: i64) -> bool {
     var i: i64 = 0;
     while i < set.len() {
         var s0: str = set.get(i).a;
         var s1: i64 = set.get(i).b;
-        if s1 == line_num {
+        if s1 == line_num && (names == 0 || vl_is_user(names, s0)) {
             return true;
         }
         i = i + 1;
     }
     return false;
+}
+
+/// BG328: the functions and methods `source` itself defines (a table for
+/// vl_is_user), or 0 when it does not parse.
+fn vl_source_names(source: str) -> i64 {
+    match parse_program_only(source) {
+        OptProgram::Some(up) => {
+            return vl_names_of(&up);
+        }
+        OptProgram::None => {
+        }
+    }
+    return 0;
 }
 
 fn pad_str(s: str, width: i64) -> str {
@@ -311,6 +329,18 @@ pub fn collect_all_coverage(module: &IrModule) -> CoverageData {
 /// lowers as `Type_method`, a generic instance as `name__...`, a method
 /// of a generic struct as `Type__method__...`).
 fn vl_keep_user(data: &mut CoverageData, up: &Program) {
+    var names: i64 = vl_names_of(up);
+    data.all_functions = vl_keep_names(data.all_functions, names);
+    data.called_functions = vl_keep_names(data.called_functions, names);
+    data.all_lines = vl_keep_entries(data.all_lines, names);
+    data.covered_lines = vl_keep_entries(data.covered_lines, names);
+    data.all_instructions = vl_keep_entries(data.all_instructions, names);
+    data.covered_instructions = vl_keep_entries(data.covered_instructions, names);
+}
+
+/// The names vl_is_user matches for the functions and methods `up`
+/// defines: 1 a function or method, 2 a generic's template.
+fn vl_names_of(up: &Program) -> i64 {
     var names: i64 = HashMap_new();
     var fi: i64 = 0;
     while fi < up.funcs.len() {
@@ -341,12 +371,20 @@ fn vl_keep_user(data: &mut CoverageData, up: &Program) {
         }
         ii = ii + 1;
     }
-    data.all_functions = vl_keep_names(data.all_functions, names);
-    data.called_functions = vl_keep_names(data.called_functions, names);
-    data.all_lines = vl_keep_entries(data.all_lines, names);
-    data.covered_lines = vl_keep_entries(data.covered_lines, names);
-    data.all_instructions = vl_keep_entries(data.all_instructions, names);
-    data.covered_instructions = vl_keep_entries(data.covered_instructions, names);
+    // the methods of `impl Trait for Type` (lowered as `Type_method`)
+    var ti: i64 = 0;
+    while ti < up.trait_impls.len() {
+        var timp: TraitImpl = up.trait_impls.get(ti);
+        var tm: i64 = 0;
+        while tm < timp.methods.len() {
+            if HashMap_get(names, timp.type_name + "_" + timp.methods.get(tm).name) == 0 {
+                HashMap_insert(names, timp.type_name + "_" + timp.methods.get(tm).name, 1);
+            }
+            tm = tm + 1;
+        }
+        ti = ti + 1;
+    }
+    return names;
 }
 
 fn vl_is_user(names: i64, n: str) -> bool {
@@ -709,11 +747,12 @@ pub fn generate_text_report(data: &CoverageData, source: str) -> str {
     report = report + "Source Coverage\n";
     report = report + "---------------\n";
     var lines: Vec<str> = veil_split_lines(source);
+    val src_names: i64 = vl_source_names(source);
     var li: i64 = 0;
     while li < lines.len() {
         var line_num: i64 = li + 1;
-        var is_executable: bool = line_in_set(data.all_lines, line_num);
-        var is_covered: bool = line_in_set(data.covered_lines, line_num);
+        var is_executable: bool = line_in_set(data.all_lines, line_num, src_names);
+        var is_covered: bool = line_in_set(data.covered_lines, line_num, src_names);
         var marker: str = "  ";
         if is_executable {
             if is_covered {
@@ -771,11 +810,12 @@ pub fn generate_html_report(data: &CoverageData, source: str, filename: str) -> 
     html = html + "<h2>Source</h2>\n";
     html = html + "<pre class=\"source\">\n";
     var lines: Vec<str> = veil_split_lines(source);
+    val src_names: i64 = vl_source_names(source);
     var li: i64 = 0;
     while li < lines.len() {
         var line_num: i64 = li + 1;
-        var is_executable: bool = line_in_set(data.all_lines, line_num);
-        var is_covered: bool = line_in_set(data.covered_lines, line_num);
+        var is_executable: bool = line_in_set(data.all_lines, line_num, src_names);
+        var is_covered: bool = line_in_set(data.covered_lines, line_num, src_names);
         var cls: str = "neutral";
         if is_executable {
             if is_covered {

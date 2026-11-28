@@ -440,19 +440,42 @@ pub fn cb_gcm_encrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, pt: &Vec) -> Ve
     return out;
 }
 
+/// BG473: what an AES-GCM open gives: `ok` is whether the tag verified,
+/// `plain` the plaintext (empty when not ok). An authenticated empty
+/// message (ok, no bytes) is told apart from a forgery here, which an
+/// empty Vec from cb_gcm_decrypt cannot do.
+pub struct CbGcmOpened {
+    pub ok: bool,
+    pub plain: Vec<i64>,
+}
+
 /// AES-GCM decrypt: input is ciphertext || 16-byte tag; empty Vec on failure
-/// (tag mismatch included).
+/// (tag mismatch included). An empty plaintext gives an empty Vec too: when
+/// one is legal, use cb_gcm_open, which reports the tag check (BG473).
 /// The key is `@secret` (complaint CO1): this body may not print, log,
 /// send or store it; the result is an audited release (`@declassify`).
 @declassify
 pub fn cb_gcm_decrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -> Vec<i64> {
+    return cb_gcm_open(key, nonce, aad, ct_tag).plain;
+}
+
+/// AES-GCM open (BG473): ciphertext || 16-byte tag in, the tag check and
+/// the plaintext out (CbGcmOpened).
+/// The key is `@secret` (complaint CO1): this body may not print, log,
+/// send or store it; the result is an audited release (`@declassify`).
+@declassify
+pub fn cb_gcm_open(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -> CbGcmOpened {
     var out: Vec<i64> = Vec::new();
     if ct_tag.len() < 16 {
-        return out;
+        return CbGcmOpened {
+            ok: false, plain: out
+        };
     }
     var alg: i64 = cb_aes_alg();
     if alg == 0 {
-        return out;
+        return CbGcmOpened {
+            ok: false, plain: out
+        };
     }
     var kobj: i64 = cb_zeroed(16);
     var hkey: i64 = cb_sym_key(alg, key, kobj);
@@ -464,7 +487,9 @@ pub fn cb_gcm_decrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -
         unsafe {
             cb_close_alg(alg as * mut u8, 0);
         }
-        return out;
+        return CbGcmOpened {
+            ok: false, plain: out
+        };
     }
     var n: i64 = ct_tag.len() - 16;
     var ctb: i64 = cb_buf(ct_tag);
@@ -488,7 +513,9 @@ pub fn cb_gcm_decrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -
     unsafe {
         r = cb_decrypt(hkey as * mut u8, ctb as * mut u8, n, info as * mut u8, 0 as * mut u8, 0, pt as * mut u8, n, res as * mut u8, 0);
     }
+    var ok: bool = false;
     if r == 0 {
+        ok = true;
         out = cb_unbuf(pt, n);
     }
     // SAFETY: ctb, nb, ab, pt, info and res are the blocks cb_buf, cb_zeroed
@@ -508,7 +535,9 @@ pub fn cb_gcm_decrypt(@secret key: &Vec, nonce: &Vec, aad: &Vec, ct_tag: &Vec) -
     }
     // the key is destroyed: its key object can go
     cb_sym_key_free(kobj);
-    return out;
+    return CbGcmOpened {
+        ok: ok, plain: out
+    };
 }
 
 // ─── PBKDF2-HMAC-SHA256 ───────────────────────────────────────────────────

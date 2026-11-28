@@ -124,7 +124,32 @@ pub struct StTensor {
     pub data_end: i64,
 }
 
-/// Look up a tensor by name; found=false when absent or malformed.
+// Dimension `i` of the JSON shape array `sh`, or -1 when it is not a whole
+// number in i64 (str_parse_int reads an out-of-range one as 0, which
+// would pass for an empty dimension; BG353).
+fn st_dim(sh: str, i: i64) -> i64 {
+    var v: str = json_at_safe(sh, i);
+    var n: i64 = str_len(v);
+    if n == 0 || n > 19 {
+        return -1;
+    }
+    var k: i64 = 0;
+    while k < n {
+        var c: i64 = str_byte_at(v, k);
+        if c < 48 || c > 57 {
+            return -1;
+        }
+        k = k + 1;
+    }
+    var d: i64 = str_parse_int(v);
+    if d == 0 && !str_equal(v, "0") {
+        return -1;
+    }
+    return d;
+}
+
+/// Look up a tensor by name; found=false when absent or malformed. A
+/// zero-length dimension is an empty tensor (0 elements, no data).
 pub fn st_tensor(b: Vec<i64>, st: StFile, name: str) -> StTensor {
     var t: StTensor = StTensor {
         found: false, dtype: "", shape: Vec::new(), data_begin: 0, data_end: 0
@@ -148,32 +173,41 @@ pub fn st_tensor(b: Vec<i64>, st: StFile, name: str) -> StTensor {
     if json_len_safe(offs) != 2 {
         return t;
     }
+    // The offsets first: inside the file, so every product below is at
+    // most the file's size and cannot overflow (BG320).
+    var a: i64 = json_at_int(offs, 0, -1);
+    var e: i64 = json_at_int(offs, 1, -1);
+    if a < 0 || e < a {
+        return t;
+    }
+    if e > b.len() - st.data_off {
+        return t;
+    }
+    // The element count is a checked product over the shape, in order, as
+    // the reference loader computes it: one that would overflow is refused
+    // (BG320), and a zero-length dimension gives an empty tensor (BG353).
     var shape: Vec<i64> = Vec::new();
     var i: i64 = 0;
     var total: i64 = 1;
     while i < json_len_safe(sh) {
-        var d: i64 = json_at_int(sh, i, 0);
-        if d <= 0 {
+        var d: i64 = st_dim(sh, i);
+        if d < 0 {
+            return t;
+        }
+        if total > 0 && d > 9223372036854775807 / total {
             return t;
         }
         shape.push(d);
         total = total * d;
         i = i + 1;
     }
-    var a: i64 = json_at_int(offs, 0, -1);
-    var e: i64 = json_at_int(offs, 1, -1);
-    if a < 0 || e < a {
-        return t;
-    }
     var dsz: i64 = st_dtype_size(dt);
     if dsz == 0 {
         return t;
     }
-    if e - a != total * dsz {
-        return t;
-    }
-    // data len must match shape
-    if st.data_off + e > b.len() {
+    // data len must match shape; more elements than data bytes is checked
+    // first, so total * dsz cannot overflow
+    if total > e - a || e - a != total * dsz {
         return t;
     }
     t.found = true;

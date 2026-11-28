@@ -994,6 +994,10 @@ pub struct RtpsReader {
     pub pend_sn: Vec<i64>,
     pub pend_data: Vec<Vec<i64>>,
     pub pend_gap: Vec<bool>,
+    // GAP ranges [lo, hi) not yet reached by `next`: a range is kept as two
+    // numbers, never one entry per sequence number
+    pub gap_lo: Vec<i64>,
+    pub gap_hi: Vec<i64>,
     pub delivered: Vec<Vec<i64>>,
     pub delivered_sn: Vec<i64>,
     pub ack_count: i64,
@@ -1003,7 +1007,7 @@ pub struct RtpsReader {
 
 pub fn rtps_reader_new(prefix: Vec<i64>, reader_id: i64) -> RtpsReader {
     return RtpsReader {
-        prefix: prefix, reader_id: reader_id, vendor: 0x01ff, writer_prefix: Vec::new(), writer_id: 0, next: 1, pend_sn: Vec::new(), pend_data: Vec::new(), pend_gap: Vec::new(), delivered: Vec::new(), delivered_sn: Vec::new(), ack_count: 0, outbox: Vec::new(), duplicates: 0
+        prefix: prefix, reader_id: reader_id, vendor: 0x01ff, writer_prefix: Vec::new(), writer_id: 0, next: 1, pend_sn: Vec::new(), pend_data: Vec::new(), pend_gap: Vec::new(), gap_lo: Vec::new(), gap_hi: Vec::new(), delivered: Vec::new(), delivered_sn: Vec::new(), ack_count: 0, outbox: Vec::new(), duplicates: 0
     };
 }
 
@@ -1021,7 +1025,45 @@ fn rtps_reader_has(r: &RtpsReader, sn: i64) -> bool {
         }
         i = i + 1;
     }
+    var j: i64 = 0;
+    while j < r.gap_lo.len() {
+        if sn >= r.gap_lo.get(j) && sn < r.gap_hi.get(j) {
+            return true;
+        }
+        j = j + 1;
+    }
     return false;
+}
+
+// The smallest pending sequence number >= from, or -1.
+fn rtps_reader_min_pending(r: &RtpsReader, from: i64) -> i64 {
+    var best: i64 = -1;
+    var i: i64 = 0;
+    while i < r.pend_sn.len() {
+        val sn: i64 = r.pend_sn.get(i);
+        if sn >= from && (best < 0 || sn < best) {
+            best = sn;
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+// Move `next` up to `upto` (the sequence numbers below it are irrelevant
+// or no longer available), delivering what is pending on the way: one step
+// per pending sample, not per skipped sequence number.
+fn rtps_reader_skip_to(r: &mut RtpsReader, upto: i64) {
+    while r.next < upto {
+        val m: i64 = rtps_reader_min_pending(r, r.next);
+        if m == r.next {
+            rtps_reader_advance(r);
+        } else if m < 0 || m >= upto {
+            r.next = upto;
+        } else {
+            r.next = m;
+        }
+    }
+    rtps_reader_advance(r);
 }
 
 fn rtps_reader_store(r: &mut RtpsReader, sn: i64, data: Vec<i64>, gap: bool) {
@@ -1042,11 +1084,32 @@ fn rtps_reader_store(r: &mut RtpsReader, sn: i64, data: Vec<i64>, gap: bool) {
     r.pend_gap.push(gap);
 }
 
-// Deliver in order what is pending.
+// Deliver in order what is pending (and jump over a GAP range `next` has
+// reached).
 fn rtps_reader_advance(r: &mut RtpsReader) {
     var moved: bool = true;
     while moved {
         moved = false;
+        // GAP ranges: drop those behind `next`; one that holds `next`
+        // moves it to the range's end or the next pending sample
+        var g: i64 = 0;
+        while g < r.gap_lo.len() {
+            if r.gap_hi.get(g) <= r.next {
+                r.gap_lo.remove(g);
+                r.gap_hi.remove(g);
+            } else if r.gap_lo.get(g) <= r.next && rtps_reader_min_pending(r, r.next) != r.next {
+                val m: i64 = rtps_reader_min_pending(r, r.next);
+                if m < 0 || m >= r.gap_hi.get(g) {
+                    r.next = r.gap_hi.get(g);
+                } else {
+                    r.next = m;
+                }
+                moved = true;
+                g = r.gap_lo.len();
+            } else {
+                g = g + 1;
+            }
+        }
         var i: i64 = 0;
         while i < r.pend_sn.len() {
             if r.pend_sn.get(i) == r.next {
@@ -1102,10 +1165,15 @@ pub fn rtps_reader_receive(r: &mut RtpsReader, bytes: &Vec<i64>) {
                 rtps_reader_store(r, sub.sn, sub.payload, false);
                 rtps_reader_advance(r);
             } else if sub.id == RTPS_GAP {
-                var sn: i64 = sub.sn;
-                while sn < sub.set_base {
-                    rtps_reader_store(r, sn, Vec::new(), true);
-                    sn = sn + 1;
+                // [gapStart, gapList.base) is irrelevant: apply it as a
+                // range, never one sequence number at a time
+                if sub.set_base > sub.sn && sub.set_base > r.next {
+                    if sub.sn <= r.next {
+                        rtps_reader_skip_to(r, sub.set_base);
+                    } else {
+                        r.gap_lo.push(sub.sn);
+                        r.gap_hi.push(sub.set_base);
+                    }
                 }
                 var k: i64 = 0;
                 while k < sub.set.len() {
@@ -1115,9 +1183,8 @@ pub fn rtps_reader_receive(r: &mut RtpsReader, bytes: &Vec<i64>) {
                 rtps_reader_advance(r);
             } else if sub.id == RTPS_HEARTBEAT {
                 // changes before `first` are no longer available
-                while r.next < sub.first {
-                    rtps_reader_store(r, r.next, Vec::new(), true);
-                    rtps_reader_advance(r);
+                if r.next < sub.first {
+                    rtps_reader_skip_to(r, sub.first);
                 }
                 rtps_reader_ack(r, sub.last, (sub.flags & 2) != 0);
             }

@@ -1,0 +1,119 @@
+// BG441 (docs/roadmap/bugs-roadmap.md): srtp_unprotect and
+// srtcp_unprotect look an SSRC up without creating state; its slot (ROC,
+// highest index, replay windows) is made only once a packet with that
+// SSRC authenticates, so a flood of forged packets with new SSRCs leaves
+// the context as it was. Replay protection of a known SSRC is unchanged.
+//
+// Expected output:
+// rtp junk: 5 rejected (authentication failed), ssrcs 0 wins 0
+// rtcp junk: 5 rejected (authentication failed), ssrcs 0 rtcp_wins 0
+// valid rtp: ok true, ssrcs 1
+// again: replayed
+// forged with known ssrc: authentication failed, ssrcs 1
+// valid rtcp: ok true, ssrcs 1
+// rtcp again: replayed
+// second stream: ok true, ssrcs 2
+use srtp;
+use string;
+
+fn rtp_packet(ssrc: i64, seq: i64, size: i64) -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    p.push(128);
+    p.push(15);
+    p.push((seq >> 8) & 255);
+    p.push(seq & 255);
+    p.push(0);
+    p.push(0);
+    p.push(0);
+    p.push(1);
+    p.push((ssrc >> 24) & 255);
+    p.push((ssrc >> 16) & 255);
+    p.push((ssrc >> 8) & 255);
+    p.push(ssrc & 255);
+    while p.len() < size {
+        p.push(p.len() & 255);
+    }
+    return p;
+}
+
+fn rtcp_packet(ssrc: i64, size: i64) -> Vec<i64> {
+    var p: Vec<i64> = Vec::new();
+    p.push(128);
+    p.push(200);
+    p.push(0);
+    p.push(6);
+    p.push((ssrc >> 24) & 255);
+    p.push((ssrc >> 16) & 255);
+    p.push((ssrc >> 8) & 255);
+    p.push(ssrc & 255);
+    while p.len() < size {
+        p.push(p.len() & 255);
+    }
+    return p;
+}
+
+fn main() -> i64 {
+    var mk: Vec<i64> = Vec::new();
+    var ms: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        mk.push(i * 7 + 1);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 14 {
+        ms.push(i * 3 + 2);
+        i = i + 1;
+    }
+    var tx: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_80, mk, ms);
+    var rx: SrtpContext = srtp_context_new(SRTP_AES128_CM_SHA1_80, mk, ms);
+
+    // the entry's trigger with 5 junk 32-byte RTP packets (not 5,000: HMAC
+    // is slow in the interpreter), each with a new SSRC
+    var bad: i64 = 0;
+    var why: str = "";
+    i = 0;
+    while i < 5 {
+        val r: SrtpResult = srtp_unprotect(&mut rx, rtp_packet(i, i, 32));
+        if !r.ok {
+            bad = bad + 1;
+            why = r.err;
+        }
+        i = i + 1;
+    }
+    println("rtp junk: " + int_to_str(bad) + " rejected (" + why + "), ssrcs " + int_to_str(rx.ssrcs.len()) + " wins " + int_to_str(rx.wins.len()));
+
+    // the same for SRTCP
+    bad = 0;
+    i = 0;
+    while i < 5 {
+        val r: SrtpResult = srtcp_unprotect(&mut rx, rtcp_packet(1000 + i, 32));
+        if !r.ok {
+            bad = bad + 1;
+            why = r.err;
+        }
+        i = i + 1;
+    }
+    println("rtcp junk: " + int_to_str(bad) + " rejected (" + why + "), ssrcs " + int_to_str(rx.ssrcs.len()) + " rtcp_wins " + int_to_str(rx.rtcp_wins.len()));
+
+    // a real packet creates the SSRC's state; its replay is caught
+    val sp: SrtpResult = srtp_protect(&mut tx, rtp_packet(77, 5, 40));
+    val o: SrtpResult = srtp_unprotect(&mut rx, sp.data);
+    println("valid rtp: ok " + bool_to_str(o.ok) + ", ssrcs " + int_to_str(rx.ssrcs.len()));
+    println("again: " + srtp_unprotect(&mut rx, sp.data).err);
+    // a forged packet for the known SSRC is still rejected and adds nothing
+    val f: SrtpResult = srtp_unprotect(&mut rx, rtp_packet(77, 6, 32));
+    println("forged with known ssrc: " + f.err + ", ssrcs " + int_to_str(rx.ssrcs.len()));
+
+    // SRTCP from the same SSRC
+    val cp: SrtpResult = srtcp_protect(&mut tx, rtcp_packet(77, 28));
+    val co: SrtpResult = srtcp_unprotect(&mut rx, cp.data);
+    println("valid rtcp: ok " + bool_to_str(co.ok) + ", ssrcs " + int_to_str(rx.ssrcs.len()));
+    println("rtcp again: " + srtcp_unprotect(&mut rx, cp.data).err);
+
+    // a second real stream gets its own slot
+    val sp2: SrtpResult = srtp_protect(&mut tx, rtp_packet(78, 1, 40));
+    val o2: SrtpResult = srtp_unprotect(&mut rx, sp2.data);
+    println("second stream: ok " + bool_to_str(o2.ok) + ", ssrcs " + int_to_str(rx.ssrcs.len()));
+    return 0;
+}

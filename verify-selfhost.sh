@@ -285,9 +285,16 @@ if [[ ! -f "$BASELINE_FILE" ]]; then
     fi
 fi
 
-# Compare current results to baseline
-CURRENT_FAILS=$(echo -e "$OUTPUT" | grep ": FAIL" || true)
-BASELINE_FAILS=$(grep ": FAIL" "$BASELINE_FILE" || true)
+# Compare current results to baseline. BG457: each FAIL line carries its
+# backend ("Interpreter / test_x.fd: FAIL"): every backend section writes
+# the same "test_x.fd: FAIL" line, so by name alone an old failure on one
+# backend hid a new one on another
+fails_by_backend() {
+    tr -d '\r' | awk '/^=== .* ===$/ { sec = $0; gsub(/^=== | ===$/, "", sec); next }
+                      /: FAIL$/ { print sec " / " $0 }'
+}
+CURRENT_FAILS=$(echo -e "$OUTPUT" | fails_by_backend || true)
+BASELINE_FAILS=$(fails_by_backend < "$BASELINE_FILE" || true)
 
 CURRENT_SUMMARY=$(echo -e "$OUTPUT" | grep -E "^(Interpreter|C Codegen|PE Emitter):")
 BASELINE_SUMMARY=$(grep -E "^(Interpreter|C Codegen|PE Emitter):" "$BASELINE_FILE")
@@ -311,7 +318,7 @@ else
     # Show new failures (in current but not baseline)
     NEW_FAILS=""
     while IFS= read -r line; do
-        if [[ -n "$line" ]] && ! echo "$BASELINE_FAILS" | grep -qF "$line"; then
+        if [[ -n "$line" ]] && ! echo "$BASELINE_FAILS" | grep -qxF "$line"; then
             NEW_FAILS="$NEW_FAILS$line\n"
         fi
     done <<< "$CURRENT_FAILS"
@@ -319,7 +326,7 @@ else
     # Show fixed tests (in baseline but not current)
     FIXED=""
     while IFS= read -r line; do
-        if [[ -n "$line" ]] && ! echo "$CURRENT_FAILS" | grep -qF "$line"; then
+        if [[ -n "$line" ]] && ! echo "$CURRENT_FAILS" | grep -qxF "$line"; then
             FIXED="$FIXED$line\n"
         fi
     done <<< "$BASELINE_FAILS"

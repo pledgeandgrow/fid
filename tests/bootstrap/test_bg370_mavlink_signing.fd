@@ -1,0 +1,67 @@
+// BG370 (docs/roadmap/bugs-roadmap.md): a MAVLink parser given a signing
+// key enforces signing (MAVLink 2 message signing): unsigned v2 and v1
+// frames are dropped unless mav_parser_accept_unsigned allows them, and a
+// signed frame whose timestamp is not newer than the last one of its
+// (sysid, compid, link id) stream is dropped as a replay.
+//
+// Expected output:
+// with key: unsigned v2=0 v1=0 unsigned_dropped=2 sig_errors=0
+// signed=1 replayed=0 replays=1
+// newer=1 older=0 replays=2
+// other link, older ts=1 other sysid=1
+// wrong key=0 sig_errors=1
+// accept unsigned: v2=1 v1=1 signed replay=0
+// no key: unsigned v2=1 v1=1 signed=1 same signed again=1
+use mavlink;
+use crypto;
+
+fn main() {
+    val defs: Vec<MavDef> = mav_common_defs();
+    var hb: MavMsg = mav_msg_new(defs.get(0));
+    mav_set(&mut hb, "type", 2.0);
+    var key: Vec<i64> = Vec::new();
+    var other: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 32 {
+        key.push(i);
+        other.push(31 - i);
+        i = i + 1;
+    }
+    val ts: i64 = 27992960000000;
+
+    // the entry's triggers
+    var p: MavParser = mav_parser_new(mav_common_defs());
+    mav_parser_set_key(&mut p, key);
+    val u2: i64 = mav_parser_feed(&mut p, mav_frame_v2(&hb, 1, 1, 0));
+    val u1: i64 = mav_parser_feed(&mut p, mav_frame_v1(&hb, 1, 1, 1));
+    println("with key: unsigned v2=" + int_to_str(u2) + " v1=" + int_to_str(u1) + " unsigned_dropped=" + int_to_str(p.unsigned_dropped) + " sig_errors=" + int_to_str(p.sig_errors));
+    val sf: Vec<i64> = mav_frame_v2_signed(&hb, 1, 1, 2, &key, 0, ts);
+    val s1: i64 = mav_parser_feed(&mut p, sf);
+    val s2: i64 = mav_parser_feed(&mut p, sf);
+    println("signed=" + int_to_str(s1) + " replayed=" + int_to_str(s2) + " replays=" + int_to_str(p.replays));
+    val nw: i64 = mav_parser_feed(&mut p, mav_frame_v2_signed(&hb, 1, 1, 3, &key, 0, ts + 1));
+    val od: i64 = mav_parser_feed(&mut p, mav_frame_v2_signed(&hb, 1, 1, 4, &key, 0, ts - 100));
+    println("newer=" + int_to_str(nw) + " older=" + int_to_str(od) + " replays=" + int_to_str(p.replays));
+    // another stream (link id 1, or sysid 2) has its own timestamp
+    val ol: i64 = mav_parser_feed(&mut p, mav_frame_v2_signed(&hb, 1, 1, 5, &key, 1, ts - 100));
+    val os: i64 = mav_parser_feed(&mut p, mav_frame_v2_signed(&hb, 2, 1, 0, &key, 0, ts - 100));
+    println("other link, older ts=" + int_to_str(ol) + " other sysid=" + int_to_str(os));
+    val wk: i64 = mav_parser_feed(&mut p, mav_frame_v2_signed(&hb, 1, 1, 6, &other, 0, ts + 50));
+    println("wrong key=" + int_to_str(wk) + " sig_errors=" + int_to_str(p.sig_errors));
+
+    var pa: MavParser = mav_parser_new(mav_common_defs());
+    mav_parser_set_key(&mut pa, key);
+    mav_parser_accept_unsigned(&mut pa, true);
+    val a2: i64 = mav_parser_feed(&mut pa, mav_frame_v2(&hb, 1, 1, 0));
+    val a1: i64 = mav_parser_feed(&mut pa, mav_frame_v1(&hb, 1, 1, 1));
+    mav_parser_feed(&mut pa, sf);
+    val ar: i64 = mav_parser_feed(&mut pa, sf);
+    println("accept unsigned: v2=" + int_to_str(a2) + " v1=" + int_to_str(a1) + " signed replay=" + int_to_str(ar));
+
+    var pn: MavParser = mav_parser_new(mav_common_defs());
+    val n2: i64 = mav_parser_feed(&mut pn, mav_frame_v2(&hb, 1, 1, 0));
+    val n1: i64 = mav_parser_feed(&mut pn, mav_frame_v1(&hb, 1, 1, 1));
+    val ns: i64 = mav_parser_feed(&mut pn, sf);
+    val ns2: i64 = mav_parser_feed(&mut pn, sf);
+    println("no key: unsigned v2=" + int_to_str(n2) + " v1=" + int_to_str(n1) + " signed=" + int_to_str(ns) + " same signed again=" + int_to_str(ns2));
+}

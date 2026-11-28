@@ -1,0 +1,48 @@
+// Bugs roadmap BG241: `select` dropped a received value equal to its
+// in-band "nothing ready" word -9223372036854775807: the value had already
+// been taken from the channel and the case was treated as nothing ready.
+// select now asks p_chan_try_recv_into, which says out of band whether a
+// value was taken (lower.fd Lowerer_lower_select_stmt; the C runtime, the
+// native runtimes stdlib/pe_runtime and stdlib/linux_runtime conc.fd).
+//
+// Expected output:
+// got -9223372036854775807
+// got 5
+// nothing ready
+// closed gives 0
+
+use channel;
+
+fn take(ch: i64) -> i64 {
+    select {
+        case ch => v => {
+            println("got " + int_to_str(v));
+            return 1;
+        }
+        default => {
+            println("nothing ready");
+        }
+    }
+    return 0;
+}
+
+fn main() -> i64 {
+    val ch = channel_create(4);
+    val pending: i64 = 0 - 9223372036854775807;
+    channel_send(ch, pending);
+    channel_send(ch, 5);
+    take(ch);
+    take(ch);
+    take(ch);
+    val cl = channel_create(1);
+    p_chan_close(cl);
+    select {
+        case cl => w => {
+            println("closed gives " + int_to_str(w));
+        }
+        default => {
+            println("nothing ready");
+        }
+    }
+    return 0;
+}

@@ -72,6 +72,8 @@ pub fn iropt_native(module: &mut IrModule) {
     var timing: bool = stats || g_iro_time_on;
     g_iro_pass_names = Vec::new();
     g_iro_pass_ms = Vec::new();
+    // BG243: the inlined calls of this module only
+    iro_inl_sites_reset();
     if g_iro_remarks_on {
         g_iro_remarks = Vec::new();
     }
@@ -1328,6 +1330,68 @@ fn iro_copy_line(src: &IrFunction, from: i64, f: &mut IrFunction, to: i64) {
     }
 }
 
+// --- BG243: where inlined code came from (debug info) ----------------------
+// A call iro_inline_function inlines leaves its callee's body in the
+// caller, where later passes may fold all of it away (scale(6, 7) becomes
+// 45): no instruction is left on the callee's lines, so a debug build had
+// no line row for them and a breakpoint there was never hit, and nothing
+// said the code was the callee's. Each inlined call is recorded here; a
+// debug build of pe_ir (pe_ir.fd peir_inl_setup) gives every line of the
+// body that kept no instruction a one-byte nop with its row at the place
+// the body was, and describes the call (DW_TAG_inlined_subroutine, through
+// nat_enc.fd's DWARF writer). The records cost nothing else: the IR is
+// unchanged, and only a debug build reads them.
+
+/// BG243: one record per inlined call, its fields joined by tabs: the
+/// caller, the callee, the call's source line (0: none), the copies of
+/// the callee's instructions in body order with their lines
+/// ("id:line,..."), and the instructions that come after the body in the
+/// caller ("id,...": the call's own id, which becomes the move of the
+/// result, then at most 8 that follow it in its block). Emptied by each
+/// iropt_native (iro_inl_sites_reset).
+pub var g_iro_inl_sites: Vec<str> = Vec::new();
+/// BG243: how many times the records were emptied (an index of them, as
+/// pe_ir.fd's, is made again when this changes).
+pub var g_iro_inl_gen: i64 = 0;
+
+/// BG243: forget the records (a new module is about to be optimized).
+pub fn iro_inl_sites_reset() {
+    g_iro_inl_sites = Vec::new();
+    g_iro_inl_gen = g_iro_inl_gen + 1;
+}
+
+/// BG243: the source line of instruction `id` of `f` (0: none).
+fn iro_line_of(f: &IrFunction, id: i64) -> i64 {
+    match IrFunction_get_meta(f, id) {
+        OptValueMeta::Some(m) => {
+            match m.source_line {
+                OptU64::Some(v) => {
+                    return v as i64;
+                }
+                OptU64::None => {
+                }
+            }
+        }
+        OptValueMeta::None => {
+        }
+    }
+    return 0;
+}
+
+/// BG243: note that `f` inlined `callee` at its instruction `call_id`
+/// (instruction k of `old`, the block's instructions before inlining);
+/// `body` is the copies' "id:line" list.
+fn iro_inl_note(f: &IrFunction, callee: str, call_line: i64, body: Vec<str>, old: &Vec<i64>, k: i64, call_id: i64) {
+    var after: Vec<str> = Vec::new();
+    after.push(int_to_str(call_id));
+    var j: i64 = k + 1;
+    while j < old.len() && j <= k + 8 {
+        after.push(int_to_str(old.get(j)));
+        j = j + 1;
+    }
+    g_iro_inl_sites.push(f.name + "\t" + callee + "\t" + int_to_str(call_line) + "\t" + str_join(body, ",") + "\t" + str_join(after, ","));
+}
+
 /// A new instruction in `f` that is in no block yet.
 fn iro_detached(f: &mut IrFunction, inst: Inst) -> i64 {
     var id: i64 = IrFunction_emit(f, inst);
@@ -1807,12 +1871,25 @@ fn iro_inline_function(module: &IrModule, f: &mut IrFunction) -> bool {
                                                         var cid0: i64 = iro_detached(f, Inst::BitCast(arg, aty, pty));
                                                         fresh.push(cid0);
                                                         map.set(pid, cid0 + 1);
+                                                    } else if ir_type_is_int(pty) && ir_type_is_int(aty) && !ir_type_eq(pty, IrType::Bool) && !ir_type_eq(aty, IrType::Bool) && ir_type_size(aty) > ir_type_size(pty) {
+                                                        // BG259: a wider integer argument (lowering
+                                                        // leaves `a4(200)` an I64 literal for a u8
+                                                        // parameter) is narrowed to the parameter's
+                                                        // type, as the call would: the body's u8/i16/
+                                                        // i32 arithmetic then sees operands of its
+                                                        // own type (the e-graph folded 200 + 100 at
+                                                        // 64 bits: 300, no overflow panic)
+                                                        var cidt: i64 = iro_detached(f, Inst::IntTrunc(arg, aty, pty));
+                                                        fresh.push(cidt);
+                                                        map.set(pid, cidt + 1);
                                                     } else {
                                                         map.set(pid, arg + 1);
                                                     }
                                                 }
                                                 p = p + 1;
                                             }
+                                            // BG243: the copies and their lines (iro_inl_note)
+                                            var inl_body: Vec<str> = Vec::new();
                                             var q: i64 = 0;
                                             while q < body.insts.len() {
                                                 var cid: i64 = body.insts.get(q);
@@ -1822,6 +1899,13 @@ fn iro_inline_function(module: &IrModule, f: &mut IrFunction) -> bool {
                                                         // the callee's source line (a panic in inlined
                                                         // code says where, as the interpreter does)
                                                         iro_copy_line(&callee, cid, f, nid);
+                                                        // (a line of code the callee inlined from
+                                                        // another file is not one of its lines: 0)
+                                                        var inl_ln: i64 = iro_line_of(&callee, cid);
+                                                        if str_len(ir_value_file_rec(callee.name, cid)) > 0 {
+                                                            inl_ln = 0;
+                                                        }
+                                                        inl_body.push(int_to_str(nid) + ":" + int_to_str(inl_ln));
                                                         if cid < map.len() {
                                                             map.set(cid, nid + 1);
                                                         }
@@ -1843,6 +1927,11 @@ fn iro_inline_function(module: &IrModule, f: &mut IrFunction) -> bool {
                                             if ir_type_is_float(rvty0) && ir_type_is_float(cty) {
                                                 rvty = rvty0;
                                             }
+                                            var inl_call: i64 = iro_line_of(f, id);
+                                            if str_len(ir_value_file_rec(f.name, id)) > 0 {
+                                                inl_call = 0;
+                                            }
+                                            iro_inl_note(f, name, inl_call, inl_body, &old, k, id);
                                             IrFunction_set_inst(f, id, Inst::BitCast(rv, rvty, cty));
                                             fresh.push(id);
                                             done = true;
@@ -5390,8 +5479,14 @@ fn iro_identities(f: &mut IrFunction) -> bool {
                                 }
                             } else {
                                 // comparisons of a value with itself: Eq,
-                                // LtEq, GtEq always true; Neq, Lt, Gt false
-                                if l == r && !binop_eq(op, BinOp::And) && !binop_eq(op, BinOp::Or) {
+                                // LtEq, GtEq always true; Neq, Lt, Gt false.
+                                // BG420: only for an integer (or pointer)
+                                // operand: `t` is the result type (Bool, which
+                                // iro_int_ty takes), and a float compared with
+                                // itself is false for NaN (`x != x` is true)
+                                var self_ty: IrType = iro_value_ty(f, l);
+                                var self_total: bool = iro_int_ty(self_ty) || ir_type_is_ptr(self_ty);
+                                if l == r && self_total && !binop_eq(op, BinOp::And) && !binop_eq(op, BinOp::Or) {
                                     if binop_eq(op, BinOp::Eq) || binop_eq(op, BinOp::LtEq) || binop_eq(op, BinOp::GtEq) {
                                         bkonst = 1;
                                     }
@@ -6656,13 +6751,20 @@ fn iro_cdev_scan(module: &IrModule, f: &IrFunction, u: &IroUses, env_id: i64) ->
 /// Struct) has in cargs[0] the pointer the callee writes the result to,
 /// which goes first, before the env, as for any direct call (codegen_c's
 /// sret_call; the arguments were shifted by one: zero or garbage fields).
-/// Otherwise the env, then cargs.
+/// Otherwise the env, then cargs. BG386: a fixed-array result is returned
+/// the same way since BG126 (lower.fd puts its buffer in cargs[0] for an
+/// `IrType::Array` result, as pe_ir peir_callptr_sret and nat_ir
+/// ng_callptr_sret read it); it went after the env, so the callee wrote its
+/// result through the env and the caller read an unwritten buffer.
 fn iro_cp_direct_args(env: i64, cargs: Vec<i64>, cret: IrType) -> Vec<i64> {
     var out: Vec<i64> = Vec::new();
     var ai: i64 = 0;
     var sret: bool = false;
     match cret {
         IrType::Struct(_) => {
+            sret = cargs.len() > 0;
+        }
+        IrType::Array(_, _) => {
             sret = cargs.len() > 0;
         }
         _ => {

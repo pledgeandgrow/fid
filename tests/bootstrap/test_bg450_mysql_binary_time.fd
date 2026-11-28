@@ -1,0 +1,45 @@
+// BG450 (docs/roadmap/bugs-roadmap.md): mysql_parse_binary_row gives a
+// binary-protocol TIME the text protocol's form, [-]hhh:mm:ss with hours
+// = days * 24 + hh (range -838:59:59..838:59:59), and keeps the
+// microseconds of the 12-byte form as .uuuuuu, so mysql_execute and
+// mysql_query return the same string for the same column.
+//
+// Expected output:
+// 26:00:00
+// 12:34:56.789000
+// 00:00:00
+// -838:59:59
+// -00:00:01.000005
+// 09:05:07
+use mysql;
+use encoding;
+
+fn time_col(name: str) -> MysqlColumn {
+    return MysqlColumn {
+        schema: "", table: "", name: name, org_name: name, charset: 63,
+        length: 10, kind: MYSQL_TYPE_TIME, flags: 0, decimals: 6
+    };
+}
+
+fn main() -> i64 {
+    var cols: Vec<MysqlColumn> = Vec::new();
+    var k: i64 = 0;
+    while k < 6 {
+        cols.push(time_col("t" + int_to_str(k)));
+        k = k + 1;
+    }
+    // header 00, null bitmap 00, then six TIME values:
+    // the entry's two ([len 8, 1 day, 02:00:00] and [len 12, 12:34:56,
+    // 789000 us]), a zero-length TIME, the negative maximum (34 days
+    // 22:59:59), a negative 12-byte one, a plain 8-byte one
+    val row: str = "0000" + "080001000000020000" + "0c00000000000c2238080a0c00" + "00" + "080122000000163b3b" + "0c010000000000000105000000" + "080000000000090507";
+    var vals: Vec<str> = Vec::new();
+    var nulls: Vec<bool> = Vec::new();
+    mysql_parse_binary_row(hex_decode_bytes(row), cols, &mut vals, &mut nulls);
+    var i: i64 = 0;
+    while i < vals.len() {
+        println(vals.get(i));
+        i = i + 1;
+    }
+    return 0;
+}

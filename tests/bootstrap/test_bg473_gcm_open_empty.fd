@@ -1,0 +1,46 @@
+// Bugs roadmap BG473: stdlib/crypto_bind.fd (and crypto_bind_unix.fd)
+// cb_gcm_decrypt returned an empty Vec both for a forged tag and for an
+// authenticated empty plaintext. cb_gcm_open reports the tag check
+// (CbGcmOpened.ok) apart from the plaintext. NIST GCM test case 2 (zero
+// key, zero 96-bit IV, empty plaintext and AAD).
+// (native/ccompile only: needs bcrypt.dll / libcrypto, as test_crypto_bind)
+//@ backends: ccompile,emit
+//
+// Expected output:
+// sealed 16
+// genuine: ok true len 0
+// forged: ok false len 0
+// decrypt 0 0
+
+use crypto_bind;
+
+fn main() {
+    var key: Vec<i64> = Vec::new();
+    var nonce: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 16 {
+        key.push(0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 12 {
+        nonce.push(0);
+        i = i + 1;
+    }
+    var aad: Vec<i64> = Vec::new();
+    var pt: Vec<i64> = Vec::new();
+    val ct: Vec<i64> = cb_gcm_encrypt(&key, &nonce, &aad, &pt);
+    println(f"sealed {ct.len()}");
+    val g: CbGcmOpened = cb_gcm_open(&key, &nonce, &aad, &ct);
+    println(f"genuine: ok {g.ok} len {g.plain.len()}");
+    var bad: Vec<i64> = Vec::new();
+    i = 0;
+    while i < ct.len() {
+        bad.push(ct.get(i));
+        i = i + 1;
+    }
+    bad.set(0, bad.get(0) ^ 1);
+    val f: CbGcmOpened = cb_gcm_open(&key, &nonce, &aad, &bad);
+    println(f"forged: ok {f.ok} len {f.plain.len()}");
+    println(f"decrypt {cb_gcm_decrypt(&key, &nonce, &aad, &ct).len()} {cb_gcm_decrypt(&key, &nonce, &aad, &bad).len()}");
+}

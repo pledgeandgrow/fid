@@ -1,0 +1,61 @@
+// Bugs roadmap BG228: every owned argument of an async-task call leaked.
+// The caller hands the task an owner of each str, Vec, map or struct
+// holding one (the task runs on after its caller goes on), but parameters
+// are borrowed, so the task body never dropped them. A task that owns an
+// argument now starts through its word adapter (`<name>__task`), which drops
+// what it was given when the task function returns (lower.fd
+// Lowerer_task_owns_args, Lowerer_emit_task_adapter). Leak gate:
+//   fid run tests/bootstrap/test_bg228_task_arg_owners.fd --leaks
+//
+// Expected output:
+// before yield hello42
+// hello42!
+// sum3 6 of 3
+// tag: n7 3
+// done
+use task;
+
+struct Tagged {
+    name: str,
+    n: i64,
+}
+
+async fn word(s: str) -> Future<str> {
+    println("before yield " + s);
+    task_yield();
+    return s + "!";
+}
+
+async fn total(v: Vec<i64>, label: str) -> Future<str> {
+    task_yield();
+    var t: i64 = 0;
+    for x in v {
+        t = t + x;
+    }
+    return label + " " + int_to_str(t) + " of " + int_to_str(v.len());
+}
+
+async fn tag(t: Tagged, f: f64) -> Future<str> {
+    task_yield();
+    return "tag: " + t.name + " " + int_to_str((f * 2.0) as i64);
+}
+
+fn start() -> Future<str> {
+    val s = "hello" + int_to_str(42);
+    return word(s);
+}
+
+fn main() -> i64 {
+    val w = start();
+    println(await w);
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    val t = total(v, "sum" + int_to_str(v.len()));
+    println(await t);
+    val g = tag(Tagged { name: "n" + int_to_str(7), n: 1 }, 1.5);
+    println(await g);
+    println("done");
+    return 0;
+}

@@ -181,6 +181,7 @@ pub fn set_c_debug_info(fd_file: str, source: str, c_file: str) {
     g_c_dbg_file_esc = escape_c_string(fd_file);
     g_c_dbg_cfile_esc = escape_c_string(c_file);
     g_c_dbg_names = cg_source_fn_names(source);
+    g_cg_dbg_taken = 0;
 }
 
 /// BG50: -g off again (`fid serve` resets it between requests).
@@ -189,6 +190,7 @@ pub fn clear_c_debug_info() {
     g_c_dbg_file_esc = "";
     g_c_dbg_cfile_esc = "";
     g_c_dbg_names = 0;
+    g_cg_dbg_taken = 0;
 }
 
 /// The C compiler flag -g needs (" -g", or "" without -g).
@@ -698,6 +700,327 @@ fn cg_dbg_prologue(self: &mut CCodeGen, name: str, func: IrFunction) {
     wln(self, "    __p_dbg_frame __p_df = { P_DBG_MAGIC, \"" + escape_c_string(name) + "\", " + int_to_str(k) + ", __p_dn, __p_dk, (void* const*)__p_da, 0 };");
     wln(self, "    __p_df.self = &__p_df;");
     wln(self, "    __p_dbg_cur = &__p_df;");
+}
+
+// --- BG244: the Fides names of a function's variables in its C (-g) --------
+// A C debugger (gdb, lldb, Visual Studio on the C build) shows the C
+// variables, which are the IR's values v0..vN; a Fides variable is the
+// stack slot an alloca() gives (v12 = alloca(8)), so `print total` found
+// nothing. With -g each named local of the function gets a C variable of
+// its own under its Fides name (cg_dbg_c_names): a variable held in a slot
+// becomes that slot (`int64_t total = 0; v12 = (void*)&total;`, the code
+// reading and writing *v12 as before), a parameter and a value bound once
+// (`val`) a copy made where the value is (`int64_t base = (int64_t)v1;`).
+// The name is the Fides one where C allows it and nothing else in the
+// generated C has it (cg_dbg_taken: keywords, the C library's and the
+// runtime's names, the module's functions); else the name and a number
+// (`i_1` for a second `i`). Only with -g: without it the C is what it was
+// (the fixpoint compares it byte for byte).
+
+// HashMap: the identifiers a debug name may not take (cg_dbg_taken); 0:
+// not built yet for this -g build
+var g_cg_dbg_taken: i64 = 0;
+
+const CG_DBG_RESERVED: str = "auto,break,case,char,const,continue,default,do,double,else,enum,extern,float,for,goto,if,inline,int,long,register,restrict,return,short,signed,sizeof,static,struct,switch,typedef,union,unsigned,void,volatile,while,bool,true,false,asm,typeof,alignas,alignof,noreturn,static_assert,thread_local,nullptr,constexpr,main,errno,stdin,stdout,stderr,environ,unix,linux,i386,near,far,small,pascal,cdecl,interface,hyper,min,max,abs,labs,div,exit,abort,assert,offsetof,setjmp,longjmp,jmp_buf,alloca,malloc,calloc,realloc,free,memset,memcpy,memmove,memcmp,memchr,strlen,strcmp,strncmp,strcpy,strncpy,strcat,strchr,strrchr,strstr,strdup,printf,fprintf,sprintf,snprintf,vsnprintf,puts,putchar,fputs,fputc,fwrite,fread,fopen,fclose,fflush,fseek,ftell,fileno,getchar,getenv,system,atexit,qsort,bsearch,atoi,atol,atof,strtol,strtoll,strtoul,strtoull,strtod,sqrt,pow,floor,ceil,fabs,fmod,round,trunc,sin,cos,tan,asin,acos,atan,atan2,exp,log,log2,log10,isnan,isinf,time,clock,rand,srand,signal,raise,sleep,usleep,read,write,open,close,poll,select,socket,bind,listen,accept,connect,send,recv,shutdown,setsockopt,getsockopt,pipe,fork,kill,wait,index,rindex,y0,y1,yn,j0,j1,jn,gamma,size_t,ssize_t,ptrdiff_t,intptr_t,uintptr_t,int8_t,int16_t,int32_t,int64_t,uint8_t,uint16_t,uint32_t,uint64_t,va_list,FILE,NULL,EOF,SOCKET,TRUE,FALSE,IN,OUT,OPTIONAL,CONST,VOID,BOOL,BYTE,WORD,DWORD,ERROR,DELETE,INFINITE,MAX_PATH,INFINITY,NAN,HUGE_VAL,INT_MAX,INT_MIN,LLONG_MAX,LLONG_MIN,INT64_MAX,INT64_MIN,UINT64_MAX,SEEK_SET,SEEK_CUR,SEEK_END,BUFSIZ,CHAR_BIT,panic,alloc,vec_ld,vec_tid,vec_elem_dup";
+
+/// BG244: may a C local of a -g build be called `n`? Not a C keyword or a
+/// name the generated C or what it includes may use (CG_DBG_RESERVED, the
+/// module's functions and externs), not the compiler's own kinds of names
+/// (`v12`, `t3`, `bb4`, `_x`, `p_x`, `P_X`).
+fn cg_dbg_name_free(self: &CCodeGen, n: str) -> bool {
+    if str_len(n) == 0 {
+        return false;
+    }
+    if g_cg_dbg_taken == 0 {
+        g_cg_dbg_taken = HashMap_new();
+        var kw: Vec<str> = str_split(CG_DBG_RESERVED, ",");
+        var i: i64 = 0;
+        while i < kw.len() {
+            HashMap_insert(g_cg_dbg_taken, kw.get(i), 1);
+            i = i + 1;
+        }
+        i = 0;
+        while i < self.user_functions.len() {
+            var fname: str = self.user_functions.get(i);
+            HashMap_insert(g_cg_dbg_taken, fname, 1);
+            HashMap_insert(g_cg_dbg_taken, sanitize_c_name(self, fname), 1);
+            i = i + 1;
+        }
+        i = 0;
+        while i < self.extern_func_names.len() {
+            HashMap_insert(g_cg_dbg_taken, self.extern_func_names.get(i), 1);
+            i = i + 1;
+        }
+        i = 0;
+        while i < self.struct_layouts.len() {
+            HashMap_insert(g_cg_dbg_taken, self.struct_layouts.get(i).name, 1);
+            i = i + 1;
+        }
+    }
+    if HashMap_contains(g_cg_dbg_taken, n) {
+        return false;
+    }
+    var c0: i64 = str_byte_at(n, 0);
+    if c0 == 95 || (c0 >= 48 && c0 <= 57) {
+        return false;
+    }
+    if str_starts_with(n, "p_") || str_starts_with(n, "P_") {
+        return false;
+    }
+    // v<digits>, t<digits>, bb<digits>
+    var k: i64 = 1;
+    if str_starts_with(n, "bb") {
+        k = 2;
+    } else if c0 != 118 && c0 != 116 {
+        return true;
+    }
+    if k >= str_len(n) {
+        return true;
+    }
+    while k < str_len(n) {
+        var c: i64 = str_byte_at(n, k);
+        if c < 48 || c > 57 {
+            return true;
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+/// BG244: the C type a -g local of IR type `ty` is declared with ("": none
+/// is, the type is not a word the debugger shows by itself).
+fn cg_dbg_ctype(ty: IrType) -> str {
+    match ty {
+        IrType::Ptr(inner) => {
+            match cc_box_ir_type_unbox(inner) {
+                IrType::U8 => {
+                    return "const char*";
+                }
+                _ => {
+                }
+            }
+            return "void*";
+        }
+        IrType::Opaque(name) => {
+            if name == "String" {
+                return "const char*";
+            }
+            return "void*";
+        }
+        IrType::Generic(name, _) => {
+            if name == "String" {
+                return "const char*";
+            }
+            return "void*";
+        }
+        IrType::Struct(_) => {
+            return "";
+        }
+        IrType::Array(_, _) => {
+            return "";
+        }
+        IrType::Void => {
+            return "";
+        }
+        IrType::Never => {
+            return "";
+        }
+        _ => {
+        }
+    }
+    return c_type(ty);
+}
+
+/// BG244: the slots of `func` (its allocas) a named C variable of their
+/// type can be: read and written only as a whole word of that type (a
+/// Load of it, a Store to it with no wider store type) or handed on as an
+/// address (a call argument, a value stored); anything else (a field or
+/// element address of it, a cast, a struct copy) keeps the alloca. id ->
+/// 1 fits, 2 does not.
+fn cg_dbg_slots_fit(func: IrFunction) -> i64 {
+    var st: i64 = HashMap_new();
+    var i: i64 = 0;
+    while i < func.insts.len() {
+        var e: ValueIdInst = func.insts.get(i);
+        match e.inst {
+            Inst::Alloca(aty, _) => {
+                if str_len(cg_dbg_ctype(aty)) > 0 && ir_type_size(aty) > 0 {
+                    HashMap_insert(st, int_to_str(e.id), 1);
+                }
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < func.insts.len() {
+        var e2: ValueIdInst = func.insts.get(i);
+        var refs: Vec<i64> = inst_value_refs(&e2.inst);
+        var r: i64 = 0;
+        while r < refs.len() {
+            var key: str = int_to_str(refs.get(r));
+            r = r + 1;
+            if !HashMap_contains(st, key) {
+                continue;
+            }
+            var u: i64 = str_parse_int(key);
+            var fine: bool = false;
+            match e2.inst {
+                Inst::Load(lp, lty) => {
+                    fine = lp == u && cg_dbg_fits(func, u, lty);
+                }
+                Inst::Store(sp, sv, sty) => {
+                    if sp == u && sv != u {
+                        fine = true;
+                        match sty {
+                            OptIrType::Some(t) => {
+                                fine = cg_dbg_fits(func, u, t);
+                            }
+                            OptIrType::None => {
+                            }
+                        }
+                    } else if sv == u && sp != u {
+                        fine = true;
+                    }
+                }
+                Inst::Call(_, _, _, _) => {
+                    fine = true;
+                }
+                Inst::Alloca(_, _) => {
+                    fine = true;
+                }
+                _ => {
+                }
+            }
+            if !fine {
+                HashMap_insert(st, key, 2);
+            }
+        }
+        i = i + 1;
+    }
+    return st;
+}
+
+/// BG244: is an access of type `t` within slot `id`'s type?
+fn cg_dbg_fits(func: IrFunction, id: i64, t: IrType) -> bool {
+    var sz: i64 = ir_type_size(t);
+    match find_inst(func.insts, id) {
+        OptInst::Some(it) => {
+            match it {
+                Inst::Alloca(aty, _) => {
+                    return sz > 0 && sz <= ir_type_size(aty);
+                }
+                _ => {
+                }
+            }
+        }
+        OptInst::None => {
+        }
+    }
+    return false;
+}
+
+/// BG244: the C variables of `func`'s named locals in a -g build, one per
+/// entry, tab-separated: the kind ("s" a slot that becomes the variable,
+/// "p" a parameter, "v" a value bound once, both copied into it), the IR
+/// id, the C name and the C type. Slots and values first, in the order
+/// the locals were bound (IrFunction.dbg_locals), then the parameters a
+/// slot of the same name does not already show (a parameter the body
+/// changes is copied into one).
+fn cg_dbg_c_names(self: &CCodeGen, func: IrFunction) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var used: i64 = HashMap_new();
+    var done: i64 = HashMap_new();
+    var fit: i64 = cg_dbg_slots_fit(func);
+    // every binding (dbg_locals keeps those of closed scopes too; locals
+    // only what is in scope at the end)
+    var list: Vec<StringValueId> = func.dbg_locals;
+    if list.len() == 0 {
+        list = func.locals;
+    }
+    var pass: i64 = 0;
+    while pass < 2 {
+        var i: i64 = 0;
+        while i < list.len() {
+            var lv: StringValueId = list.get(i);
+            i = i + 1;
+            var vid: i64 = lv.id;
+            var idk: str = int_to_str(vid);
+            if str_len(lv.name) == 0 || str_starts_with(lv.name, "__") || HashMap_contains(done, idk) {
+                continue;
+            }
+            var is_param: bool = params_contains_id(func, vid);
+            if is_param != (pass == 1) {
+                continue;
+            }
+            var kind: str = "";
+            var cty: str = "";
+            if is_param {
+                if HashMap_contains(used, lv.name) {
+                    continue;
+                }
+                kind = "p";
+                cty = cg_dbg_ctype(cg_param_ty(func, vid));
+            } else {
+                match find_inst(func.insts, vid) {
+                    OptInst::Some(li) => {
+                        match li {
+                            Inst::Alloca(aty, _) => {
+                                if HashMap_contains(fit, idk) && HashMap_get(fit, idk) == 1 {
+                                    kind = "s";
+                                    cty = cg_dbg_ctype(aty);
+                                }
+                            }
+                            _ => {
+                                kind = "v";
+                                cty = cg_dbg_ctype(value_ty_for_id(func, vid));
+                            }
+                        }
+                    }
+                    OptInst::None => {
+                    }
+                }
+            }
+            if str_len(kind) == 0 || str_len(cty) == 0 {
+                continue;
+            }
+            // the Fides name, made a C identifier, numbered if taken
+            var base: str = "";
+            var bi: i64 = 0;
+            while bi < str_len(lv.name) {
+                var c: i64 = str_byte_at(lv.name, bi);
+                if cg_is_ident_byte(c) {
+                    base = base + str_slice(lv.name, bi, bi + 1);
+                } else {
+                    base = base + "_";
+                }
+                bi = bi + 1;
+            }
+            var cname: str = base;
+            var n: i64 = 1;
+            while !cg_dbg_name_free(self, cname) || HashMap_contains(used, cname) {
+                cname = base + "_" + int_to_str(n);
+                n = n + 1;
+                if n > 1000 {
+                    cname = "";
+                    break;
+                }
+            }
+            if str_len(cname) == 0 {
+                continue;
+            }
+            HashMap_insert(used, cname, 1);
+            HashMap_insert(used, lv.name, 1);
+            HashMap_insert(done, idk, 1);
+            out.push(kind + "\t" + idk + "\t" + cname + "\t" + cty);
+        }
+        pass = pass + 1;
+    }
+    HashMap_drop(used);
+    HashMap_drop(done);
+    HashMap_drop(fit);
+    return out;
 }
 
 /// CE8: the current frame record and its printer (-g only).
@@ -1730,6 +2053,12 @@ fn cg_libc_clash(name: str) -> bool {
     if name == "_ReadWriteBarrier" || name == "MemoryBarrier" || name == "_WriteBarrier" || name == "__fastfail" || name == "Assert" || name == "RtlSecurityAttribute" {
         return true;
     }
+    // BG420: function-like macros of math.h, ctype.h, setjmp.h, stdarg.h,
+    // errno.h and stddef.h: a user `fn isnan(x: f64)` was expanded by the
+    // macro ("too many arguments provided to function-like macro")
+    if name == "isnan" || name == "isinf" || name == "isfinite" || name == "isnormal" || name == "signbit" || name == "fpclassify" || name == "isgreater" || name == "isgreaterequal" || name == "isless" || name == "islessequal" || name == "islessgreater" || name == "isunordered" || name == "isblank" || name == "iscntrl" || name == "isgraph" || name == "isascii" || name == "toascii" || name == "setjmp" || name == "longjmp" || name == "va_start" || name == "va_end" || name == "va_arg" || name == "va_copy" || name == "errno" || name == "offsetof" {
+        return true;
+    }
     var n: i64 = str_len(name);
     if n < 2 || n > 12 {
         return false;
@@ -2295,6 +2624,7 @@ fn CCodeGen_insert_runtime_sigs(self: &mut CCodeGen) -> void {
     fn_param_types_set(self, "p_chan_send", t2(IrType::I64, IrType::I64));
     fn_param_types_set(self, "p_chan_recv", t1(IrType::I64));
     fn_param_types_set(self, "p_chan_try_recv", t1(IrType::I64));
+    fn_param_types_set(self, "p_chan_try_recv_into", t2(IrType::I64, IrType::I64));
     fn_param_types_set(self, "p_chan_close", t1(IrType::I64));
     fn_param_types_set(self, "p_chan_is_closed", t1(IrType::I64));
 
@@ -2490,8 +2820,9 @@ fn emit_runtime_header(self: &mut CCodeGen) -> void {
     wln(self, "#include <stdio.h>");
     wln(self, "#include <stdlib.h>");
     wln(self, "#include <string.h>");
-    // PL3: FreeBSD declares alloca in <stdlib.h> and has no <alloca.h>
-    wln(self, "#if !defined(_WIN32) && !defined(__FreeBSD__)");
+    // PL3: FreeBSD declares alloca in <stdlib.h> and has no <alloca.h>;
+    // nor has OpenBSD (XT54: `ccompile --target x86_64-openbsd`)
+    wln(self, "#if !defined(_WIN32) && !defined(__FreeBSD__) && !defined(__OpenBSD__)");
     wln(self, "#include <alloca.h>");
     wln(self, "#endif");
     wln(self, "#include <stdint.h>");
@@ -2525,6 +2856,16 @@ fn emit_runtime_header(self: &mut CCodeGen) -> void {
     wln(self, "#ifndef __wasi__");
     wln(self, "#include <sys/wait.h>");
     wln(self, "#endif");
+    wln(self, "#endif");
+    // BG429: file paths are UTF-8 (reference §1: source text and string
+    // literals are); on Windows the runtime opens them through the wide API
+    // (defined with the file builtins, emit_runtime_fs_utf8)
+    wln(self, "static FILE* __p_fopen(const char* path, const char* mode);");
+    wln(self, "static int64_t __p_fsize64(FILE* f);");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "static wchar_t* __p_w_of_utf8(const char* s);");
+    wln(self, "static char* __p_utf8_of_w(const wchar_t* w);");
+    wln(self, "void __p_win_utf8_argv(int argc, char*** argvp);");
     wln(self, "#endif");
     wln(self, "#ifdef __wasi__");
     wln(self, "/* WASI (preview 1), release F9: WebAssembly through C. A WASI program has");
@@ -3701,6 +4042,7 @@ fn emit_runtime_types(self: &mut CCodeGen) -> void {
     wln(self, "bool p_chan_send(int64_t ch, int64_t val);");
     wln(self, "int64_t p_chan_recv(int64_t ch);");
     wln(self, "int64_t p_chan_try_recv(int64_t ch);");
+    wln(self, "int64_t p_chan_try_recv_into(int64_t ch, int64_t out);");
     wln(self, "void p_chan_close(int64_t ch);");
     wln(self, "bool p_chan_is_closed(int64_t ch);");
     wln(self, "void p_thread_register(const char* name, int64_t (*fn)());");
@@ -4305,8 +4647,26 @@ fn emit_globals(self: &mut CCodeGen, module: IrModule) -> void {
             _ => {
             }
         }
+        var is_array: bool = false;
+        match entry.ty {
+            IrType::Array(_, _) => {
+                is_array = true;
+            }
+            _ => {
+            }
+        }
         if is_struct {
             wln(self, "static " + c_ty + " " + c_name + " = {0};");
+        } else if is_array {
+            // BG418: an array global is declared with its size after the
+            // name (`int64_t[4] _g_GA` is not C) and initialized with a
+            // brace list: the literal's elements when they are plain
+            // numbers, else zeros and __init_globals stores them
+            var ainit: str = cg_global_array_static(entry.init);
+            if str_len(ainit) == 0 {
+                ainit = "{0}";
+            }
+            wln(self, "static " + cg_global_array_decl(entry.ty, c_name) + " = " + ainit + ";");
         } else {
             var init_str: str = gen_global_init_expr(entry.init);
             // S3: a str literal is the headered static, as every other literal
@@ -4326,6 +4686,82 @@ fn emit_globals(self: &mut CCodeGen, module: IrModule) -> void {
     wln(self, "");
 }
 
+// BG418: the C declarator of an array global: `int64_t _g_GA[4]`, an
+// array of arrays `int64_t _g_M[3][2]`.
+fn cg_global_array_decl(ty: IrType, name: str) -> str {
+    match ty {
+        IrType::Array(elem, size) => {
+            return cg_global_array_decl(cc_box_ir_type_unbox(elem), name + "[" + int_to_str(size) + "]");
+        }
+        _ => {
+        }
+    }
+    return c_type_global(ty) + " " + name;
+}
+
+// BG418: the static brace initializer of an array literal whose elements
+// are int, float or bool literals (or such arrays); "" for any other.
+fn cg_global_array_static(e: Expr) -> str {
+    match e {
+        Expr::ArrayLit(_, elems) => {
+            var out: str = "{";
+            var i: i64 = 0;
+            while i < elems.len() {
+                var el: Expr = elems.get(i);
+                var es: str = "";
+                match el {
+                    Expr::IntLit(_) => {
+                        es = gen_global_init_expr(el);
+                    }
+                    Expr::FloatLit(_) => {
+                        es = gen_global_init_expr(el);
+                    }
+                    Expr::BoolLit(_) => {
+                        es = gen_global_init_expr(el);
+                    }
+                    Expr::ArrayLit(_, _) => {
+                        es = cg_global_array_static(el);
+                    }
+                    _ => {
+                    }
+                }
+                if str_len(es) == 0 {
+                    return "";
+                }
+                if i > 0 {
+                    out = out + ", ";
+                }
+                out = out + es;
+                i = i + 1;
+            }
+            return out + "}";
+        }
+        _ => {
+        }
+    }
+    return "";
+}
+
+// BG418: an array global needs no run-time initialization when its literal
+// is the static initializer (or it has no literal: zeros).
+fn cg_global_array_done(entry: GlobalEntry) -> bool {
+    match entry.ty {
+        IrType::Array(_, _) => {
+            match entry.init {
+                Expr::ArrayLit(_, _) => {
+                    return str_len(cg_global_array_static(entry.init)) > 0;
+                }
+                _ => {
+                    return true;
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
 // Bug 3.16 fix: Emit __init_globals() function that initializes globals
 // with complex (non-literal) initializers at runtime.
 fn emit_global_init_function(self: &mut CCodeGen, module: IrModule) -> void {
@@ -4343,7 +4779,7 @@ fn emit_global_init_function(self: &mut CCodeGen, module: IrModule) -> void {
     var gi: i64 = 0;
     while gi < module.globals.len() {
         var entry: GlobalEntry = module.globals.get(gi);
-        if !is_simple_init_expr(entry.init) {
+        if !is_simple_init_expr(entry.init) && !cg_global_array_done(entry) {
             needs_init = true;
             break;
         }
@@ -4360,9 +4796,30 @@ fn emit_global_init_function(self: &mut CCodeGen, module: IrModule) -> void {
     gi = 0;
     while gi < module.globals.len() {
         var entry: GlobalEntry = module.globals.get(gi);
-        if !is_simple_init_expr(entry.init) {
+        if !is_simple_init_expr(entry.init) && !cg_global_array_done(entry) {
             var c_name: str = global_c_name(entry.name);
             var is_struct_global: bool = false;
+            // BG418: an array is not assignable: its literal's elements are
+            // stored one by one
+            match entry.ty {
+                IrType::Array(_, _) => {
+                    is_struct_global = true;
+                    match entry.init {
+                        Expr::ArrayLit(_, aelems) => {
+                            var ak: i64 = 0;
+                            while ak < aelems.len() {
+                                var aes: str = gen_global_runtime_expr(self, aelems.get(ak));
+                                wln(self, "    " + c_name + "[" + int_to_str(ak) + "] = " + aes + ";");
+                                ak = ak + 1;
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
             match entry.ty {
                 IrType::Struct(sname) => {
                     is_struct_global = true;
@@ -5006,6 +5463,11 @@ fn emit_main_wrapper(self: &mut CCodeGen, module: IrModule) -> void {
         wln(self, "    _setmode(_fileno(stderr), _O_BINARY);");
         wln(self, "#endif");
         wln(self, "    __p_argc = argc; __p_argv = argv;");
+        // BG429: on Windows the arguments as UTF-8 (the CRT's argv is
+        // code-page text), from the wide command line
+        wln(self, "#ifdef _WIN32");
+        wln(self, "    __p_win_utf8_argv(argc, &__p_argv);");
+        wln(self, "#endif");
         // roadmap P6: a rank started by rank 0 takes its pipes; FID_TP_WORLD=n
         // starts the ranks here
         wln(self, "    __p_tp_boot();");
@@ -6199,8 +6661,8 @@ fn emit_zero_copy_runtime(self: &mut CCodeGen) -> void {
     // copies: an unused static function would warn elsewhere)
     wln(self, "#if defined(_WIN32) || defined(__wasi__)");
     wln(self, "static int64_t __p_zc_copy_stdio(const char* src, const char* dst) {");
-    wln(self, "    FILE* in = fopen(src, \"rb\"); if (!in) return -1;");
-    wln(self, "    FILE* out = fopen(dst, \"wb\"); if (!out) { fclose(in); return -1; }");
+    wln(self, "    FILE* in = __p_fopen(src, \"rb\"); if (!in) return -1;");
+    wln(self, "    FILE* out = __p_fopen(dst, \"wb\"); if (!out) { fclose(in); return -1; }");
     wln(self, "    char* buf = (char*)malloc(65536);");
     wln(self, "    int64_t total = 0; int bad = buf ? 0 : 1; size_t n;");
     wln(self, "    while (!bad && (n = fread(buf, 1, 65536, in)) > 0) {");
@@ -6216,7 +6678,11 @@ fn emit_zero_copy_runtime(self: &mut CCodeGen) -> void {
     wln(self, "#ifdef _WIN32");
     wln(self, "static int64_t __p_zc_wsize(const char* p) {");
     wln(self, "    WIN32_FILE_ATTRIBUTE_DATA a;");
-    wln(self, "    if (!GetFileAttributesExA(p, GetFileExInfoStandard, &a)) return -1;");
+    // BG429: the UTF-8 path through the wide API
+    wln(self, "    wchar_t* wp = __p_w_of_utf8(p);");
+    wln(self, "    BOOL got = wp ? GetFileAttributesExW(wp, GetFileExInfoStandard, &a) : GetFileAttributesExA(p, GetFileExInfoStandard, &a);");
+    wln(self, "    free(wp);");
+    wln(self, "    if (!got) return -1;");
     wln(self, "    return (int64_t)(((uint64_t)a.nFileSizeHigh << 32) | (uint64_t)a.nFileSizeLow);");
     wln(self, "}");
     wln(self, "#ifndef SIO_GET_EXTENSION_FUNCTION_POINTER");
@@ -6234,7 +6700,12 @@ fn emit_zero_copy_runtime(self: &mut CCodeGen) -> void {
     wln(self, "        DWORD la = GetFullPathNameA(src, 1024, fa, NULL), lb = GetFullPathNameA(dst, 1024, fb, NULL);");
     wln(self, "        if (la > 0 && la < 1024 && lb > 0 && lb < 1024 && _stricmp(fa, fb) == 0) return __p_zc_wsize(src);");
     wln(self, "    }");
-    wln(self, "    if (CopyFileA(src, dst, FALSE)) { int64_t sz = __p_zc_wsize(dst); if (sz >= 0) return sz; }");
+    wln(self, "    {");
+    wln(self, "        wchar_t* ws = __p_w_of_utf8(src); wchar_t* wd = __p_w_of_utf8(dst);");
+    wln(self, "        BOOL cp = (ws && wd) ? CopyFileW(ws, wd, FALSE) : CopyFileA(src, dst, FALSE);");
+    wln(self, "        free(ws); free(wd);");
+    wln(self, "        if (cp) { int64_t sz = __p_zc_wsize(dst); if (sz >= 0) return sz; }");
+    wln(self, "    }");
     wln(self, "    return __p_zc_copy_stdio(src, dst);");
     wln(self, "#elif defined(__wasi__)");
     wln(self, "    return __p_zc_copy_stdio(src, dst);");
@@ -6582,7 +7053,9 @@ fn fast_core_vec_body(name: str, func: IrFunction, c_ret: str) -> Vec<str> {
         out.push("    __h[1] = __len + 1;");
     } else if name == "Vec_pop" && n == 2 && c_ret == "int64_t" {
         out.push("    int64_t* __h = (int64_t*)(intptr_t)" + p.get(1) + ";");
-        out.push("    if (__h[1] == 0) return 0;");
+        // BG309: an empty Vec of Vecs/maps pops an empty one (core
+        // vec_pop_empty), not a null handle
+        out.push("    if (__h[1] == 0) return P_UNLIKELY(__h[4] != 0) ? vec_pop_empty(0, " + p.get(1) + ") : 0;");
         out.push("    if (P_UNLIKELY(__h[3]) && P_VEC_CODE(__h) >= 16) return vec_sz_pop(0, " + p.get(1) + ");");
         out.push("    __h[1] = __h[1] - 1;");
         out.push("    if (P_UNLIKELY(__h[3])) return __p_vec_ld(__h, __h[1]);");
@@ -6675,6 +7148,33 @@ fn gen_function(self: &mut CCodeGen, name: str, func: IrFunction) -> void {
         i = i + 1;
     }
 
+    // BG244: -g: the named locals as C variables (cg_dbg_c_names): their
+    // declarations; the slots that become one (dbg_slot) and the values
+    // copied into one after their instruction (dbg_val), id -> entry
+    var dbg_slot: i64 = 0;
+    var dbg_val: i64 = 0;
+    var dbg_ents: Vec<str> = Vec::new();
+    if g_c_dbg {
+        dbg_ents = cg_dbg_c_names(self, func);
+        dbg_slot = HashMap_new();
+        dbg_val = HashMap_new();
+        var de: i64 = 0;
+        while de < dbg_ents.len() {
+            var dp: Vec<str> = str_split(dbg_ents.get(de), "\t");
+            if dp.get(0) == "p" {
+                wln(self, "    " + dp.get(3) + " " + dp.get(2) + " = (" + dp.get(3) + ")" + val_name(self, str_parse_int(dp.get(1))) + ";");
+            } else {
+                wln(self, "    " + dp.get(3) + " " + dp.get(2) + " = 0;");
+                if dp.get(0) == "s" {
+                    HashMap_insert(dbg_slot, dp.get(1), de);
+                } else {
+                    HashMap_insert(dbg_val, dp.get(1), de);
+                }
+            }
+            de = de + 1;
+        }
+    }
+
     // Prologue alloca pre-pass: bind one stack slot per Inst::Alloca at
     // function entry. The zero-init memset is still emitted at the
     // instruction's own site, so loop iterations re-clear the slot while
@@ -6689,7 +7189,13 @@ fn gen_function(self: &mut CCodeGen, name: str, func: IrFunction) -> void {
                 OptInst::Some(ait) => {
                     match ait {
                         Inst::Alloca(aty, _) => {
-                            wln(self, "    v" + int_to_str(ainst_id) + " = alloca(" + int_to_str(alloca_size(self, aty)) + ");");
+                            if dbg_slot != 0 && HashMap_contains(dbg_slot, int_to_str(ainst_id)) {
+                                // BG244: the slot is the named variable
+                                var sp: Vec<str> = str_split(dbg_ents.get(HashMap_get(dbg_slot, int_to_str(ainst_id))), "\t");
+                                wln(self, "    v" + int_to_str(ainst_id) + " = (void*)&" + sp.get(2) + ";");
+                            } else {
+                                wln(self, "    v" + int_to_str(ainst_id) + " = alloca(" + int_to_str(alloca_size(self, aty)) + ");");
+                            }
                         }
                         _ => {
                         }
@@ -6762,6 +7268,11 @@ fn gen_function(self: &mut CCodeGen, name: str, func: IrFunction) -> void {
                         line_end = j + 2;
                     }
                     gen_inst(self, it, inst_id, func);
+                    // BG244: a named value, copied into its C variable
+                    if dbg_val != 0 && HashMap_contains(dbg_val, int_to_str(inst_id)) {
+                        var vp: Vec<str> = str_split(dbg_ents.get(HashMap_get(dbg_val, int_to_str(inst_id))), "\t");
+                        wln(self, "    " + vp.get(2) + " = (" + vp.get(3) + ")" + val_name(self, inst_id) + ";");
+                    }
                     if j == line_end {
                         wln(self, "    p_print_line_end();");
                         line_end = -1;
@@ -6788,6 +7299,10 @@ fn gen_function(self: &mut CCodeGen, name: str, func: IrFunction) -> void {
     if last_line > 0 {
         // the rest of the file is the C file's own lines again
         wln(self, "#line " + int_to_str(g_c_line + 2) + " \"" + g_c_dbg_cfile_esc + "\"");
+    }
+    if dbg_slot != 0 {
+        HashMap_drop(dbg_slot);
+        HashMap_drop(dbg_val);
     }
 
     if self.cur_fn_c_ret_is_void {
@@ -8246,9 +8761,16 @@ fn gen_inst(self: &mut CCodeGen, inst: Inst, id: i64, func: IrFunction) -> void 
             var v: str = val_name(self, value);
             wln(self, "    " + dst + " = (int32_t)" + v + ";");
         }
-        Inst::IntToFloat(value, _, _) => {
+        Inst::IntToFloat(value, _, ift_to) => {
             var v: str = val_name(self, value);
-            wln(self, "    " + dst + " = (double)" + v + ";");
+            if ir_type_eq(ift_to, IrType::F32) {
+                // BG337: straight to float, one rounding (through double an
+                // integer above 2^53 was rounded twice: 2^54 + 2^30 + 1
+                // gave 2^54, not 2^54 + 2^31)
+                wln(self, "    " + dst + " = (float)" + v + ";");
+            } else {
+                wln(self, "    " + dst + " = (double)" + v + ";");
+            }
         }
         Inst::FloatToInt(value, _, _) => {
             var v: str = val_name(self, value);
@@ -9702,12 +10224,113 @@ fn extract_param_types(params: Vec<ValueIdType>) -> Vec<IrType> {
     return v;
 }
 
+// BG429 / BG432 (C runtime): UTF-8 paths, arguments and environment
+// values on Windows, and 64-bit file sizes. __p_w_of_utf8 gives NULL for
+// text that is not valid UTF-8: the callers then use the narrow API with
+// the bytes as they are (a path in the code page still opens).
+fn emit_runtime_fs_utf8(self: &mut CCodeGen) -> void {
+    wln(self, "#ifdef _WIN32");
+    wln(self, "static wchar_t* __p_w_of_utf8(const char* s) {");
+    wln(self, "    if (!s) return NULL;");
+    wln(self, "    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, NULL, 0);");
+    wln(self, "    if (n <= 0) return NULL;");
+    wln(self, "    wchar_t* w = (wchar_t*)malloc((size_t)n * sizeof(wchar_t));");
+    wln(self, "    if (!w) return NULL;");
+    wln(self, "    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, w, n) <= 0) { free(w); return NULL; }");
+    wln(self, "    return w;");
+    wln(self, "}");
+    wln(self, "static char* __p_utf8_of_w(const wchar_t* w) {");
+    wln(self, "    if (!w) return NULL;");
+    wln(self, "    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);");
+    wln(self, "    if (n <= 0) return NULL;");
+    wln(self, "    char* s = (char*)malloc((size_t)n + 1);");
+    wln(self, "    if (!s) return NULL;");
+    wln(self, "    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, s, n, NULL, NULL) <= 0) { free(s); return NULL; }");
+    wln(self, "    s[n] = 0;");
+    wln(self, "    return s;");
+    wln(self, "}");
+    // The arguments from the wide command line, split as the C runtime
+    // splits it (white space outside quotes; 2n backslashes before a quote
+    // are n and the quote opens or closes, 2n+1 are n and a quote; `""`
+    // inside quotes is a quote); kept only when the count agrees with the
+    // CRT's argc, else argv stays as it was
+    wln(self, "void __p_win_utf8_argv(int argc, char*** argvp) {");
+    wln(self, "    const wchar_t* p = GetCommandLineW();");
+    wln(self, "    if (!p || argc <= 0) return;");
+    wln(self, "    size_t L = wcslen(p);");
+    wln(self, "    wchar_t* buf = (wchar_t*)malloc((L + 1) * sizeof(wchar_t));");
+    wln(self, "    char** out = (char**)calloc((size_t)argc + 1, sizeof(char*));");
+    wln(self, "    if (!buf || !out) { free(buf); free(out); return; }");
+    wln(self, "    int n = 0, bad = 0;");
+    wln(self, "    size_t k = 0;");
+    wln(self, "    while (*p == L' ' || *p == L'\\t') p++;");
+    wln(self, "    if (*p == L'\"') { p++; while (*p && *p != L'\"') buf[k++] = *p++; if (*p == L'\"') p++; }");
+    wln(self, "    else { while (*p && *p != L' ' && *p != L'\\t') buf[k++] = *p++; }");
+    wln(self, "    buf[k] = 0;");
+    wln(self, "    out[n] = __p_utf8_of_w(buf); if (!out[n]) bad = 1; n++;");
+    wln(self, "    for (;;) {");
+    wln(self, "        while (*p == L' ' || *p == L'\\t') p++;");
+    wln(self, "        if (!*p) break;");
+    wln(self, "        int inq = 0; k = 0;");
+    wln(self, "        for (;;) {");
+    wln(self, "            size_t bs = 0, i;");
+    wln(self, "            while (*p == L'\\\\') { bs++; p++; }");
+    wln(self, "            if (*p == L'\"') {");
+    wln(self, "                for (i = 0; i < bs / 2; i++) buf[k++] = L'\\\\';");
+    wln(self, "                if (bs % 2) { buf[k++] = L'\"'; p++; }");
+    wln(self, "                else if (inq && p[1] == L'\"') { buf[k++] = L'\"'; p += 2; }");
+    wln(self, "                else { inq = !inq; p++; }");
+    wln(self, "            } else {");
+    wln(self, "                for (i = 0; i < bs; i++) buf[k++] = L'\\\\';");
+    wln(self, "                if (!*p || (!inq && (*p == L' ' || *p == L'\\t'))) break;");
+    wln(self, "                buf[k++] = *p++;");
+    wln(self, "            }");
+    wln(self, "        }");
+    wln(self, "        buf[k] = 0;");
+    wln(self, "        if (n < argc) { out[n] = __p_utf8_of_w(buf); if (!out[n]) bad = 1; }");
+    wln(self, "        n++;");
+    wln(self, "    }");
+    wln(self, "    free(buf);");
+    wln(self, "    if (n != argc || bad) { int i; for (i = 0; i < argc; i++) free(out[i]); free(out); return; }");
+    wln(self, "    out[argc] = NULL;");
+    wln(self, "    *argvp = out;");
+    wln(self, "}");
+    wln(self, "#endif");
+    wln(self, "static FILE* __p_fopen(const char* path, const char* mode) {");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    wchar_t* wp = __p_w_of_utf8(path); wchar_t* wm = __p_w_of_utf8(mode);");
+    wln(self, "    if (wp && wm) { FILE* f = _wfopen(wp, wm); free(wp); free(wm); return f; }");
+    wln(self, "    free(wp); free(wm);");
+    wln(self, "#endif");
+    wln(self, "    return fopen(path, mode);");
+    wln(self, "}");
+    // BG432: the size of an open file through a 64-bit seek (Win64's long,
+    // ftell's result, is 32 bits); the position is left at the start
+    wln(self, "static int64_t __p_fsize64(FILE* f) {");
+    wln(self, "    int64_t sz = -1;");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    if (_fseeki64(f, 0, SEEK_END) != 0) return -1;");
+    wln(self, "    sz = (int64_t)_ftelli64(f);");
+    wln(self, "    _fseeki64(f, 0, SEEK_SET);");
+    wln(self, "#elif defined(__wasi__)");
+    wln(self, "    if (fseek(f, 0, SEEK_END) != 0) return -1;");
+    wln(self, "    sz = (int64_t)ftell(f);");
+    wln(self, "    fseek(f, 0, SEEK_SET);");
+    wln(self, "#else");
+    wln(self, "    if (fseeko(f, 0, SEEK_END) != 0) return -1;");
+    wln(self, "    sz = (int64_t)ftello(f);");
+    wln(self, "    fseeko(f, 0, SEEK_SET);");
+    wln(self, "#endif");
+    wln(self, "    return sz;");
+    wln(self, "}");
+}
+
 fn emit_file_write_bin_impl(self: &mut CCodeGen) -> void {
     // Every byte of a file as one Vec element (binary-safe: keeps 0x00).
     wln(self, "PVec* p_file_read_bytes(const char* path) {");
     wln(self, "    PVec* v = p_vec_new();");
     wln(self, "    if (P_CAP_DENIED(P_CAP_FS)) return v;");
-    wln(self, "    FILE* f = fopen(path, \"rb\");");
+    wln(self, "    FILE* f = __p_fopen(path, \"rb\");");
     wln(self, "    if (!f) return v;");
     wln(self, "    int c;");
     wln(self, "    while ((c = fgetc(f)) != EOF) p_vec_push(v, (void*)(intptr_t)c);");
@@ -9717,7 +10340,7 @@ fn emit_file_write_bin_impl(self: &mut CCodeGen) -> void {
     // a 300 KB executable on Windows); the same file
     wln(self, "int64_t p_file_write_vec(const char* path, PVec* v) {");
     wln(self, "    if (P_CAP_DENIED(P_CAP_FS)) return -1;");
-    wln(self, "    FILE* f = fopen(path, \"wb\");");
+    wln(self, "    FILE* f = __p_fopen(path, \"wb\");");
     wln(self, "    if (!f) return -1;");
     wln(self, "    unsigned char* buf = (unsigned char*)malloc(v->len > 0 ? (size_t)v->len : 1);");
     wln(self, "    if (!buf) { for (int64_t i = 0; i < v->len; i++) { unsigned char b = (unsigned char)(int64_t)P_VEC_AT(v, i); fwrite(&b, 1, 1, f); } fclose(f); return 0; }");
@@ -9734,7 +10357,7 @@ fn emit_file_write_bin_impl(self: &mut CCodeGen) -> void {
     wln(self, "    PVec* v = p_vec_new();");
     wln(self, "    if (P_CAP_DENIED(P_CAP_FS) || !path || offset < 0 || n <= 0) return v;");
     wln(self, "    if (n > ((int64_t)1 << 30)) n = (int64_t)1 << 30;");
-    wln(self, "    FILE* f = fopen(path, \"rb\");");
+    wln(self, "    FILE* f = __p_fopen(path, \"rb\");");
     wln(self, "    if (!f) return v;");
     wln(self, "#ifdef _WIN32");
     wln(self, "    int sk = _fseeki64(f, (long long)offset, SEEK_SET);");
@@ -9762,7 +10385,7 @@ fn emit_file_write_bin_impl(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_file_append_vec(const char* path, void* vp) {");
     wln(self, "    PVec* v = (PVec*)vp;");
     wln(self, "    if (P_CAP_DENIED(P_CAP_FS) || !path) return -1;");
-    wln(self, "    FILE* f = fopen(path, \"ab\");");
+    wln(self, "    FILE* f = __p_fopen(path, \"ab\");");
     wln(self, "    if (!f) return -1;");
     wln(self, "    int64_t len = v ? v->len : 0;");
     wln(self, "    if (len <= 0) { fclose(f); return 0; }");
@@ -12818,30 +13441,35 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    h->cur = keep;");
     wln(self, "}");
     // File I/O builtins
+    emit_runtime_fs_utf8(self);
     wln(self, "static char* p_file_read__raw(const char* path);");
     wln(self, "char* p_file_read(const char* path) { return p_str_own_c(p_file_read__raw(path)); }");
     // CI6: the I/O entry points fail, as on a missing file, when the
     // capability mask of fides_call (__p_caps) leaves their capability out
     wln(self, "static char* p_file_read__raw(const char* path) {");
     wln(self, "    if (P_CAP_DENIED(P_CAP_FS)) return NULL;");
-    wln(self, "    FILE* f = fopen(path, \"rb\");");
+    wln(self, "    FILE* f = __p_fopen(path, \"rb\");");
     wln(self, "    if (!f) return NULL;");
-    wln(self, "    fseek(f, 0, SEEK_END); long sz = ftell(f);");
+    // BG432: a 64-bit size (ftell's long is 32 bits on Windows: -1 at 2 GiB)
+    wln(self, "    int64_t sz = __p_fsize64(f);");
     // VF14 (whole-suite ASan run, test_files_spec): glibc opens a directory
     // and ftell gives LONG_MAX, so sz + 1 was a negative size and p_malloc
     // aborted; a directory (or any size no file has) reads as a missing file
     wln(self, "    if (sz < 0 || (uint64_t)sz >= ((uint64_t)1 << 48)) { fclose(f); return NULL; }");
-    wln(self, "    fseek(f, 0, SEEK_SET);");
-    wln(self, "    char* buf = (char*)p_malloc((int64_t)sz + 1);");
+    // BG426: the text is a counted string of the bytes read, a zero byte
+    // included (p_str_own_c took strlen of a headerless buffer: the text
+    // stopped at the first NUL); __p_fsize64 left the position at 0
+    wln(self, "    char* buf = p_str_alloc_c((int64_t)sz);");
     wln(self, "    if (!buf) { fclose(f); return NULL; }");
-    wln(self, "    size_t rd = fread(buf, 1, (size_t)sz, f); buf[rd] = 0; fclose(f);");
+    wln(self, "    size_t rd = fread(buf, 1, (size_t)sz, f); fclose(f);");
+    wln(self, "    if ((int64_t)rd < sz) { ((int64_t*)(void*)buf)[-1] = (int64_t)rd; buf[rd] = 0; }");
     wln(self, "    return buf;");
     wln(self, "}");
     wln(self, "int64_t p_file_write(const char* path, const char* content) {");
     wln(self, "    if (P_CAP_DENIED(P_CAP_FS)) return -1;");
     // BG81: a counted string's bytes, NULs included (fputs stopped at the
     // first), and a failed write or flush is -1 (it was 0)
-    wln(self, "    FILE* f = fopen(path, \"wb\");");
+    wln(self, "    FILE* f = __p_fopen(path, \"wb\");");
     wln(self, "    if (!f) return -1;");
     wln(self, "    size_t n = (size_t)p_slen(content);");
     wln(self, "    int bad = n > 0 && fwrite(content, 1, n, f) != n; if (fclose(f) != 0) bad = 1; return bad ? -1 : 0;");
@@ -12851,14 +13479,14 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     // RT2: a negative length is an error, not a huge size_t; a short write
     // is -1 as on the native runtimes
     wln(self, "    if (len < 0) return -1;");
-    wln(self, "    FILE* f = fopen(path, \"wb\");");
+    wln(self, "    FILE* f = __p_fopen(path, \"wb\");");
     wln(self, "    if (!f) return -1;");
     wln(self, "    size_t w = len > 0 ? fwrite(data, 1, (size_t)len, f) : 0; fclose(f); return w == (size_t)len ? 0 : -1;");
     wln(self, "}");
-    wln(self, "bool p_file_exists(const char* path) { if (P_CAP_DENIED(P_CAP_FS)) return false; FILE* f = fopen(path, \"rb\"); if (f) { fclose(f); return true; } return false; }");
+    wln(self, "bool p_file_exists(const char* path) { if (P_CAP_DENIED(P_CAP_FS)) return false; FILE* f = __p_fopen(path, \"rb\"); if (f) { fclose(f); return true; } return false; }");
     wln(self, "int64_t p_file_append(const char* path, const char* content) {");
     wln(self, "    if (P_CAP_DENIED(P_CAP_FS)) return -1;");
-    wln(self, "    FILE* f = fopen(path, \"ab\");");
+    wln(self, "    FILE* f = __p_fopen(path, \"ab\");");
     wln(self, "    if (!f) return -1;");
     // C4: a full disk is an error, not a silent success (the write or the
     // flush at fclose fails)
@@ -12866,9 +13494,16 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    size_t n = (size_t)p_slen(content);");
     wln(self, "    int bad = n > 0 && fwrite(content, 1, n, f) != n; if (fclose(f) != 0) bad = 1; return bad ? -1 : 0;");
     wln(self, "}");
-    wln(self, "int64_t p_file_delete(const char* path) { if (P_CAP_DENIED(P_CAP_FS)) return -1; return remove(path) == 0 ? 0 : -1; }");
-    wln(self, "int64_t p_file_size(const char* path) { if (P_CAP_DENIED(P_CAP_FS)) return -1; FILE* f = fopen(path, \"rb\"); if (!f) return -1; fseek(f, 0, SEEK_END); int64_t sz = ftell(f); fclose(f); return (sz < 0 || (uint64_t)sz >= ((uint64_t)1 << 48)) ? -1 : sz; }");
-    wln(self, "int64_t p_file_hash(const char* path) { FILE* f = fopen(path, \"rb\"); if (!f) return 0; uint64_t h = 0xcbf29ce484222325ULL; unsigned char buf[65536]; size_t n; while ((n = fread(buf, 1, sizeof buf, f)) > 0) { for (size_t i = 0; i < n; i++) { h ^= buf[i]; h *= 0x100000001b3ULL; } } fclose(f); return (int64_t)h; }");
+    wln(self, "int64_t p_file_delete(const char* path) {");
+    wln(self, "    if (P_CAP_DENIED(P_CAP_FS)) return -1;");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    { wchar_t* w = __p_w_of_utf8(path); if (w) { int r = _wremove(w); free(w); return r == 0 ? 0 : -1; } }");
+    wln(self, "#endif");
+    wln(self, "    return remove(path) == 0 ? 0 : -1;");
+    wln(self, "}");
+    // BG432: the size through a 64-bit seek (__p_fsize64)
+    wln(self, "int64_t p_file_size(const char* path) { if (P_CAP_DENIED(P_CAP_FS)) return -1; FILE* f = __p_fopen(path, \"rb\"); if (!f) return -1; int64_t sz = __p_fsize64(f); fclose(f); return (sz < 0 || (uint64_t)sz >= ((uint64_t)1 << 48)) ? -1 : sz; }");
+    wln(self, "int64_t p_file_hash(const char* path) { FILE* f = __p_fopen(path, \"rb\"); if (!f) return 0; uint64_t h = 0xcbf29ce484222325ULL; unsigned char buf[65536]; size_t n; while ((n = fread(buf, 1, sizeof buf, f)) > 0) { for (size_t i = 0; i < n; i++) { h ^= buf[i]; h *= 0x100000001b3ULL; } } fclose(f); return (int64_t)h; }");
     // Read a line from stdin - returns malloc'd string (caller must not free,
     // arena-managed). Returns NULL on EOF. Strips trailing \n and \r\n.
     wln(self, "static char* p_read_line__raw(void);");
@@ -12918,7 +13553,23 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     // Environment variable builtins
     wln(self, "static char* p_getenv__raw(const char* name);");
     wln(self, "char* p_getenv(const char* name) { return p_str_copy_c(p_getenv__raw(name)); }");
-    wln(self, "static char* p_getenv__raw(const char* name) { if (P_CAP_DENIED(P_CAP_ENV)) return NULL; return getenv(name); }");
+    // BG429: on Windows the value is read wide and given as UTF-8 (getenv's
+    // is code-page text); a static buffer as getenv's, copied at once
+    wln(self, "static char* p_getenv__raw(const char* name) {");
+    wln(self, "    if (P_CAP_DENIED(P_CAP_ENV)) return NULL;");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    { static char* __p_env_last = NULL; wchar_t* wn = __p_w_of_utf8(name);");
+    wln(self, "      if (wn) {");
+    wln(self, "        DWORD n = GetEnvironmentVariableW(wn, NULL, 0);");
+    wln(self, "        if (n == 0) { DWORD e = GetLastError(); free(wn); if (e == ERROR_ENVVAR_NOT_FOUND) return NULL; return (char*)\"\"; }");
+    wln(self, "        wchar_t* wv = (wchar_t*)malloc((size_t)n * sizeof(wchar_t));");
+    wln(self, "        DWORD m = wv ? GetEnvironmentVariableW(wn, wv, n) : 0; free(wn);");
+    wln(self, "        if (wv && m < n) { wv[m] = 0; free(__p_env_last); __p_env_last = __p_utf8_of_w(wv); free(wv); return __p_env_last; }");
+    wln(self, "        free(wv);");
+    wln(self, "      } }");
+    wln(self, "#endif");
+    wln(self, "    return getenv(name);");
+    wln(self, "}");
     // Command-line argument builtins - globals declared in emit_runtime_types
     wln(self, "int64_t p_argc(void) { return (int64_t)__p_argc; }");
     wln(self, "static char* p_argv__raw(int64_t index);");
@@ -13528,6 +14179,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_mkdir(const char* path) {");
     wln(self, "    if (P_CAP_DENIED(P_CAP_FS)) return -1;");
     wln(self, "#ifdef _WIN32");
+    wln(self, "    { wchar_t* w = __p_w_of_utf8(path); if (w) { int r = _wmkdir(w); free(w); return r == 0 ? 0 : -1; } }");
     wln(self, "    return _mkdir(path) == 0 ? 0 : -1;");
     wln(self, "#else");
     wln(self, "    return mkdir(path, 0755) == 0 ? 0 : -1;");
@@ -13536,13 +14188,25 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "int64_t p_rmdir(const char* path) {");
     wln(self, "    if (P_CAP_DENIED(P_CAP_FS)) return -1;");
     wln(self, "#ifdef _WIN32");
+    wln(self, "    { wchar_t* w = __p_w_of_utf8(path); if (w) { int r = _wrmdir(w); free(w); return r == 0 ? 0 : -1; } }");
     wln(self, "    return _rmdir(path) == 0 ? 0 : -1;");
     wln(self, "#else");
     wln(self, "    return rmdir(path) == 0 ? 0 : -1;");
     wln(self, "#endif");
     wln(self, "}");
-    wln(self, "int64_t p_rename(const char* a, const char* b) { if (P_CAP_DENIED(P_CAP_FS)) return -1; return rename(a, b) == 0 ? 0 : -1; }");
+    wln(self, "int64_t p_rename(const char* a, const char* b) {");
+    wln(self, "    if (P_CAP_DENIED(P_CAP_FS)) return -1;");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    { wchar_t* wa = __p_w_of_utf8(a); wchar_t* wb = __p_w_of_utf8(b);");
+    wln(self, "      if (wa && wb) { int r = _wrename(wa, wb); free(wa); free(wb); return r == 0 ? 0 : -1; }");
+    wln(self, "      free(wa); free(wb); }");
+    wln(self, "#endif");
+    wln(self, "    return rename(a, b) == 0 ? 0 : -1;");
+    wln(self, "}");
     wln(self, "bool p_is_dir(const char* path) {");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    { wchar_t* w = __p_w_of_utf8(path); if (w) { DWORD at = GetFileAttributesW(w); free(w); return at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY) != 0; } }");
+    wln(self, "#endif");
     wln(self, "    struct stat st;");
     wln(self, "    if (stat(path, &st) != 0) return false;");
     wln(self, "    return (st.st_mode & S_IFMT) == S_IFDIR;");
@@ -13550,6 +14214,9 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     // D9: a file's last-write time in ms since the epoch (-1 when missing),
     // so a cache can key a file's hash by path, size and mtime
     wln(self, "int64_t p_file_mtime_ms(const char* path) {");
+    wln(self, "#ifdef _WIN32");
+    wln(self, "    { wchar_t* w = __p_w_of_utf8(path); if (w) { struct _stat64 wst; int r = _wstat64(w, &wst); free(w); if (r != 0) return -1; return (int64_t)wst.st_mtime * 1000; } }");
+    wln(self, "#endif");
     wln(self, "    struct stat st;");
     wln(self, "    if (stat(path, &st) != 0) return -1;");
     wln(self, "#if defined(__APPLE__)");
@@ -13560,6 +14227,26 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    return (int64_t)st.st_mtime * 1000;");
     wln(self, "#endif");
     wln(self, "}");
+    // BG469: the names in byte order (strcmp), as the machine layer gives
+    // them (linux_runtime/sys.fd pert_dir_list) and pe_ir: the order does
+    // not depend on the file system (NTFS, readdir's hash order)
+    wln(self, "static int __p_dir_name_cmp(const void* a, const void* b) { return strcmp(*(const char* const*)a, *(const char* const*)b); }");
+    wln(self, "static char* __p_dir_sort(char* out) {");
+    wln(self, "    size_t n = 1, len = 0, k = 0, at = 0, i;");
+    wln(self, "    if (!out || !out[0]) return out;");
+    wln(self, "    for (; out[len]; len++) if (out[len] == '\\n') n++;");
+    wln(self, "    if (n < 2) return out;");
+    wln(self, "    char* copy = (char*)malloc(len + 1); char** v = (char**)malloc(n * sizeof(char*));");
+    wln(self, "    if (!copy || !v) { free(copy); free(v); return out; }");
+    wln(self, "    memcpy(copy, out, len + 1);");
+    wln(self, "    v[k++] = copy;");
+    wln(self, "    for (i = 0; i < len; i++) if (copy[i] == '\\n') { copy[i] = 0; v[k++] = copy + i + 1; }");
+    wln(self, "    qsort(v, k, sizeof(char*), __p_dir_name_cmp);");
+    wln(self, "    for (i = 0; i < k; i++) { size_t l = strlen(v[i]); if (i) out[at++] = '\\n'; memcpy(out + at, v[i], l); at += l; }");
+    wln(self, "    out[at] = 0;");
+    wln(self, "    free(v); free(copy);");
+    wln(self, "    return out;");
+    wln(self, "}");
     wln(self, "static char* p_dir_list__raw(const char* path);");
     wln(self, "char* p_dir_list(const char* path) { return p_str_own_c(p_dir_list__raw(path)); }");
     wln(self, "static char* p_dir_list__raw(const char* path) {");
@@ -13567,6 +14254,32 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    // entry names joined by '\\n', no \".\"/\"..\"; \"\" on failure");
     wln(self, "    size_t need = 1;");
     wln(self, "#ifdef _WIN32");
+    // BG429: the directory through the wide API, the names given as UTF-8
+    wln(self, "    {");
+    wln(self, "      size_t pl = strlen(path); char* pat8 = (char*)malloc(pl + 3);");
+    wln(self, "      wchar_t* wpat = NULL;");
+    wln(self, "      if (pat8) { memcpy(pat8, path, pl); pat8[pl] = '\\\\'; pat8[pl + 1] = '*'; pat8[pl + 2] = 0; wpat = __p_w_of_utf8(pat8); free(pat8); }");
+    wln(self, "      if (wpat) {");
+    wln(self, "        WIN32_FIND_DATAW wfd;");
+    wln(self, "        HANDLE wh = FindFirstFileW(wpat, &wfd);");
+    wln(self, "        if (wh == INVALID_HANDLE_VALUE) { free(wpat); char* e = (char*)p_malloc(1); e[0] = 0; return e; }");
+    wln(self, "        size_t wcap = 256, wused = 0; char* acc = (char*)malloc(wcap);");
+    wln(self, "        if (acc) acc[0] = 0;");
+    wln(self, "        do {");
+    wln(self, "          if (!acc) break;");
+    wln(self, "          if (wcscmp(wfd.cFileName, L\".\") == 0 || wcscmp(wfd.cFileName, L\"..\") == 0) continue;");
+    wln(self, "          char* nm = __p_utf8_of_w(wfd.cFileName); if (!nm) continue;");
+    wln(self, "          size_t nl = strlen(nm), sep = wused > 0 ? 1 : 0;");
+    wln(self, "          if (wused + sep + nl + 1 > wcap) { while (wused + sep + nl + 1 > wcap) wcap *= 2; char* na = (char*)realloc(acc, wcap); if (!na) { free(nm); break; } acc = na; }");
+    wln(self, "          if (sep) acc[wused++] = '\\n';");
+    wln(self, "          memcpy(acc + wused, nm, nl); wused += nl; acc[wused] = 0; free(nm);");
+    wln(self, "        } while (FindNextFileW(wh, &wfd));");
+    wln(self, "        FindClose(wh); free(wpat);");
+    wln(self, "        char* wout = (char*)p_malloc((int64_t)wused + 1);");
+    wln(self, "        if (acc) { memcpy(wout, acc, wused + 1); free(acc); } else { wout[0] = 0; }");
+    wln(self, "        return __p_dir_sort(wout);");
+    wln(self, "      }");
+    wln(self, "    }");
     wln(self, "    WIN32_FIND_DATAA fd; char pat[2056];");
     wln(self, "    snprintf(pat, sizeof pat, \"%s\\\\*\", path);");
     wln(self, "    HANDLE h = FindFirstFileA(pat, &fd);");
@@ -13592,7 +14305,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "        }");
     wln(self, "    } while (FindNextFileA(h, &fd));");
     wln(self, "    FindClose(h);");
-    wln(self, "    return out;");
+    wln(self, "    return __p_dir_sort(out);");
     wln(self, "#else");
     wln(self, "    DIR* d = opendir(path);");
     wln(self, "    if (!d) { char* e = (char*)p_malloc(1); e[0] = 0; return e; }");
@@ -13614,7 +14327,7 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "        }");
     wln(self, "    }");
     wln(self, "    closedir(d);");
-    wln(self, "    return out;");
+    wln(self, "    return __p_dir_sort(out);");
     wln(self, "#endif");
     wln(self, "}");
     // Wall-clock timing builtins - use clock_gettime(CLOCK_REALTIME)
@@ -16590,6 +17303,32 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "    pthread_mutex_unlock(&ch->mutex);");
     wln(self, "    return val;");
     wln(self, "}");
+    // BG241: select's receive, "a value was taken" out of band: 1 with the
+    // value (or 0 from a closed, empty channel) written to *out, 0 when
+    // nothing is ready (a value equal to P_CHAN_PENDING is a value)
+    wln(self, "int64_t p_chan_try_recv_into(int64_t handle, int64_t out) {");
+    wln(self, "    p_channel_t* ch = (p_channel_t*)(intptr_t)handle;");
+    wln(self, "    if (!ch) return 0;");
+    wln(self, "    __p_rnd_point();");
+    wln(self, "    pthread_mutex_lock(&ch->mutex);");
+    wln(self, "    if (ch->count == 0) {");
+    wln(self, "        int closed = ch->closed;");
+    wln(self, "        pthread_mutex_unlock(&ch->mutex);");
+    wln(self, "        if (!closed) return 0;");
+    wln(self, "        *(int64_t*)(intptr_t)out = 0;");
+    wln(self, "        return 1;");
+    wln(self, "    }");
+    wln(self, "    int64_t val = ch->buffer[ch->head];");
+    wln(self, "    ch->head = (ch->head + 1) % ch->capacity;");
+    wln(self, "    ch->count--;");
+    wln(self, "    pthread_cond_signal(&ch->not_full);");
+    wln(self, "#ifdef P_MN");
+    wln(self, "    if (ch->ts_head) __p_chan_wake(ch, 1, 0);");
+    wln(self, "#endif");
+    wln(self, "    pthread_mutex_unlock(&ch->mutex);");
+    wln(self, "    *(int64_t*)(intptr_t)out = val;");
+    wln(self, "    return 1;");
+    wln(self, "}");
     wln(self, "void p_chan_close(int64_t handle) {");
     wln(self, "    p_channel_t* ch = (p_channel_t*)(intptr_t)handle;");
     wln(self, "    if (!ch) return;");
@@ -17144,6 +17883,17 @@ fn emit_runtime_impl(self: &mut CCodeGen) -> void {
     wln(self, "#ifdef __wasi__");
     wln(self, "    struct pollfd pf; pf.fd = (int)fd; pf.events = write_mode ? POLLOUT : POLLIN; pf.revents = 0;");
     wln(self, "    return (int64_t)poll(&pf, 1, (int)timeout_ms);");
+    // BG205: POSIX waits with poll(), as WASI does: select's fd_set holds
+    // fds below FD_SETSIZE (1024 on Linux) only, and FD_SET of a larger
+    // one wrote past the stack set on every poll. Windows' fd_set is a
+    // list of sockets (any value; one socket here), so it keeps select.
+    wln(self, "#elif !defined(_WIN32)");
+    wln(self, "    if (fd < 0) return -1;");
+    wln(self, "    struct pollfd pf; pf.fd = (int)fd; pf.events = write_mode ? POLLOUT : POLLIN; pf.revents = 0;");
+    wln(self, "    int pt = timeout_ms < 0 ? -1 : (timeout_ms > 2147483647 ? 2147483647 : (int)timeout_ms);");
+    wln(self, "    int n = poll(&pf, 1, pt);");
+    wln(self, "    if (n > 0 && (pf.revents & POLLNVAL)) return -1;");
+    wln(self, "    return (int64_t)n;");
     wln(self, "#else");
     wln(self, "    fd_set rset, wset; struct timeval tv;");
     wln(self, "    FD_ZERO(&rset); FD_ZERO(&wset);");

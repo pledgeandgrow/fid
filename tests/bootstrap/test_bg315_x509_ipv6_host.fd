@@ -1,0 +1,117 @@
+// BG315 (docs/roadmap/bugs-roadmap.md): x509_matches_host compares an IP
+// host with the iPAddress SANs as addresses, so an IPv6 host written the
+// usual way (RFC 5952: "::1", "2001:db8::1") or in brackets matches, as
+// does the uncompressed form; a different address or a malformed literal
+// does not. x509_ip_parse gives the bytes (values from Python's
+// ipaddress). Certificate made with openssl 3.5: subjectAltName =
+// IP:2001:db8::1, IP:::1, IP:192.0.2.7, IP:::ffff:198.51.100.9,
+// DNS:host.example.test.
+//
+// Expected output:
+// parsed true, 4 ip SANs
+// 2001:db8::1 true
+// 2001:DB8::1 true
+// 2001:db8:0:0:0:0:0:1 true
+// [2001:db8::1] true
+// 2001:0db8:0000:0000:0000:0000:0000:0001 true
+// ::1 true
+// [::1] true
+// 0:0:0:0:0:0:0:1 true
+// 192.0.2.7 true
+// ::ffff:198.51.100.9 true
+// ::ffff:c633:6409 true
+// host.example.test true
+// 198.51.100.9 false
+// 2001:db8::2 false
+// ::2 false
+// 192.0.2.8 false
+// 2001:db8::1:: false
+// 192.0.2.07 false
+// parse 2001:db8::1 20010db8000000000000000000000001
+// parse :: 00000000000000000000000000000000
+// parse 1:: 00010000000000000000000000000000
+// parse ::ffff:1.2.3.4 00000000000000000000ffff01020304
+// parse 1:2:3:4:5:6:7:: 00010002000300040005000600070000
+// parse 192.0.2.7 c0000207
+// parse 1:2:3:4:5:6:7:8:: <none>
+// parse 1:2:3:4:5:6:7:8:9 <none>
+// parse :1 <none>
+// parse 1: <none>
+// parse 2001:db8::1:: <none>
+// parse 192.0.2.07 <none>
+// parse 256.1.1.1 <none>
+// parse ::12345 <none>
+// parse host.example.test <none>
+use x509;
+use encoding;
+use string;
+
+fn ip_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+        "MIIBrzCCAVagAwIBAgIUfqbeFVDyVVqcrF0873cCYZ2+7ocwCgYIKoZIzj0EAwIw\n" +
+        "EjEQMA4GA1UEAwwHaXAgdGVzdDAgFw0yNjExMjcxOTM1MThaGA8yMTI2MTEwMzE5\n" +
+        "MzUxOFowEjEQMA4GA1UEAwwHaXAgdGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEH\n" +
+        "A0IABHKn5CQIQGMDMsibZtKvijxibHX5as42vTs3o8gfjwwqmEvez6KdjbLWMxnR\n" +
+        "1wWdrw7PQqbJ3L6i4ruYYhbW7eujgYcwgYQwCQYDVR0TBAIwADBYBgNVHREEUTBP\n" +
+        "hxAgAQ24AAAAAAAAAAAAAAABhxAAAAAAAAAAAAAAAAAAAAABhwTAAAIHhxAAAAAA\n" +
+        "AAAAAAAA///GM2QJghFob3N0LmV4YW1wbGUudGVzdDAdBgNVHQ4EFgQUVBcqgNPV\n" +
+        "+Sve5oOkZx51IK+yMKswCgYIKoZIzj0EAwIDRwAwRAIgIVp9YQ6t2ADOHrWmjX5a\n" +
+        "pj0xB8gB624VGPELB4Ds+xMCIA9KDzbe3wnEp9+V5kWEvvT2QT65+HOIfTjfXuyL\n" +
+        "dMVH\n" +
+        "-----END CERTIFICATE-----\n";
+}
+
+fn host(c: X509Cert, h: str) -> void {
+    println(h + " " + bool_to_str(x509_matches_host(c, h)));
+}
+
+fn parse(h: str) -> void {
+    val b: Vec<i64> = x509_ip_parse(h);
+    if b.len() == 0 {
+        println("parse " + h + " <none>");
+    } else {
+        println("parse " + h + " " + str_to_lower(hex_encode_bytes(b)));
+    }
+}
+
+fn main() -> i64 {
+    val c: X509Cert = x509_parse_pem(ip_pem());
+    println("parsed " + bool_to_str(c.ok) + ", " + int_to_str(c.san_ip_raw.len()) + " ip SANs");
+    // the entry's trigger, and the other ways to write the same addresses
+    host(c, "2001:db8::1");
+    host(c, "2001:DB8::1");
+    host(c, "2001:db8:0:0:0:0:0:1");
+    host(c, "[2001:db8::1]");
+    host(c, "2001:0db8:0000:0000:0000:0000:0000:0001");
+    host(c, "::1");
+    host(c, "[::1]");
+    host(c, "0:0:0:0:0:0:0:1");
+    host(c, "192.0.2.7");
+    host(c, "::ffff:198.51.100.9");
+    host(c, "::ffff:c633:6409");
+    host(c, "host.example.test");
+    // other addresses, an IPv4 address against its IPv4-mapped SAN, bad literals
+    host(c, "198.51.100.9");
+    host(c, "2001:db8::2");
+    host(c, "::2");
+    host(c, "192.0.2.8");
+    host(c, "2001:db8::1::");
+    host(c, "192.0.2.07");
+    // the parser
+    parse("2001:db8::1");
+    parse("::");
+    parse("1::");
+    parse("::ffff:1.2.3.4");
+    parse("1:2:3:4:5:6:7::");
+    parse("192.0.2.7");
+    parse("1:2:3:4:5:6:7:8::");
+    parse("1:2:3:4:5:6:7:8:9");
+    parse(":1");
+    parse("1:");
+    parse("2001:db8::1::");
+    parse("192.0.2.07");
+    parse("256.1.1.1");
+    parse("::12345");
+    parse("host.example.test");
+    return 0;
+}

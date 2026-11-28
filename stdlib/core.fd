@@ -2724,6 +2724,21 @@ pub fn Vec_push(v: i64, value: i64) {
 /// The last element, taken out: the caller owns it (proposal 0004). From a
 /// shared buffer the element stays the other owners' too, so it gets one
 /// more owner.
+/// BG309: what pop gives for an empty Vec `v`: an empty Vec (or map) the
+/// caller owns when the elements are Vecs (maps) -- pop's result is the
+/// caller's -- not a null handle compiled code faults on; else 0. The C
+/// generator's fast Vec_pop body calls it too.
+pub fn vec_pop_empty(v: i64) -> i64 {
+    var etid: i64 = vec_tid(v);
+    if etid == P_TID_VEC {
+        return Vec_new();
+    }
+    if etid == P_TID_MAP {
+        return HashMap_new();
+    }
+    return 0;
+}
+
 pub fn Vec_pop(v: i64) -> i64 {
     if vec_code(v) != 0 {
         return vec_sz_pop(v);
@@ -2741,7 +2756,7 @@ pub fn Vec_pop(v: i64) -> i64 {
         cap = *cap_ptr;
     }
     if len == 0 {
-        return 0;
+        return vec_pop_empty(v);
     }
     var elem_ptr: *mut i64 = data + (len - 1) * 8;
     var result: i64 = 0;
@@ -3136,6 +3151,141 @@ pub fn Vec_eq_strs(a: i64, b: i64) -> bool {
         i = i + 1;
     }
     return true;
+}
+
+/// BG464: IEEE 754 `==` of two f64s given as their bits (semantics-2 §5
+/// F-cmp): a NaN equals nothing, itself included, and -0.0 equals 0.0.
+/// Integer operations only, so it means the same on every backend.
+fn f64_bits_eq(a: i64, b: i64) -> bool {
+    if (a & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000 || (b & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000 {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    return ((a | b) & 0x7FFFFFFFFFFFFFFF) == 0;
+}
+
+/// BG464: a Vec<f32>'s (or a map's f32 value's) word as the bits of the
+/// f64 equal to it, from either word form (Vec_sort_f32).
+fn f32_word_f64_bits(w: i64) -> i64 {
+    if ((w >> 32) & 0xFFFFFFFF) != 0 {
+        return w;
+    }
+    return vec_f32_bits_to_f64_bits(w & 0xFFFFFFFF);
+}
+
+/// BG464: `==` on two Vec<f64> (proposal 0001 rule 5): same length, and
+/// equal element by element as floats (f64_bits_eq). Vec_eq_words compared
+/// the bits: `[0.0] == [-0.0]` was false and `[NaN] == [NaN]` true. (No
+/// shortcut for one shared buffer: a NaN in it makes it unequal to itself.)
+pub fn Vec_eq_f64(a: i64, b: i64) -> bool {
+    if a == 0 || b == 0 {
+        return a == b;
+    }
+    var n: i64 = Vec_len(a);
+    if n != Vec_len(b) {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        if !f64_bits_eq(Vec_get(a, i), Vec_get(b, i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// BG464: `==` on two Vec<f32>, as Vec_eq_f64 (each word in either form).
+pub fn Vec_eq_f32(a: i64, b: i64) -> bool {
+    if a == 0 || b == 0 {
+        return a == b;
+    }
+    var n: i64 = Vec_len(a);
+    if n != Vec_len(b) {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        if !f64_bits_eq(f32_word_f64_bits(Vec_get(a, i)), f32_word_f64_bits(Vec_get(b, i))) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// BG423: `==` on two maps (proposal 0001 rule 5: by content): the same
+/// number of entries, and every key of `a` in `b` with an equal value.
+/// `vk` says how values compare: 0 as words (numbers, bools), 1 as
+/// strings, 2 as f64s, 3 as f32s (f64_bits_eq). A map with struct keys
+/// (RT5) is still compared by handle.
+fn hm_eq_by(a: i64, b: i64, vk: i64) -> bool {
+    if a == 0 || b == 0 {
+        return a == b;
+    }
+    if hm_skey_size(a) > 0 || hm_skey_size(b) > 0 {
+        return a == b;
+    }
+    if HashMap_len(a) != HashMap_len(b) {
+        return false;
+    }
+    var keys: i64 = HashMap_keys(a);
+    var n: i64 = Vec_len(keys);
+    var same: bool = true;
+    var i: i64 = 0;
+    while i < n && same {
+        var k: i64 = Vec_get(keys, i);
+        // an integer key is looked up in its stored form (HashMap_get_i
+        // would mark a map it is not in as integer-keyed)
+        var ka: i64 = k;
+        if hm_is_int(a) {
+            ka = k ^ HM_INT_XOR;
+        }
+        var kb: i64 = k;
+        if hm_is_int(b) {
+            kb = k ^ HM_INT_XOR;
+        }
+        if !HashMap_contains(b, kb) {
+            same = false;
+        } else {
+            var va: i64 = HashMap_get(a, ka);
+            var vb: i64 = HashMap_get(b, kb);
+            if vk == 1 {
+                same = str_equal(va, vb);
+            } else if vk == 2 {
+                same = f64_bits_eq(va, vb);
+            } else if vk == 3 {
+                same = f64_bits_eq(f32_word_f64_bits(va), f32_word_f64_bits(vb));
+            } else {
+                same = va == vb;
+            }
+        }
+        i = i + 1;
+    }
+    Vec_drop(keys);
+    return same;
+}
+
+/// BG423: `==` on maps of numbers or bools.
+pub fn HashMap_eq_words(a: i64, b: i64) -> bool {
+    return hm_eq_by(a, b, 0);
+}
+
+/// BG423: `==` on maps of strings.
+pub fn HashMap_eq_strs(a: i64, b: i64) -> bool {
+    return hm_eq_by(a, b, 1);
+}
+
+/// BG423: `==` on maps of f64s.
+pub fn HashMap_eq_f64(a: i64, b: i64) -> bool {
+    return hm_eq_by(a, b, 2);
+}
+
+/// BG423: `==` on maps of f32s.
+pub fn HashMap_eq_f32(a: i64, b: i64) -> bool {
+    return hm_eq_by(a, b, 3);
 }
 
 /// Element `idx` becomes `value`, which the Vec now owns; the old element is
@@ -3936,6 +4086,105 @@ fn vec_sift_down_f64(data: i64, root: i64, n: i64) {
                 child = child + 1;
             }
             if vec_f64_key(vec_slot(data, r)) >= vec_f64_key(vec_slot(data, child)) {
+                done = true;
+            } else {
+                vec_swap_slots(data, r, child);
+                r = child;
+            }
+        }
+    }
+}
+
+/// BG301: sort a `Vec<f32>` ascending as numbers, in place (heapsort, as
+/// Vec_sort_f64; the lowering of `.sort()` on a `Vec<f32>` picks it). A
+/// word holds its f32 as the bits of the f64 it widens to (fid run, C,
+/// pe_ir) or as the f32's own 32-bit pattern, zero-extended (the machine
+/// layer). A word whose upper half is zero is the latter: as an f64's bits
+/// it could only be +0.0, which is 0 either way. Both are ordered by the
+/// f64's key, so negative values no longer sort backwards (or, on --nat,
+/// after every positive one).
+pub fn Vec_sort_f32(v: i64) {
+    vec_own(v);
+    if vec_code(v) != 0 {
+        // not one word per element: no f32s in it
+        vec_raw_sort(v);
+        return;
+    }
+    var len_ptr: *mut i64 = v + 8;
+    var data_ptr_ptr: *mut i64 = v;
+    var len: i64 = 0;
+    var data: i64 = 0;
+    // SAFETY: header words 0 and 1 of the Vec v (vec_own above).
+    unsafe {
+        len = *len_ptr;
+        data = *data_ptr_ptr;
+    }
+    if len <= 1 {
+        return;
+    }
+    var start: i64 = len / 2 - 1;
+    while start >= 0 {
+        vec_sift_down_f32(data, start, len);
+        start = start - 1;
+    }
+    var end: i64 = len - 1;
+    while end > 0 {
+        vec_swap_slots(data, 0, end);
+        vec_sift_down_f32(data, 0, end);
+        end = end - 1;
+    }
+}
+
+/// BG301: the order key (vec_f64_key) of a Vec<f32>'s word, in either of
+/// its two forms (Vec_sort_f32).
+fn vec_f32_word_key(w: i64) -> i64 {
+    if ((w >> 32) & 0xFFFFFFFF) != 0 {
+        return vec_f64_key(w);
+    }
+    return vec_f64_key(vec_f32_bits_to_f64_bits(w & 0xFFFFFFFF));
+}
+
+/// BG301: the bits of the f64 equal to the f32 whose 32-bit pattern is `b`
+/// (an exact widening: subnormal f32s become normal f64s, NaN keeps its
+/// payload's top bits).
+fn vec_f32_bits_to_f64_bits(b: i64) -> i64 {
+    var s64: i64 = 0;
+    if ((b >> 31) & 1) == 1 {
+        s64 = (0 - 1) ^ 0x7FFFFFFFFFFFFFFF;
+    }
+    var e: i64 = (b >> 23) & 0xFF;
+    var m: i64 = b & 0x7FFFFF;
+    if e == 0xFF {
+        return s64 | 0x7FF0000000000000 | (m << 29);
+    }
+    if e == 0 {
+        if m == 0 {
+            return s64;
+        }
+        // subnormal: m * 2^-149, normalized to 1.f * 2^ex
+        var ex: i64 = 0 - 126;
+        while (m & 0x800000) == 0 {
+            m = m << 1;
+            ex = ex - 1;
+        }
+        m = m & 0x7FFFFF;
+        return s64 | ((ex + 1023) << 52) | (m << 29);
+    }
+    return s64 | ((e - 127 + 1023) << 52) | (m << 29);
+}
+
+fn vec_sift_down_f32(data: i64, root: i64, n: i64) {
+    var r: i64 = root;
+    var done: bool = false;
+    while !done {
+        var child: i64 = 2 * r + 1;
+        if child >= n {
+            done = true;
+        } else {
+            if child + 1 < n && vec_f32_word_key(vec_slot(data, child)) < vec_f32_word_key(vec_slot(data, child + 1)) {
+                child = child + 1;
+            }
+            if vec_f32_word_key(vec_slot(data, r)) >= vec_f32_word_key(vec_slot(data, child)) {
                 done = true;
             } else {
                 vec_swap_slots(data, r, child);
@@ -6434,7 +6683,20 @@ pub fn HashMap_get_or(m: i64, key: i64, default: i64) -> i64 {
 // Keys and values are assumed to be string pointers (i64 addresses).
 // Keys are sorted lexicographically for deterministic output.
 pub fn HashMap_to_str(m: i64) -> str {
-    var keys: i64 = HashMap_keys(m);
+    return HashMap_to_str_k(m, 0, 0);
+}
+
+/// BG279: a map's text with its keys shown as kind `kk` and its values as
+/// kind `vk` (coll_word_text: the lowering passes the kinds its static
+/// type says; 0 is the old text, a number, or a string the map owns).
+/// u64 keys (kk 4) are listed in unsigned order (BG336).
+pub fn HashMap_to_str_k(m: i64, kk: i64, vk: i64) -> str {
+    var keys: i64 = 0;
+    if kk == 4 {
+        keys = HashMap_keys_u64(m);
+    } else {
+        keys = HashMap_keys(m);
+    }
     var len: i64 = Vec_len(keys);
 
     // Sort keys lexicographically (simple bubble sort); integer keys are
@@ -6467,12 +6729,12 @@ pub fn HashMap_to_str(m: i64) -> str {
         }
         var key: i64 = Vec_get(keys, i);
         if hm_is_int(m) {
-            result = result + p_to_str(key) + ": " + p_to_str(HashMap_get(m, key ^ HM_INT_XOR));
+            result = result + coll_word_text(key, kk) + ": " + coll_word_text(HashMap_get(m, key ^ HM_INT_XOR), vk);
             i = i + 1;
             continue;
         }
         if skeys {
-            result = result + "{..}: " + p_to_str(HashMap_get(m, key));
+            result = result + "{..}: " + coll_word_text(HashMap_get(m, key), vk);
             i = i + 1;
             continue;
         }
@@ -6481,10 +6743,10 @@ pub fn HashMap_to_str(m: i64) -> str {
         result = result + ": ";
         // A value the map owns as a string is shown as text (before, every
         // value was shown as a number)
-        if hm_vtid(m) == P_TID_STR && value != 0 {
+        if vk == 0 && hm_vtid(m) == P_TID_STR && value != 0 {
             result = p_str_concat(result, value);
         } else {
-            result = result + p_to_str(value);
+            result = result + coll_word_text(value, vk);
         }
         i = i + 1;
     }
@@ -6492,6 +6754,119 @@ pub fn HashMap_to_str(m: i64) -> str {
     // the keys' copies (HashMap_keys gave this function their owners)
     Vec_drop(keys);
     return result;
+}
+
+/// BG279: the text of a Vec element or map key/value word of kind `kind`,
+/// which the lowering takes from the static type (the word itself does not
+/// say): 1 an f64 (its bits), 2 an f32 (either word form, f32_word_f64_bits),
+/// 3 a bool, 4 a u64 (unsigned, reference §3.5); 0 a number as before
+/// (p_to_str). Doubles printed as their bits, bools as 1/0, a u64 above
+/// i64::MAX as negative.
+pub fn coll_word_text(w: i64, kind: i64) -> str {
+    if kind == 1 {
+        return float_to_str(p_f64_from_bits(w));
+    }
+    if kind == 2 {
+        return float_to_str(p_f64_from_bits(f32_word_f64_bits(w)));
+    }
+    if kind == 3 {
+        if (w & 255) != 0 {
+            return "true";
+        }
+        return "false";
+    }
+    if kind == 4 {
+        return u64_to_str(w as u64);
+    }
+    return p_to_str(w);
+}
+
+/// BG279: a Vec's text with its elements shown as kind `kind`
+/// (coll_word_text); kind 0 is Vec_to_str.
+pub fn Vec_to_str_k(v: i64, kind: i64) -> str {
+    if kind == 0 || v == 0 {
+        return Vec_to_str(v);
+    }
+    var r: str = "[";
+    var n: i64 = Vec_len(v);
+    var i: i64 = 0;
+    while i < n {
+        if i > 0 {
+            r = r + ", ";
+        }
+        r = r + coll_word_text(Vec_get(v, i), kind);
+        i = i + 1;
+    }
+    return r + "]";
+}
+
+/// BG336: the keys of a map whose keys are u64, in unsigned order
+/// (semantics-2 §20.2 M-order: integer keys ascending by value):
+/// HashMap_keys sorts them as i64, so keys at or above 2^63 came first.
+pub fn HashMap_keys_u64(m: i64) -> i64 {
+    var ks: i64 = HashMap_keys(m);
+    vec_sort_unsigned(ks);
+    return ks;
+}
+
+/// BG336: HashMap_values in the unsigned order of the keys (as
+/// HashMap_keys_u64).
+pub fn HashMap_values_u64(m: i64) -> i64 {
+    var keys: i64 = HashMap_keys_u64(m);
+    var len: i64 = Vec_len(keys);
+    var vtid: i64 = hm_vtid(m);
+    var result: i64 = Vec_new_typed(0, vtid);
+    var ms: i64 = hm_mem_size(m);
+    var i: i64 = 0;
+    while i < len {
+        var k: i64 = Vec_get(keys, i);
+        var v: i64 = 0;
+        if hm_is_int(m) {
+            v = HashMap_get(m, k ^ HM_INT_XOR);
+        } else {
+            v = HashMap_get(m, k);
+        }
+        if ms > 0 {
+            hm_vec_push_copy(result, v, ms, vtid);
+        } else {
+            Vec_push(result, vec_elem_dup(vtid, v));
+        }
+        i = i + 1;
+    }
+    Vec_drop(keys);
+    return result;
+}
+
+/// BG336: sort a Vec of one word per element ascending as unsigned
+/// numbers: each word's top bit flipped, sorted as i64, flipped back.
+fn vec_sort_unsigned(v: i64) {
+    var top: i64 = (0 - 1) ^ 0x7FFFFFFFFFFFFFFF;
+    var n: i64 = Vec_len(v);
+    var i: i64 = 0;
+    while i < n {
+        Vec_set(v, i, Vec_get(v, i) ^ top);
+        i = i + 1;
+    }
+    Vec_sort(v);
+    i = 0;
+    while i < n {
+        Vec_set(v, i, Vec_get(v, i) ^ top);
+        i = i + 1;
+    }
+}
+
+/// BG308: the value `HashMap_get` gave for a map whose values are Vecs,
+/// maps or structs, or for a missing key (the word 0) the zeroed block
+/// `z` of `words` words: an empty Vec or map header, a struct of zeros
+/// (what `fid run` reads at address 0). Compiled code read through the
+/// null word and faulted. The block is the caller's (a stack slot the
+/// lowering made), lent like the map's own value.
+pub fn hm_get_or_zero(v: i64, z: i64, words: i64) -> i64 {
+    if v != 0 {
+        return v;
+    }
+    p_zero_words(z, words);
+    return z;
 }
 
 // ─── String (Phase 10B) ─────────────────────────────────────────────────
@@ -7707,8 +8082,10 @@ impl StringBuilder {
     }
 
     pub fn append_char(self: &mut StringBuilder, c: i64) -> void {
-        p_sb_append(self.handle, byte_to_str(c));
-        self.len = self.len + 1;
+        // BG341: a character above 255 as its UTF-8 bytes (char_to_str)
+        val text: str = char_to_str(c);
+        p_sb_append(self.handle, text);
+        self.len = self.len + String_len(text);
     }
 
     pub fn append_int(self: &mut StringBuilder, n: i64) -> void {
@@ -7784,8 +8161,25 @@ pub fn String_char_count(s: i64) -> i64 {
     return p_str_length(s);
 }
 
+/// A character as a string. 0..255 is one byte of that value, as before
+/// (callers append the bytes of UTF-8 and binary data one by one); BG341: a
+/// larger Unicode scalar value (`'€'` is 8364) is its UTF-8 encoding, a
+/// surrogate or a value above U+10FFFF is U+FFFD (it kept only the low byte).
 pub fn char_to_str(b: i64) -> str {
-    return p_char_to_str(b);
+    if b < 256 {
+        return p_char_to_str(b);
+    }
+    var c: i64 = b;
+    if c > 1114111 || (c >= 55296 && c <= 57343) {
+        c = 65533;
+    }
+    if c < 2048 {
+        return p_char_to_str(192 | (c >> 6)) + p_char_to_str(128 | (c & 63));
+    }
+    if c < 65536 {
+        return p_char_to_str(224 | (c >> 12)) + p_char_to_str(128 | ((c >> 6) & 63)) + p_char_to_str(128 | (c & 63));
+    }
+    return p_char_to_str(240 | (c >> 18)) + p_char_to_str(128 | ((c >> 12) & 63)) + p_char_to_str(128 | ((c >> 6) & 63)) + p_char_to_str(128 | (c & 63));
 }
 
 pub fn char_is_digit(b: i64) -> bool {
@@ -8275,6 +8669,11 @@ pub fn str_parse_hex(s: str) -> i64 {
             i = i + 2;
         }
     }  // Parse hex digits
+    // BG342: up to 16 significant digits are the 64 bits (16 digits keep
+    // their two's-complement meaning: "ffffffffffffffff" is -1); a value of
+    // 17 or more significant digits (2^64 and up) returns 0, the documented
+    // failure, instead of wrapping
+    var sig: i64 = 0;
     while i < slen {
         var addr: i64 = s + i;
         var ptr: *mut u8 = addr;
@@ -8292,6 +8691,12 @@ pub fn str_parse_hex(s: str) -> i64 {
             digit = b - 87;
         } else {
             break;
+        }
+        if sig > 0 || digit != 0 {
+            sig = sig + 1;
+        }
+        if sig > 16 {
+            return 0;
         }
         result = result * 16 + digit;
         i = i + 1;
@@ -8329,6 +8734,11 @@ pub fn str_parse_int_range(s: str, start: i64, end: i64) -> i64 {
         }
         if b < 48 || b > 57 {
             break;
+        }
+        // BG342 (as BG175 for str_parse_int): a digit run past i64::MAX
+        // returns 0 instead of panicking on the checked multiply
+        if result > 922337203685477580 || (result == 922337203685477580 && b > 55) {
+            return 0;
         }
         result = result * 10 + (b - 48);
         i = i + 1;
@@ -8647,10 +9057,53 @@ pub fn fstr_fmt_u64(v: u64, spec: str) -> str {
     return __fstr_pad(pre + s, spec, 62, true);
 }
 
+/// BG339: `f * scale` rounded once to the nearest integer (half-way values
+/// up), for a fraction 0 <= f < 1 and a power of ten `scale` <= 10^18.
+/// `(f * scale + 0.5) as i64` rounded twice: the product was rounded to a
+/// double first, so 0.0055 (0.00549999...) became 5.5 at 3 digits and
+/// printed 0.006. The product is kept exact as p + e (Dekker's two-product,
+/// Veltkamp splits), and p's fraction d is compared with 0.5 - e exactly.
+@wrapping
+fn __fstr_round_scaled(f: f64, scale: f64) -> i64 {
+    var p: f64 = f * scale;
+    var sp: f64 = 134217729.0;
+    var c1: f64 = sp * f;
+    var fh: f64 = c1 - (c1 - f);
+    var fl: f64 = f - fh;
+    var c2: f64 = sp * scale;
+    var sh: f64 = c2 - (c2 - scale);
+    var sl: f64 = scale - sh;
+    var e: f64 = (((fh * sh - p) + fh * sl) + fl * sh) + fl * sl;
+    var n0: i64 = p as i64;
+    if p >= 9007199254740992.0 {
+        // p is whole: the exact product is n0 + e, e a double of any size
+        var ke: i64 = e as i64;
+        if (ke as f64) > e {
+            ke = ke - 1;
+        }
+        if e - (ke as f64) >= 0.5 {
+            ke = ke + 1;
+        }
+        return n0 + ke;
+    }
+    if p < 0.25 {
+        return n0;
+    }
+    // d = p - n0 is exact, and so is d - 0.5 (p >= 0.25); |e| <= 0.5
+    var d: f64 = p - (n0 as f64);
+    if d - 0.5 >= 0.0 - e {
+        return n0 + 1;
+    }
+    return n0;
+}
+
 pub fn fstr_fmt_f64(v: f64, spec: str) -> str {
     var s: str = "";
     var prec: i64 = __fstr_prec(spec);
-    if prec < 0 {
+    // NaN (v != v) and the infinities have no digits to round: they print
+    // as without a precision, "NaN" / "inf" / "-inf" (BG305).
+    var fmax: f64 = 1.7976931348623157e308;
+    if prec < 0 || v != v || v > fmax || v < 0.0 - fmax {
         s = float_to_str(v);
     } else {
         if prec > 18 {
@@ -8679,7 +9132,7 @@ pub fn fstr_fmt_f64(v: f64, spec: str) -> str {
                 ip10 = ip10 * 10;
                 pi = pi + 1;
             }
-            frac = ((av - (ip as f64)) * scale + 0.5) as i64;
+            frac = __fstr_round_scaled(av - (ip as f64), scale);
             if frac >= ip10 {
                 // the fraction rounded up to a whole
                 frac = frac - ip10;

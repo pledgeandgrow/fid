@@ -1,0 +1,84 @@
+// BG447 (docs/roadmap/bugs-roadmap.md): image_bmp_decode rejected every
+// top-down BMP (negative biHeight): the height is read unsigned, so the
+// `h < 0` test never fired and the second test turned it into a negative
+// value that the `h <= 0` check then refused. A negative biHeight now means
+// -biHeight rows stored top to bottom.
+//
+// Expected output:
+// bottom-up: w=1 h=2 top=65535 bottom=4278190335
+// top-down: w=1 h=2 top=4278190335 bottom=65535
+// top-down 2x3: w=2 h=3 16711935 4278190335 65535 4294967295 255 2155905279
+// top-down, -2147483648 rows: 0
+// negative width: 0
+// height 0: 0
+use image;
+
+fn put_u32le(v: &mut Vec<i64>, x: i64) {
+    v.push(x & 255);
+    v.push((x >> 8) & 255);
+    v.push((x >> 16) & 255);
+    v.push((x >> 24) & 255);
+}
+
+fn put_u16le(v: &mut Vec<i64>, x: i64) {
+    v.push(x & 255);
+    v.push((x >> 8) & 255);
+}
+
+// a 24-bit BI_RGB BMP (54-byte header) with these biWidth/biHeight words
+fn bmp(w: i64, h: i64, pixels: &Vec<i64>) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    v.push(66);
+    v.push(77);
+    put_u32le(&mut v, 54 + pixels.len());
+    put_u32le(&mut v, 0);
+    put_u32le(&mut v, 54);
+    put_u32le(&mut v, 40);
+    put_u32le(&mut v, w);
+    put_u32le(&mut v, h);
+    put_u16le(&mut v, 1);
+    put_u16le(&mut v, 24);
+    put_u32le(&mut v, 0);
+    put_u32le(&mut v, pixels.len());
+    put_u32le(&mut v, 2835);
+    put_u32le(&mut v, 2835);
+    put_u32le(&mut v, 0);
+    put_u32le(&mut v, 0);
+    var i: i64 = 0;
+    while i < pixels.len() {
+        v.push(pixels.get(i));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn main() {
+    // two rows of one pixel, 4 bytes each (BGR + pad): red, then blue
+    var px: Vec<i64> = Vec::new();
+    val rows: [i64; 8] = [0, 0, 255, 0, 255, 0, 0, 0];
+    var i: i64 = 0;
+    while i < 8 {
+        px.push(rows[i]);
+        i = i + 1;
+    }
+    val up: Image = image_bmp_decode(bmp(1, 2, &px));
+    println(f"bottom-up: w={up.width} h={up.height} top={image_get_pixel(&up, 0, 0)} bottom={image_get_pixel(&up, 0, 1)}");
+    // biHeight = -2 (0xFFFFFFFE): the same bytes, first row on top
+    val td: Image = image_bmp_decode(bmp(1, 4294967294, &px));
+    println(f"top-down: w={td.width} h={td.height} top={image_get_pixel(&td, 0, 0)} bottom={image_get_pixel(&td, 0, 1)}");
+    // 2x3, biHeight -3: rows of 6 bytes padded to 8
+    var p3: Vec<i64> = Vec::new();
+    val r3: [i64; 24] = [0, 255, 0, 0, 0, 255, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0, 0, 0, 0, 128, 128, 128, 0, 0];
+    i = 0;
+    while i < 24 {
+        p3.push(r3[i]);
+        i = i + 1;
+    }
+    val t3: Image = image_bmp_decode(bmp(2, 4294967293, &p3));
+    println(f"top-down 2x3: w={t3.width} h={t3.height} {image_get_pixel(&t3, 0, 0)} {image_get_pixel(&t3, 1, 0)} {image_get_pixel(&t3, 0, 1)} {image_get_pixel(&t3, 1, 1)} {image_get_pixel(&t3, 0, 2)} {image_get_pixel(&t3, 1, 2)}");
+    // biHeight = i32 minimum: 2^31 rows do not fit in the 8 bytes given
+    println(f"top-down, -2147483648 rows: {image_bmp_decode(bmp(1, 2147483648, &px)).width}");
+    // biWidth = -1: invalid
+    println(f"negative width: {image_bmp_decode(bmp(4294967295, 2, &px)).width}");
+    println(f"height 0: {image_bmp_decode(bmp(1, 0, &px)).width}");
+}

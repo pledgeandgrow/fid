@@ -146,8 +146,11 @@ pub fn can_validate_dlc(dlc: i64) -> bool {
 //   Priority (3 bits) | Reserved (1) | Data Page (1) | PDU Format (8)
 //   | PDU Specific (8) | Source Address (8)
 //
-// PDU Format >= 240: PDU1 (destination-specific), PF is destination
-// PDU Format < 240:  PDU2 (broadcast), PDU Specific is PS (Group Extension)
+// SAE J1939-21:
+// PDU Format < 240:  PDU1 (destination-specific), PS is the destination
+//                    address and not part of the PGN
+// PDU Format >= 240: PDU2 (broadcast), PS is the Group Extension (part of
+//                    the PGN)
 
 /// Build a J1939 CAN ID from its components.
 /// priority: 0-7 (0 = highest)
@@ -186,24 +189,24 @@ pub fn j1939_source_addr(id: i64) -> i64 {
     return id & 0xFF;
 }
 
-/// Check if a J1939 frame is PDU1 (destination-specific, PF >= 240).
+/// Check if a J1939 frame is PDU1 (destination-specific, PF < 240).
 pub fn j1939_is_pdu1(id: i64) -> bool {
-    return j1939_pdu_format(id) >= 240;
-}
-
-/// Check if a J1939 frame is PDU2 (broadcast, PF < 240).
-pub fn j1939_is_pdu2(id: i64) -> bool {
     return j1939_pdu_format(id) < 240;
 }
 
+/// Check if a J1939 frame is PDU2 (broadcast, PF >= 240).
+pub fn j1939_is_pdu2(id: i64) -> bool {
+    return j1939_pdu_format(id) >= 240;
+}
+
 /// Extract the PGN (Parameter Group Number) from a J1939 CAN ID.
-/// For PDU1 (PF >= 240): PGN = (DP << 16) | (PF << 8) | 0
-/// For PDU2 (PF < 240):  PGN = (DP << 16) | (PF << 8) | PS
+/// For PDU1 (PF < 240):  PGN = (DP << 16) | (PF << 8) | 0
+/// For PDU2 (PF >= 240): PGN = (DP << 16) | (PF << 8) | PS
 pub fn j1939_pgn(id: i64) -> i64 {
     var dp = (id >> 24) & 0x1;
     var pf = (id >> 16) & 0xFF;
     var ps = (id >> 8) & 0xFF;
-    if pf >= 240 {
+    if pf < 240 {
         return (dp << 16) | (pf << 8);
     }
     return (dp << 16) | (pf << 8) | ps;
@@ -390,32 +393,41 @@ pub fn dtc_system_char(dtc: i64) -> str {
 
 // ─── OBD-II Mode 03 / 04 (Read/Clear DTCs) ─────────────────────────────
 
-/// OBD-II Mode 03: Read DTCs. Build a request frame.
+// OBD-II on CAN (ISO 15765-4): every request and reply is an ISO 15765-2
+// single frame, so byte 0 is the PCI byte (high nibble 0 = single frame,
+// low nibble = the number of bytes that follow): a Mode 01 PID 0C request
+// is [0x02, 0x01, 0x0C], its reply [0x04, 0x41, 0x0C, A, B].
+
+/// OBD-II Mode 03: Read DTCs. Build a request frame: [0x01, 0x03].
 pub fn obd_read_dtcs() -> CanFrame {
     var data = Vec::new();
+    data.push(0x01);
     data.push(0x03);
     return can_frame_standard(0x7DF, data);
 }
 
-/// OBD-II Mode 04: Clear DTCs. Build a request frame.
+/// OBD-II Mode 04: Clear DTCs. Build a request frame: [0x01, 0x04].
 pub fn obd_clear_dtcs() -> CanFrame {
     var data = Vec::new();
+    data.push(0x01);
     data.push(0x04);
     return can_frame_standard(0x7DF, data);
 }
 
-/// OBD-II Mode 01 PID 00: Supported PIDs 01-20.
+/// OBD-II Mode 01 PID 00: Supported PIDs 01-20: [0x02, 0x01, 0x00].
 pub fn obd_supported_pids() -> CanFrame {
     var data = Vec::new();
+    data.push(0x02);
     data.push(0x01);
     data.push(0x00);
     return can_frame_standard(0x7DF, data);
 }
 
-/// OBD-II Mode 01 PID 0C: Engine RPM.
-/// Response: [0x41, 0x0C, RPM_High, RPM_Low] where RPM = ((A*256)+B)/4
+/// OBD-II Mode 01 PID 0C: Engine RPM: [0x02, 0x01, 0x0C].
+/// Response: [0x04, 0x41, 0x0C, A, B] where RPM = ((A*256)+B)/4
 pub fn obd_engine_rpm_request() -> CanFrame {
     var data = Vec::new();
+    data.push(0x02);
     data.push(0x01);
     data.push(0x0C);
     return can_frame_standard(0x7DF, data);
@@ -424,23 +436,36 @@ pub fn obd_engine_rpm_request() -> CanFrame {
 /// Decode engine RPM from an OBD-II Mode 01 PID 0C response.
 /// Returns RPM as i64, or -1 if the frame is invalid.
 pub fn obd_decode_engine_rpm(frame: CanFrame) -> i64 {
-    if frame.dlc < 4 {
+    if !obd_single_frame_reply(frame, 0x0C, 2) {
         return -1;
     }
-    if can_frame_byte(frame, 0) != 0x41 {
-        return -1;
-    }
-    if can_frame_byte(frame, 1) != 0x0C {
-        return -1;
-    }
-    var a = can_frame_byte(frame, 2);
-    var b = can_frame_byte(frame, 3);
+    var a = can_frame_byte(frame, 3);
+    var b = can_frame_byte(frame, 4);
     return ((a * 256) + b) / 4;
 }
 
-/// OBD-II Mode 01 PID 0D: Vehicle Speed (km/h).
+/// Is `frame` an ISO 15765-2 single-frame Mode 01 reply for `pid` with at
+/// least `nbytes` data bytes: [PCI, 0x41, pid, data...]?
+fn obd_single_frame_reply(frame: CanFrame, pid: i64, nbytes: i64) -> bool {
+    if frame.dlc < 3 + nbytes {
+        return false;
+    }
+    val pci: i64 = can_frame_byte(frame, 0);
+    // single frame (high nibble 0) carrying mode, PID and the data
+    if (pci >> 4) != 0 || (pci & 15) < 2 + nbytes || (pci & 15) > frame.dlc - 1 {
+        return false;
+    }
+    if can_frame_byte(frame, 1) != 0x41 {
+        return false;
+    }
+    return can_frame_byte(frame, 2) == pid;
+}
+
+/// OBD-II Mode 01 PID 0D: Vehicle Speed (km/h): [0x02, 0x01, 0x0D].
+/// Response: [0x03, 0x41, 0x0D, A] where speed = A
 pub fn obd_vehicle_speed_request() -> CanFrame {
     var data = Vec::new();
+    data.push(0x02);
     data.push(0x01);
     data.push(0x0D);
     return can_frame_standard(0x7DF, data);
@@ -449,22 +474,17 @@ pub fn obd_vehicle_speed_request() -> CanFrame {
 /// Decode vehicle speed from an OBD-II Mode 01 PID 0D response.
 /// Returns speed in km/h, or -1 if the frame is invalid.
 pub fn obd_decode_vehicle_speed(frame: CanFrame) -> i64 {
-    if frame.dlc < 3 {
+    if !obd_single_frame_reply(frame, 0x0D, 1) {
         return -1;
     }
-    if can_frame_byte(frame, 0) != 0x41 {
-        return -1;
-    }
-    if can_frame_byte(frame, 1) != 0x0D {
-        return -1;
-    }
-    return can_frame_byte(frame, 2);
+    return can_frame_byte(frame, 3);
 }
 
-/// OBD-II Mode 01 PID 05: Engine Coolant Temperature (°C).
-/// Response: [0x41, 0x05, Temp] where Temp = A - 40
+/// OBD-II Mode 01 PID 05: Engine Coolant Temperature (°C):
+/// [0x02, 0x01, 0x05]. Response: [0x03, 0x41, 0x05, A] where Temp = A - 40
 pub fn obd_coolant_temp_request() -> CanFrame {
     var data = Vec::new();
+    data.push(0x02);
     data.push(0x01);
     data.push(0x05);
     return can_frame_standard(0x7DF, data);
@@ -473,16 +493,10 @@ pub fn obd_coolant_temp_request() -> CanFrame {
 /// Decode coolant temperature from an OBD-II Mode 01 PID 05 response.
 /// Returns temperature in °C, or -1 if the frame is invalid.
 pub fn obd_decode_coolant_temp(frame: CanFrame) -> i64 {
-    if frame.dlc < 3 {
+    if !obd_single_frame_reply(frame, 0x05, 1) {
         return -1;
     }
-    if can_frame_byte(frame, 0) != 0x41 {
-        return -1;
-    }
-    if can_frame_byte(frame, 1) != 0x05 {
-        return -1;
-    }
-    return can_frame_byte(frame, 2) - 40;
+    return can_frame_byte(frame, 3) - 40;
 }
 
 // ─── CAN Bus Functional IDs ────────────────────────────────────────────
@@ -491,12 +505,17 @@ pub fn obd_decode_coolant_temp(frame: CanFrame) -> i64 {
 pub const OBD_BROADCAST_ID: i64 = 0x7DF;
 /// OBD-II ECU response ID base (0x7E8-0x7EF for 8 ECUs).
 pub const OBD_RESPONSE_BASE: i64 = 0x7E8;
-/// Build an OBD-II request to a specific ECU (0-7).
+/// OBD-II physical request ID base (0x7E0-0x7E7: ECU n answers on
+/// 0x7E8 + n; ISO 15765-4).
+pub const OBD_REQUEST_BASE: i64 = 0x7E0;
+/// Build an OBD-II request to a specific ECU (0-7), sent to its physical
+/// request ID: [0x02, mode, pid].
 pub fn obd_request_to_ecu(ecu: i64, mode: i64, pid: i64) -> CanFrame {
     var data = Vec::new();
+    data.push(0x02);
     data.push(mode);
     data.push(pid);
-    return can_frame_standard(OBD_RESPONSE_BASE + ecu, data);
+    return can_frame_standard(OBD_REQUEST_BASE + ecu, data);
 }
 
 /// Check if a frame is an OBD-II response from a specific ECU.

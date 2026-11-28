@@ -799,7 +799,10 @@ class Gen:
             if signed(t):
                 out += [
                     f"static inline {ct} div_{t}({ct} a, {ct} b) {{ if (b == 0 || (a == {mn} && b == -1)) panic(); return ({ct})(a / b); }}",
-                    f"static inline {ct} rem_{t}({ct} a, {ct} b) {{ if (b == 0 || (a == {mn} && b == -1)) panic(); return ({ct})(a % b); }}",
+                    # BG463: MIN % -1 is 0 (the exact remainder, in range:
+                    # every backend gives it); in C it is undefined, so -1
+                    # is answered here
+                    f"static inline {ct} rem_{t}({ct} a, {ct} b) {{ if (b == 0) panic(); if (b == -1) return 0; return ({ct})(a % b); }}",
                     f"static inline {ct} neg_{t}({ct} a) {{ if (a == {mn}) panic(); return ({ct})(-a); }}",
                     f"static inline {ct} wneg_{t}({ct} a) {{ return ({ct})(0 - ({ut})a); }}",
                 ]

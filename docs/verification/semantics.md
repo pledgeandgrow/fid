@@ -86,7 +86,7 @@ operand, then the right: a:τ, b:τ. Then, in a function **without**
 |---|---|
 | a + b, a − b, a · b | the exact result r if r ∈ range(τ), else **panic** |
 | a / b | **panic** if b = 0; **panic** if τ signed, a = min(τ), b = −1; else trunc(a/b):τ |
-| a % b | **panic** if b = 0; **panic** if τ signed, a = min(τ), b = −1; else (a rem b):τ |
+| a % b | **panic** if b = 0; else (a rem b):τ (min(τ) rem −1 = 0 is in range: no panic, BG463) |
 | −a (τ signed) | **panic** if a = min(τ), else (−a):τ |
 
 In a `@wrapping` function, `+ − ·` and `−a` give wrap_τ(r) instead of

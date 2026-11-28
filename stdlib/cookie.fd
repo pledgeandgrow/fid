@@ -383,11 +383,57 @@ pub fn cookie_domain_match(domain: str, host: str) -> bool {
     if h == domain {
         return true;
     }
+    // BG357: the suffix form applies to host names only (RFC 6265 §5.1.3):
+    // an IP address matches only itself ("0.0.1" matched 10.0.0.1)
+    if cookie_host_is_ip(h) {
+        return false;
+    }
     if !str_ends_with(h, domain) {
         return false;
     }
     val k: i64 = str_len(h) - str_len(domain);
     return k > 0 && str_byte_at(h, k - 1) == 46;
+}
+
+/// Whether `h` is an IP address: an IPv6 literal (it has a ':') or a host
+/// whose last label is a number, as the WHATWG URL parser reads IPv4
+/// ("ends in a number": 192.168.1.5, also 1.2.3 and 0x7f.1 forms).
+fn cookie_host_is_ip(h: str) -> bool {
+    if str_find(h, ":") >= 0 {
+        return true;
+    }
+    var end: i64 = str_len(h);
+    if end > 0 && str_byte_at(h, end - 1) == 46 {
+        end = end - 1;
+    }
+    var start: i64 = end;
+    while start > 0 && str_byte_at(h, start - 1) != 46 {
+        start = start - 1;
+    }
+    if start == end {
+        return false;
+    }
+    var i: i64 = start;
+    // "0x7f": a hexadecimal label is a number too
+    if end - start >= 2 && str_byte_at(h, start) == 48 && (str_byte_at(h, start + 1) == 120 || str_byte_at(h, start + 1) == 88) {
+        i = start + 2;
+        while i < end {
+            val c: i64 = str_byte_at(h, i);
+            if !((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    while i < end {
+        val c: i64 = str_byte_at(h, i);
+        if c < 48 || c > 57 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
 }
 
 // --- dates -------------------------------------------------------------------

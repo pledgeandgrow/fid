@@ -89,15 +89,10 @@ pub fn main() -> i64 {
     //   Interpreter: fidesc run main.fd -- ccompile <file.fd> -o <output>
     //   Native:      fid ccompile <file.fd> -o <output>
     // Find the "--" separator (interpreter mode) or start at argv[1] (native).
-    var start: i64 = 1;
-    var i: i64 = 0;
-    while i < n {
-        if p_argv(i) == "--" {
-            start = i + 1;
-            break;
-        }
-        i = i + 1;
-    }
+    // BG331: only under the Rust interpreter (main_args_start); a native
+    // fid leaves a `--` to its command (`fid run x.fd -- args`, `fid watch
+    // f.fd run -- args`)
+    var start: i64 = main_args_start(n);
 
     if start >= n {
         print_usage();
@@ -183,19 +178,38 @@ pub fn main() -> i64 {
         if cmd_arg == "--version" {
             return cmd_version();
         }
+        // BG483: `fid --help` / `fid -h` (and `fid help` below): the usage,
+        // exit 0 (it was "Unknown command: " with an empty name, exit 1)
+        if cmd_arg == "--help" || cmd_arg == "-h" {
+            print_usage();
+            return 0;
+        }
         if !str_starts_with(cmd_arg, "--") {
             break;
+        }
+        // a global flag's value is not the command (`fid --timeout 5 run
+        // x.fd`, `fid --profile-use p.prof emit x.fd`)
+        if (cmd_arg == "--timeout" || cmd_arg == "--profile-use") && cmd_idx + 1 < n {
+            cmd_idx = cmd_idx + 1;
         }
         cmd_idx = cmd_idx + 1;
     }
     start = cmd_idx;
+    // BG483: only global flags (`fid --borrowck=off`): the usage, not
+    // "Unknown command: " with no name
+    if start >= n {
+        print_usage();
+        return 1;
+    }
 
-    // TODO: --timeout requires spawning a watcher thread to kill the process
-    // after N seconds. Fides is single-threaded for now, so we store the
-    // value but cannot enforce it. When p_thread_spawn supports timers,
-    // wire this up. Reference: src/main.rs:103-109.
+    // --timeout: `fid run` enforces it in the interpreter (BG329,
+    // run_wall_timeout); cmd_reduce bounds each child with it.
 
     var command: str = p_argv(start);
+    if command == "help" {
+        print_usage();
+        return 0;
+    }
 
     // RL20: `--crash-report` on any command runs it again as a child that
     // names its stages; a crash is reported with the stage and the function
@@ -397,6 +411,35 @@ pub fn main() -> i64 {
     print(command);
     print("\n");
     print_usage();
+    return 1;
+}
+
+/// BG331: the index of fid's first argument. Under the Rust interpreter
+/// (`fidesc run main.fd -- ccompile x.fd`) this program sees the process's
+/// own arguments, so fid's start after the first `--`. fid's interpreter
+/// gives an interpreted program only its own arguments, the `--` after
+/// its file dropped (interp.fd interp_args_detect), and a native fid
+/// leaves every `--` to its command: `fid run x.fd -- a b` passes `a b`
+/// to the program, `fid watch f.fd run -- a` to the command it re-runs.
+fn main_args_start(n: i64) -> i64 {
+    if n < 1 {
+        return 1;
+    }
+    var a0: str = str_replace(p_argv(0), "\\", "/");
+    val slash: i64 = str_rfind_char(a0, 47);
+    if slash >= 0 {
+        a0 = str_slice(a0, slash + 1, str_len(a0));
+    }
+    if !str_starts_with(a0, "fidesc") {
+        return 1;
+    }
+    var i: i64 = 0;
+    while i < n {
+        if p_argv(i) == "--" {
+            return i + 1;
+        }
+        i = i + 1;
+    }
     return 1;
 }
 
@@ -617,7 +660,30 @@ fn normalize_target(target: str) -> str {
     }
     var first: str = str_slice(target, 0, dash);
     var rest: str = str_slice(target, dash + 1, str_len(target));
-    if first == "linux" || first == "macos" || first == "darwin" || first == "windows" || first == "wasi" || first == "freebsd" {
+    // XT77: `ios-arm64` is `aarch64-ios`, `ios-simulator-arm64` (also
+    // `iossim-arm64`) `aarch64-ios-simulator`
+    if first == "ios" || first == "iossim" {
+        var sim: bool = first == "iossim";
+        var ios_arch_s: str = rest;
+        if str_starts_with(rest, "simulator-") {
+            sim = true;
+            ios_arch_s = str_slice(rest, 10, str_len(rest));
+        }
+        var ios_arch: str = target_arch_name(ios_arch_s);
+        if str_len(ios_arch) == 0 {
+            return target;
+        }
+        if sim {
+            return ios_arch + "-ios-simulator";
+        }
+        return ios_arch + "-ios";
+    }
+    // XT64: the NDK's triple (`aarch64-linux-android34`) is `aarch64-android34`
+    var ndk_at: i64 = str_find(target, "-linux-android");
+    if ndk_at > 0 {
+        return normalize_target(str_slice(target, 0, ndk_at) + "-android" + str_slice(target, ndk_at + 14, str_len(target)));
+    }
+    if first == "linux" || first == "macos" || first == "darwin" || first == "windows" || first == "wasi" || first == "freebsd" || first == "openbsd" || first == "android" {
         var arch: str = target_arch_name(rest);
         if str_len(arch) == 0 {
             return target;
@@ -641,6 +707,10 @@ fn cross_target_os(target: str) -> str {
     if str_contains(target, "wasi") || str_starts_with(target, "wasm") {
         return "wasi";
     }
+    // XT64: Android before Linux (`aarch64-linux-android` names both)
+    if str_contains(target, "android") {
+        return "android";
+    }
     if str_contains(target, "linux") {
         return "linux";
     }
@@ -653,6 +723,10 @@ fn cross_target_os(target: str) -> str {
     // PL3: FreeBSD through C (zig cc -target x86_64-freebsd)
     if str_contains(target, "freebsd") {
         return "freebsd";
+    }
+    // XT54: OpenBSD (machine layer only: images, no runtime yet)
+    if str_contains(target, "openbsd") {
+        return "openbsd";
     }
     return "";
 }
@@ -697,7 +771,234 @@ fn cross_zig_triple(target: str) -> str {
     if os == "freebsd" {
         return arch + "-freebsd";
     }
+    // XT54/XT64: zig's names; it ships no libc for either (bionic needs the
+    // NDK, OpenBSD's libc its own system), so the C route stops in zig
+    if os == "openbsd" {
+        return arch + "-openbsd";
+    }
+    if os == "android" {
+        return arch + "-linux-android";
+    }
     return arch + "-windows-gnu";
+}
+
+// --- XT77: iOS targets (machine layer, a Mach-O) ---------------------------
+// `--target aarch64-ios` (a device) and `aarch64-ios-simulator` (also
+// `x86_64-ios-simulator`, the simulator on an Intel Mac) build a Mach-O
+// through the machine layer, as aarch64-macos does, with the darwin runtime
+// (stdlib/linux_runtime/darwin.fd: libSystem calls only); LC_BUILD_VERSION
+// names PLATFORM_IOS (2) or PLATFORM_IOSSIMULATOR (7). A minimum iOS
+// version may follow `ios` (`aarch64-ios17.0`, `aarch64-ios16.4-simulator`,
+// `arm64-apple-ios15.0`); 15.0 when none. Not done here: a real signature
+// for a device (target roadmap XT81), app bundles (XT82).
+
+/// XT77: the Mach-O platform of an iOS target: 2 (PLATFORM_IOS) for
+/// `aarch64-ios`, 7 (PLATFORM_IOSSIMULATOR) for `aarch64-ios-simulator`
+/// (also `...-ios-sim`); 0 when `target` is not iOS.
+fn ios_target_platform(target: str) -> i64 {
+    if str_find(target, "-ios") <= 0 {
+        return 0;
+    }
+    if str_contains(target, "-simulator") || str_ends_with(target, "-sim") {
+        return 7;
+    }
+    return 2;
+}
+
+/// XT77: a decimal part of an iOS version, -1 when `s` is empty or has a
+/// character other than a digit.
+fn ios_version_part(s: str) -> i64 {
+    if str_len(s) == 0 || str_len(s) > 5 {
+        return 0 - 1;
+    }
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b < 48 || b > 57 {
+            return 0 - 1;
+        }
+        i = i + 1;
+    }
+    return str_parse_int(s);
+}
+
+/// XT77: the minimum iOS version of an iOS target as LC_BUILD_VERSION
+/// holds it (xxxx.yy.zz in nibbles, 0x000F0000 = 15.0): the version right
+/// after `ios` (`aarch64-ios17.2`, `aarch64-ios16.4-simulator`), 15.0 when
+/// there is none; -1 when it is not a version (`aarch64-ios1x`).
+fn ios_target_minos(target: str) -> i64 {
+    var at: i64 = str_find(target, "-ios");
+    if at <= 0 {
+        return 0 - 1;
+    }
+    var from: i64 = at + 4;
+    var end: i64 = from;
+    while end < str_len(target) && str_byte_at(target, end) != 45 {
+        end = end + 1;
+    }
+    var ver: str = str_slice(target, from, end);
+    if str_len(ver) == 0 {
+        return 0x000F0000;
+    }
+    var parts: Vec<str> = str_split(ver, ".");
+    if parts.len() > 3 {
+        return 0 - 1;
+    }
+    var major: i64 = ios_version_part(parts.get(0));
+    if major < 1 || major > 65535 {
+        return 0 - 1;
+    }
+    var minor: i64 = 0;
+    if parts.len() > 1 {
+        minor = ios_version_part(parts.get(1));
+    }
+    var patch: i64 = 0;
+    if parts.len() > 2 {
+        patch = ios_version_part(parts.get(2));
+    }
+    if minor < 0 || minor > 255 || patch < 0 || patch > 255 {
+        return 0 - 1;
+    }
+    return (major << 16) | (minor << 8) | patch;
+}
+
+/// XT77: an LC_BUILD_VERSION version as text ("15.0", "16.4.1").
+fn ios_version_text(v: i64) -> str {
+    var s: str = int_to_str(v >> 16) + "." + int_to_str((v >> 8) & 255);
+    if (v & 255) != 0 {
+        s = s + "." + int_to_str(v & 255);
+    }
+    return s;
+}
+
+/// XT77: " simulator" for PLATFORM_IOSSIMULATOR, " device" else.
+fn ios_platform_note(platform: i64) -> str {
+    if platform == 7 {
+        return " simulator";
+    }
+    return " device";
+}
+
+/// XT77: the SDK version written with an iOS minimum version: 17.0, or the
+/// minimum itself when it is newer.
+fn ios_target_sdk(minos: i64) -> i64 {
+    if minos > 0x00110000 {
+        return minos;
+    }
+    return 0x00110000;
+}
+
+/// XT77: "" when the machine layer builds iOS target `target`, else why
+/// not: a device is AArch64 only, the simulator AArch64 or x86-64; the
+/// version must be one.
+fn ios_target_error(target: str) -> str {
+    var plat: i64 = ios_target_platform(target);
+    if plat == 0 {
+        return "";
+    }
+    var arch: str = cross_target_arch(target);
+    if arch != "aarch64" && !(plat == 7 && arch == "x86_64") {
+        return "Error: --target " + target + ": iOS devices are aarch64 (aarch64-ios), the simulator aarch64 or x86_64 (aarch64-ios-simulator, x86_64-ios-simulator)";
+    }
+    if ios_target_minos(target) < 0 {
+        return "Error: --target " + target + ": the minimum iOS version after `ios` is not a version (write e.g. aarch64-ios15.0 or aarch64-ios17.2-simulator)";
+    }
+    return "";
+}
+
+// --- XT22: Windows on ARM64 ------------------------------------------------
+/// XT22: the error for `--target aarch64-windows` on the no-toolchain path.
+/// The machine layer is where an ARM64 PE will come from (nat_ir's
+/// AArch64 code in nat_enc.fd's PE writer), but that writer has x86-64
+/// only (machine 0x8664): the ARM64 headers are target roadmap XT14, the
+/// Windows ARM64 convention, unwind data, imports and runtime XT15-XT18.
+/// Until then the build stops here instead of writing an x86-64 PE.
+fn aarch64_windows_error(target: str) -> str {
+    return "Error: --target " + target + ": the machine layer has no ARM64 PE writer yet (target roadmap XT14: PE/COFF machine 0xAA64; XT15-XT18: the Windows ARM64 calling convention, unwind data, imports, runtime), and pe_ir is x86-64 only. Use `fid ccompile <file> --target aarch64-windows` (the C route, zig cc), or --target x86_64-windows (runs under Windows on ARM's x64 emulation)";
+}
+
+// --- XT44/XT50/XT54/XT64: FreeBSD, OpenBSD and Android ELF targets ---------
+// `fid build|emit --target x86_64-freebsd|aarch64-freebsd|x86_64-openbsd|
+// aarch64-openbsd|aarch64-android[<api>]` go to the machine layer (nat_ir,
+// no zig cc), which writes the ELF with the system's branding (nat_enc.fd
+// g_nat_elf_os: EI_OSABI, the identification note, OpenBSD's PT_OPENBSD_*).
+// Android is the Linux kernel: the Linux runtime's system calls run there,
+// so an Android build is a static PIE (ET_DYN, no PT_INTERP: the kernel
+// maps it and _start relocates itself, TG14) over stdlib/linux_runtime.
+// FreeBSD and OpenBSD have no runtime yet (FreeBSD's system calls: target
+// roadmap XT43; OpenBSD takes system calls only from libc: XT53/XT55), so
+// their builds stop with an error; FID_IMAGE_ONLY=1 writes the image over
+// the Linux runtime anyway, to check its headers (it does not run there).
+
+/// XT44/XT54/XT64: the system of a branded ELF target ("freebsd",
+/// "openbsd", "android"), "" for any other target.
+fn nat_elf_target_os(target: str) -> str {
+    var os: str = cross_target_os(target);
+    if os == "freebsd" || os == "openbsd" || os == "android" {
+        return os;
+    }
+    return "";
+}
+
+/// XT64: the API level of `aarch64-android<N>` (34 when none follows
+/// `android`), -1 when what follows is not a number from 21 (the first
+/// 64-bit Android) to 99.
+fn android_api_level(target: str) -> i64 {
+    var at: i64 = str_find(target, "android");
+    if at < 0 {
+        return 34;
+    }
+    var from: i64 = at + 7;
+    var end: i64 = from;
+    while end < str_len(target) && str_byte_at(target, end) != 45 {
+        end = end + 1;
+    }
+    var s: str = str_slice(target, from, end);
+    if str_len(s) == 0 {
+        return 34;
+    }
+    if str_len(s) > 2 {
+        return 0 - 1;
+    }
+    var i: i64 = 0;
+    while i < str_len(s) {
+        var b: i64 = str_byte_at(s, i);
+        if b < 48 || b > 57 {
+            return 0 - 1;
+        }
+        i = i + 1;
+    }
+    var v: i64 = str_parse_int(s);
+    if v < 21 {
+        return 0 - 1;
+    }
+    return v;
+}
+
+/// XT44: the __FreeBSD_version the ABI note carries: 1400097 (14.0-RELEASE).
+const XT_FREEBSD_VERSION: i64 = 1400097;
+
+/// XT44/XT50/XT54/XT64: "" when the machine layer builds `target` (a
+/// branded ELF target, system `os`) now, else the error that stops the
+/// build.
+fn nat_elf_target_error(target: str, os: str) -> str {
+    var arch: str = cross_target_arch(target);
+    if arch != "x86_64" && arch != "aarch64" {
+        return "Error: --target " + target + ": the machine layer builds " + os + " for x86_64 and aarch64";
+    }
+    if os == "android" {
+        if android_api_level(target) < 0 {
+            return "Error: --target " + target + ": the API level after `android` is not one (write e.g. aarch64-android34; 21 is the first 64-bit level)";
+        }
+        return "";
+    }
+    if env_or_empty("FID_IMAGE_ONLY") == "1" {
+        return "";
+    }
+    if os == "freebsd" {
+        return "Error: --target " + target + ": there is no FreeBSD runtime yet (target roadmap XT43: stdlib/linux_runtime/freebsd.fd, FreeBSD's system call numbers and its carry-flag errors); the ELF branding is done (XT44). Use `fid ccompile <file> --target " + target + "` (the C route, zig cc), or FID_IMAGE_ONLY=1 to write the branded image over the Linux runtime for checking its headers (it does not run on FreeBSD)";
+    }
+    return "Error: --target " + target + ": there is no OpenBSD runtime yet: OpenBSD takes system calls only from libc (pinsyscalls; static raw system calls are refused since 7.5), which needs the dynamic libc link of target roadmap XT53 and the runtime of XT55; the ELF notes are done (XT54). FID_IMAGE_ONLY=1 writes the image over the Linux runtime for checking its headers (it does not run on OpenBSD)";
 }
 
 // --- Helpers: the host system -----------------------------------------------
@@ -814,11 +1115,14 @@ fn inc_system_libs(cc: str, tgt_os: str, zig_cross: bool) -> str {
         }
         return " -lm -lpthread" + unwind;
     }
-    if tgt_os == "freebsd" {
+    if tgt_os == "freebsd" || tgt_os == "openbsd" {
         if str_contains(cc, "zig") {
             return " -lm -lpthread -lunwind";
         }
         return " -lm -lpthread";
+    }
+    if tgt_os == "android" {
+        return " -lm";
     }
     if tgt_os == "macos" {
         return " -lm -lpthread";
@@ -1021,7 +1325,9 @@ fn cmd_ir(n: i64, start: i64) -> i64 {
         p_eprint_str("\n");
         return 1;
     }
-    var result: ResultIrModule = lower_to_ir_module(source);
+    // BG460: with the file's path, so its `use` lines resolve (a stdlib
+    // module or one beside it) and errors name the file, as dump-c and run
+    var result: ResultIrModule = lower_to_ir_module_with_path(source, input, "on");
     match result {
         ResultIrModule::Ok(ir_mod) => {
             print(IrModule_to_str(&ir_mod));
@@ -1182,6 +1488,14 @@ fn cmd_fmt(n: i64, start: i64) -> i64 {
         p_eprint_str("\n");
         return 1;
     }
+    // BG364: a file that does not lex or parse is not formatted (`-w`
+    // reindented a half-written file and said "formatted"; `--check` said
+    // "would reformat" for code that does not compile)
+    val syn_err: str = fmt_syntax_error(source);
+    if str_len(syn_err) > 0 {
+        p_eprint_str("Error: " + input + " does not parse, so it was not formatted:\n" + syn_err + "\n");
+        return 1;
+    }
     var formatted: str = format_source(source);
     // Formatting changes spacing only; anything else is a formatter bug,
     // and the file is left as it is
@@ -1193,8 +1507,10 @@ fn cmd_fmt(n: i64, start: i64) -> i64 {
         return 1;
     }
     // The formatter writes LF; a checkout's CRLF line endings are not a
-    // formatting difference (BG124)
-    var same: bool = formatted == str_replace(source, "\r", "");
+    // formatting difference (BG124). BG487: both sides without CRs: a
+    // string literal spanning a CRLF line break keeps its CR in
+    // `formatted`, so stripping the source alone never matched
+    var same: bool = str_replace(formatted, "\r", "") == str_replace(source, "\r", "");
     if check_mode {
         if same {
             p_eprint_str(input);
@@ -1207,7 +1523,12 @@ fn cmd_fmt(n: i64, start: i64) -> i64 {
         }
     }
     if write_mode {
-        p_file_write(input, formatted);
+        // BG358: a file that could not be written (read-only, locked, a
+        // full disk) is an error, not "formatted"
+        if p_file_write(input, formatted) < 0 {
+            p_eprint_str("Error: could not write " + input + "; it was not formatted\n");
+            return 1;
+        }
         if same {
             p_eprint_str(input);
             p_eprint_str(": already formatted\n");
@@ -1220,6 +1541,25 @@ fn cmd_fmt(n: i64, start: i64) -> i64 {
     // No -w: the formatted source to stdout; the file is not touched
     print(formatted);
     return 0;
+}
+
+/// BG364: the first lexer or parser error of `source` ("" when it parses):
+/// `fid fmt` formats only a file that parses.
+fn fmt_syntax_error(source: str) -> str {
+    var lx: Lexer = Lexer::new(source);
+    var toks: Vec<Token> = lx.tokenize();
+    if lx.errors.len() > 0 {
+        return lx.errors.get(0);
+    }
+    var ps: Parser = Parser_new(toks);
+    match ps.parse() {
+        ParseResultProgram::Ok(_) => {
+        }
+        ParseResultProgram::Err(e) => {
+            return e;
+        }
+    }
+    return "";
 }
 
 // --- run -----------------------------------------------------------------
@@ -1412,7 +1752,37 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         }
     }
     run_limit_defaults(run_lim_mem, run_lim_cpu_ms);
-    var run_rc: i64 = interpret_source_with_path(source, input, max_recursion, max_steps, max_memory_bytes, verbose, g_borrowck);
+    // BG329: --timeout N (or the global --timeout) stops the program after
+    // N seconds of wall-clock time (exit 124); it was only printed under -v
+    run_wall_timeout(run_timeout);
+    var run_rc: i64 = 0;
+    if crash_trace_on() {
+        // BG486: under --crash-report, the stages are named, so a panic of
+        // the interpreted program (after CRASH_STAGE_PROGRAM) is not
+        // reported as a crash of fid (crash_report_run)
+        crash_stage("front end and lowering (fid run)");
+        match lower_to_ir_module_with_path(source, input, g_borrowck) {
+            ResultIrModule::Err(run_errs) => {
+                var rmsg: str = "Compilation error:\n";
+                var rei: i64 = 0;
+                while rei < run_errs.len() {
+                    if !str_starts_with(run_errs.get(rei), "error") {
+                        rmsg = rmsg + "error: ";
+                    }
+                    rmsg = rmsg + run_errs.get(rei) + "\n";
+                    rei = rei + 1;
+                }
+                p_eprint_str(rmsg);
+                run_rc = 1;
+            }
+            ResultIrModule::Ok(run_mod) => {
+                crash_stage(CRASH_STAGE_PROGRAM);
+                run_rc = run_ir_module(run_mod, max_recursion, max_steps, max_memory_bytes, verbose);
+            }
+        }
+    } else {
+        run_rc = interpret_source_with_path(source, input, max_recursion, max_steps, max_memory_bytes, verbose, g_borrowck);
+    }
     if str_len(record_path) > 0 {
         run_record_finish(run_rc);
         p_eprint_str("recorded: " + record_path + " (replay it with `fid replay " + record_path + "`)\n");
@@ -1438,6 +1808,25 @@ fn cmd_run(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
 /// arguments: `fn test_x()` or `pub fn test_x()`.
 fn test_fns(source: str, prefix: str) -> Vec<str> {
     var out: Vec<str> = Vec::new();
+    // BG456: the program's own free functions, as the parser reads them:
+    // `@cold fn test_x()` (an annotation on the line) is a test, a method
+    // of an `impl` or a `fn test_old()` inside a comment is not
+    match test_parse_funcs(source) {
+        ParseResultProgram::Ok(prog) => {
+            var pi: i64 = 0;
+            while pi < prog.funcs.len() {
+                val f: Func = prog.funcs.get(pi);
+                if str_starts_with(f.name, prefix) && f.params.len() == 0 && f.type_params.len() == 0 && f.line > 0 {
+                    out.push(f.name);
+                }
+                pi = pi + 1;
+            }
+            return out;
+        }
+        ParseResultProgram::Err(_) => {
+            // it does not parse: the line scan, and the build reports why
+        }
+    }
     var lines: Vec<str> = str_split(source, "\n");
     var i: i64 = 0;
     while i < lines.len() {
@@ -1460,6 +1849,22 @@ fn test_fns(source: str, prefix: str) -> Vec<str> {
 /// (`fn fuzz_x(data: Vec<u8>)`) — CT4's fuzz targets.
 fn test_fns_fuzz(source: str) -> Vec<str> {
     var out: Vec<str> = Vec::new();
+    // BG456: as test_fns, the parsed free functions with one parameter
+    match test_parse_funcs(source) {
+        ParseResultProgram::Ok(prog) => {
+            var pi: i64 = 0;
+            while pi < prog.funcs.len() {
+                val f: Func = prog.funcs.get(pi);
+                if str_starts_with(f.name, "fuzz_") && f.params.len() == 1 && f.type_params.len() == 0 && f.line > 0 {
+                    out.push(f.name);
+                }
+                pi = pi + 1;
+            }
+            return out;
+        }
+        ParseResultProgram::Err(_) => {
+        }
+    }
     var lines: Vec<str> = str_split(source, "\n");
     var i: i64 = 0;
     while i < lines.len() {
@@ -1476,6 +1881,18 @@ fn test_fns_fuzz(source: str) -> Vec<str> {
         i = i + 1;
     }
     return out;
+}
+
+/// BG456: `source` parsed (its own items only, no stdlib), or the error
+/// when it does not lex or parse.
+fn test_parse_funcs(source: str) -> ParseResultProgram {
+    var lx: Lexer = Lexer::new(source);
+    var toks: Vec<Token> = lx.tokenize();
+    if lx.errors.len() > 0 {
+        return ParseResultProgram::Err(lx.errors.get(0));
+    }
+    var ps: Parser = Parser_new(toks);
+    return ps.parse();
 }
 
 /// CT2: the names of `names` that hold `part`.
@@ -2477,7 +2894,7 @@ fn cmd_test_file(n: i64, start: i64, fuzz_only: bool) -> i64 {
     i = 0;
     while i < benches.len() {
         val b: str = benches.get(i);
-        harness = harness + "    if which == \"" + b + "\" {\n        val t0: i64 = p_clock_now_us();\n" + "        var r: i64 = 0;\n        while r < reps { " + b + "(); r = r + 1; }\n" + "        println(p_clock_now_us() - t0);\n    }\n";
+        harness = harness + "    if which == \"" + b + "\" {\n        val t0: i64 = p_clock_now_us();\n" + "        var r: i64 = 0;\n        while r < reps { " + b + "(); r = r + 1; }\n" + "        val dt_us: i64 = p_clock_now_us() - t0;\n        print(\"\\n__fid_bench_us \" + int_to_str(dt_us) + \"\\n\");\n    }\n";
         i = i + 1;
     }
     harness = harness + "    return 0;\n}\n";
@@ -2608,7 +3025,18 @@ fn cmd_test_file(n: i64, start: i64, fuzz_only: bool) -> i64 {
                 failed = failed + 1;
                 ok = false;
             } else {
-                us = str_parse_int(str_trim(c_file_read("_fides_bench_out.txt")));
+                // BG480: the harness's own line after the bench's output
+                // (`__fid_bench_us <n>`), not the whole stdout: a bench
+                // that prints read as 0 us, so reps grew x100 to 10^10
+                val bout: str = c_file_read("_fides_bench_out.txt");
+                val bmark: i64 = str_rfind(bout, "__fid_bench_us ");
+                if bmark < 0 {
+                    print("FAIL  " + benches.get(i) + " (no timing line)\n");
+                    failed = failed + 1;
+                    ok = false;
+                    continue;
+                }
+                us = str_parse_int(str_trim(str_slice(bout, bmark + 15, str_len(bout))));
                 if us >= 200000 || reps >= 1073741824 {
                     print(benches.get(i) + "  " + int_to_str(reps) + " runs  " + int_to_str(us * 1000 / reps) + " ns/op\n");
                     ok = false;
@@ -2616,6 +3044,10 @@ fn cmd_test_file(n: i64, start: i64, fuzz_only: bool) -> i64 {
                     reps = reps * 100;
                 } else {
                     reps = reps * 2;
+                }
+                // the cap holds for the run made, not only the next test
+                if reps > 1073741824 {
+                    reps = 1073741824;
                 }
             }
         }
@@ -2670,8 +3102,10 @@ fn cmd_test(n: i64, start: i64) -> i64 {
         p_eprint_str("fid test --coverage covers one file's tests: fid test <file.fd> --coverage\n");
         return 1;
     }
-    // --fail: run only expected-fail tests (failing = correct)
-    var fail_only: bool = has_flag(n, start, "--fail");
+    // --fail: run only expected-fail tests (failing = correct). The suite
+    // form has no file argument, so the flag can be the word right after
+    // `test`, which has_flag (from start + 2) does not look at.
+    var fail_only: bool = has_flag(n, start, "--fail") || (start + 1 < n && argv_at(start + 1) == "--fail");
 
     p_eprint_str("[test] Scanning tests/bootstrap/ directory...\n");
 
@@ -2696,8 +3130,16 @@ fn cmd_test(n: i64, start: i64) -> i64 {
     var files: Vec<str> = Vec::new();
     var li: i64 = 0;
     while li < listed.len() {
-        if str_len(listed.get(li)) > 0 {
-            files.push(listed.get(li));
+        // BG454: `ls tests/bootstrap/*.fd` prints each name with its
+        // directory (`dir /b` the bare name): keep the bare name, so the
+        // stem matches the lists below and the path is not doubled
+        var lname: str = str_trim(str_replace(listed.get(li), "\\", "/"));
+        val lslash: i64 = str_rfind_char(lname, 47);
+        if lslash >= 0 {
+            lname = str_slice(lname, lslash + 1, str_len(lname));
+        }
+        if str_len(lname) > 0 {
+            files.push(lname);
         }
         li = li + 1;
     }
@@ -2817,7 +3259,10 @@ fn cmd_test(n: i64, start: i64) -> i64 {
         if str_ends_with(stem, ".fd") {
             stem = str_slice(stem, 0, str_len(stem) - 3);
         }
-        var is_fail: bool = str_vec_contains_str(expected_fail, stem);
+        // BG455: an expected-fail test is one the list names or one the
+        // file itself marks (`// expect-error` in its first three lines, or
+        // a *_fail.fd name), as scripts/tier1.sh's is_reject_test decides
+        var is_fail: bool = str_vec_contains_str(expected_fail, stem) || test_is_expected_fail(stem, c_file_read("tests/bootstrap/" + fname));
         var is_bench: bool = str_starts_with(stem, "bench_");
 
         if fail_only {
@@ -2864,7 +3309,9 @@ fn cmd_test(n: i64, start: i64) -> i64 {
     var fi: i64 = 0;
     while fi < test_files.len() {
         var fname: str = test_files.get(fi);
-        var test_path: str = "tests\\bootstrap\\" + fname;
+        // BG454: a path every host reads (it was "tests\bootstrap\" + the
+        // name, which no POSIX host has)
+        var test_path: str = "tests/bootstrap/" + fname;
         var stem2: str = fname;
         if str_ends_with(stem2, ".fd") {
             stem2 = str_slice(stem2, 0, str_len(stem2) - 3);
@@ -2883,6 +3330,38 @@ fn cmd_test(n: i64, start: i64) -> i64 {
             p_eprint_str(fname);
             p_eprint_str(" (could not read)\n");
             c_fail = c_fail + 1;
+            fi = fi + 1;
+            continue;
+        }
+
+        // BG455: an expected-fail test passes when `fid run` refuses it
+        // with every `// expect-error:` text it names (scripts/tier1.sh
+        // expect_missing), not when anything at all fails
+        if fail_only {
+            var rargv: Vec<str> = Vec::new();
+            rargv.push(p_argv(0));
+            rargv.push("run");
+            rargv.push(test_path);
+            val rr: ChildResult = process_run_argv(rargv, Vec::new(), "", 120000);
+            if rr.timed_out {
+                p_eprint_str("  [FAIL] " + fname + " (timed out)\n");
+                c_fail = c_fail + 1;
+            } else if !rr.started {
+                p_eprint_str("  [FAIL] " + fname + " (fid did not start)\n");
+                c_fail = c_fail + 1;
+            } else if rr.code == 0 {
+                p_eprint_str("  [FAIL] " + fname + " (accepted: should have failed)\n");
+                c_fail = c_fail + 1;
+            } else {
+                val miss: str = test_expect_missing(source, rr.output + "\n" + rr.errors);
+                if str_len(miss) > 0 {
+                    p_eprint_str("  [FAIL] " + fname + " (refused, but without: " + miss + ")\n");
+                    c_fail = c_fail + 1;
+                } else {
+                    p_eprint_str("  [PASS] " + fname + " (refused with the expected error)\n");
+                    c_pass = c_pass + 1;
+                }
+            }
             fi = fi + 1;
             continue;
         }
@@ -2916,7 +3395,14 @@ fn cmd_test(n: i64, start: i64) -> i64 {
                 if ret != 0 {
                     c_ok = false;
                 } else {
-                    var run_ret: i64 = p_system(exe_name);
+                    // BG410: cmd.exe reads the `/` of "tests/_fides_test_tmp.exe"
+                    // as a switch (it ran the command `tests`); POSIX needs
+                    // the ./ that "tests/..." already gives
+                    var run_name: str = "tests\\_fides_test_tmp.exe";
+                    if is_posix_host() {
+                        run_name = "./tests/_fides_test_tmp";
+                    }
+                    var run_ret: i64 = p_system(run_name);
                     c_ok = run_ret == 0;
                 }
             }
@@ -3011,6 +3497,89 @@ fn cmd_test(n: i64, start: i64) -> i64 {
         return 1;
     }
     return 0;
+}
+
+/// BG455: whether test `stem` (its text `source`) must be refused, as
+/// scripts/tier1.sh is_reject_test decides: a *_fail.fd or *_fail2.fd
+/// name (not test_panic_*_fail.fd, a program that panics on purpose), or
+/// `expect-error` in one of its first three lines.
+fn test_is_expected_fail(stem: str, source: str) -> bool {
+    if str_starts_with(stem, "test_panic_") && str_ends_with(stem, "_fail") {
+        return false;
+    }
+    if str_ends_with(stem, "_fail") || str_ends_with(stem, "_fail2") {
+        return true;
+    }
+    val lines: Vec<str> = str_split(source, "\n");
+    var i: i64 = 0;
+    while i < 3 && i < lines.len() {
+        if str_contains(lines.get(i), "expect-error") {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// `s` with every run of spaces, tabs, CRs and line breaks as one space,
+/// none at either end (scripts/tier1.sh expect_missing's ws()).
+fn test_ws(s: str) -> str {
+    var sb = StringBuilder::new();
+    var in_ws: bool = false;
+    var any: bool = false;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 32 || c == 9 || c == 13 || c == 10 {
+            in_ws = true;
+        } else {
+            if in_ws && any {
+                sb.append_char(32);
+            }
+            sb.append_char(c);
+            in_ws = false;
+            any = true;
+        }
+        i = i + 1;
+    }
+    return sb.to_str();
+}
+
+/// BG455: the first `// expect-error: <text>` text of `source` (texts
+/// under 3 characters do not count) that the output `log` does not hold,
+/// white space compared as one space and the [build]/[prof]/[time]
+/// progress lines left out; "" when every text is there (or none named).
+fn test_expect_missing(source: str, log: str) -> str {
+    var out: str = "";
+    val loglines: Vec<str> = str_split(log, "\n");
+    var li: i64 = 0;
+    while li < loglines.len() {
+        val l: str = loglines.get(li);
+        if !str_starts_with(l, "[build]") && !str_starts_with(l, "[prof]") && !str_starts_with(l, "[time]") {
+            out = out + " " + l;
+        }
+        li = li + 1;
+    }
+    out = test_ws(out);
+    val lines: Vec<str> = str_split(source, "\n");
+    var i: i64 = 0;
+    while i < lines.len() {
+        val t: str = str_trim(lines.get(i));
+        if str_starts_with(t, "//") {
+            val rest: str = str_trim(str_slice(t, 2, str_len(t)));
+            if str_starts_with(rest, "expect-error") {
+                val after: str = str_trim(str_slice(rest, 12, str_len(rest)));
+                if str_starts_with(after, ":") {
+                    val want: str = test_ws(str_slice(after, 1, str_len(after)));
+                    if str_len(want) >= 3 && !str_contains(out, want) {
+                        return want;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return "";
 }
 
 // --- Helper: check if a string is in a Vec<str> ---------------------------
@@ -3247,9 +3816,25 @@ fn cmd_profile(n: i64, start: i64) -> i64 {
             p_eprint_str("profile: the build failed\n");
             return 1;
         }
+        // BG326: a stacks file an earlier run left is not this run's
+        p_file_delete("fides-profile.folded");
         p_system(run_exe);
+        p_file_delete(exe);
+        p_file_delete("_fides_profile_tmp.c");
+        if p_file_exists("fides-profile.folded") == 0 {
+            p_eprint_str("profile: no samples (the program ran under a millisecond?)\n");
+            return 1;
+        }
         if out != "fides-profile.folded" {
-            p_rename("fides-profile.folded", out);
+            // BG326: Windows' rename does not replace a file: the old `out`
+            // was reported as this run's profile
+            if p_rename("fides-profile.folded", out) != 0 {
+                p_file_delete(out);
+                if p_rename("fides-profile.folded", out) != 0 {
+                    p_eprint_str("profile: cannot write " + out + " (the stacks are in fides-profile.folded)\n");
+                    return 1;
+                }
+            }
         }
     }
     var text: str = c_file_read(out);
@@ -3621,27 +4206,28 @@ fn cmd_repl() -> i64 {
         var source: str = repl_program(defs, repl_print_body(trimmed));
         var result: ResultStr = ccompile_source_with_path(source, "<repl>", "on");
         match result {
-            ResultStr::Ok(c_code) => {
+            ResultStr::Ok(_c_code) => {
                 last_expr = trimmed;
-                p_file_write("_fides_repl_tmp.c", c_code);
+                // BG458: built by `fid ccompile`, which picks the C compiler
+                // as every build does ($CC, then gcc, clang, tcc, cl; it
+                // was `tcc` on Windows and `gcc` elsewhere, whatever CC
+                // said), and run as ./_fides_repl_tmp on POSIX (the bare
+                // word was looked up in PATH); a failed build says so
                 var exe_name: str = "_fides_repl_tmp.exe";
+                var run_name: str = ".\\_fides_repl_tmp.exe";
                 if is_posix_host() {
                     exe_name = "_fides_repl_tmp";
+                    run_name = "./_fides_repl_tmp";
                 }
-                var build_cmd: str = "";
-                if is_posix_host() {
-                    build_cmd = "gcc -O2 -w -o " + exe_name + " _fides_repl_tmp.c -lm";
+                p_file_write("_fides_repl_tmp.fd", source);
+                if project_run("\"" + p_argv(0) + "\" ccompile _fides_repl_tmp.fd -o " + exe_name) != 0 {
+                    p_eprint_str("repl: the C build failed (`fid ccompile` needs a C compiler: set CC)\n");
                 } else {
-                    build_cmd = "tcc -O2 -w -o " + exe_name + " _fides_repl_tmp.c -lws2_32";
+                    p_system(run_name);
                 }
-                p_system(build_cmd);
-                p_system(exe_name);
-                if is_posix_host() {
-                    p_system("rm -f _fides_repl_tmp.c _fides_repl_tmp");
-                } else {
-                    p_system("del _fides_repl_tmp.c");
-                    p_system("del _fides_repl_tmp.exe");
-                }
+                p_file_delete("_fides_repl_tmp.fd");
+                p_file_delete("_fides_repl_tmp.c");
+                p_file_delete(exe_name);
             }
             ResultStr::Err(errs) => {
                 print_errors(errs);
@@ -3656,14 +4242,15 @@ fn cmd_repl() -> i64 {
 // --- notebook ------------------------------------------------------------
 fn cmd_notebook(n: i64, start: i64) -> i64 {
     if start + 2 > n {
-        p_eprint_str("Usage: fid notebook <file.fd> [-o output.html]\n");
-        p_eprint_str("  Renders a Fides file as an HTML notebook.\n");
-        p_eprint_str("  Each /// comment block becomes a markdown cell.\n");
-        p_eprint_str("  Each code block is evaluated, output rendered inline.\n");
+        p_eprint_str("Usage: fid notebook <file.fd> [-o output.html] [--run]\n");
+        p_eprint_str("  Renders a Fides file as an HTML page: each run of /// comment lines is\n");
+        p_eprint_str("  a text cell, each run of code lines a code cell (indentation kept).\n");
+        p_eprint_str("  --run: also run it (`fid run`) and add its output as the last cell.\n");
         return 1;
     }
     var input: str = p_argv(start + 1);
     var output: str = input + ".html";
+    var run_it: bool = false;
 
     var ai: i64 = start + 2;
     while ai < n {
@@ -3671,6 +4258,9 @@ fn cmd_notebook(n: i64, start: i64) -> i64 {
             if ai + 1 < n {
                 output = p_argv(ai + 1);
             }
+        }
+        if p_argv(ai) == "--run" {
+            run_it = true;
         }
         ai = ai + 1;
     }
@@ -3684,39 +4274,88 @@ fn cmd_notebook(n: i64, start: i64) -> i64 {
     }
 
     // Parse the source into cells: /// comments = markdown, code = code cells
-    var html: str = "<!DOCTYPE html>\n<html>\n<head>\n<title>";
-    html = html + input + "</title>\n<style>\n";
+    // BG462: every text from the file (its name too) is HTML-escaped: a
+    // string "<script>..." in the program was live markup in the page
+    var html: str = "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>";
+    html = html + escape_html(input) + "</title>\n<style>\n";
     html = html + "body { font-family: monospace; max-width: 800px; margin: 20px auto; padding: 20px; }\n";
     html = html + ".cell { border: 1px solid #ccc; margin: 10px 0; padding: 10px; border-radius: 5px; }\n";
     html = html + ".markdown { background: #f5f5f5; white-space: pre-wrap; }\n";
     html = html + ".code { background: #f0f0ff; white-space: pre-wrap; }\n";
     html = html + ".output { background: #f5fff5; white-space: pre-wrap; margin-top: 5px; }\n";
     html = html + "</style>\n</head>\n<body>\n";
-    html = html + "<h1>" + input + "</h1>\n";
+    html = html + "<h1>" + escape_html(input) + "</h1>\n";
 
-    // Simple cell parsing: split on /// to find markdown cells
-    var lines: Vec = str_split(source, "\n");
+    // A cell per run of `///` lines (text) and per run of other lines
+    // (code, its indentation kept); blank lines stay inside a code cell
+    var lines: Vec<str> = str_split(str_replace(source, "\r", ""), "\n");
+    var cell: str = "";
+    var cell_kind: str = "";
     var i: i64 = 0;
     while i < lines.len() {
-        var line: str = str_trim(lines.get(i));
+        val rline: str = lines.get(i);
+        val line: str = str_trim(rline);
+        var kind: str = "code";
+        var text: str = rline;
         if str_starts_with(line, "///") {
-            // Markdown cell
-            var md: str = str_slice(line, 3, str_len(line));
-            md = str_trim(md);
-            html = html + "<div class=\"cell markdown\">" + md + "</div>\n";
-        } else if str_len(line) > 0 {
-            // Code line (simplified — full implementation would group code blocks)
-            html = html + "<div class=\"cell code\">" + line + "</div>\n";
+            kind = "markdown";
+            text = str_trim(str_slice(line, 3, str_len(line)));
+        } else if str_len(line) == 0 {
+            kind = cell_kind;
         }
+        if kind != cell_kind && str_len(cell_kind) > 0 {
+            html = html + notebook_cell(cell_kind, cell);
+            cell = "";
+        }
+        if str_len(kind) > 0 {
+            if str_len(cell) > 0 {
+                cell = cell + "\n";
+            }
+            cell = cell + text;
+        }
+        cell_kind = kind;
         i = i + 1;
+    }
+    if str_len(cell_kind) > 0 {
+        html = html + notebook_cell(cell_kind, cell);
+    }
+    if run_it {
+        var rargv: Vec<str> = Vec::new();
+        rargv.push(p_argv(0));
+        rargv.push("run");
+        rargv.push(input);
+        val rr: ChildResult = process_run_argv(rargv, Vec::new(), "", 60000);
+        var shown: str = rr.output + rr.errors;
+        if rr.timed_out {
+            shown = shown + "\n(stopped after 60 s)";
+        } else if rr.code != 0 {
+            shown = shown + "\n(exit code " + int_to_str(rr.code) + ")";
+        }
+        html = html + "<div class=\"cell output\">" + escape_html(shown) + "</div>\n";
     }
 
     html = html + "</body>\n</html>\n";
-    p_file_write(output, html);
+    if p_file_write(output, html) < 0 {
+        p_eprint_str("Error: could not write " + output + "\n");
+        return 1;
+    }
     p_eprint_str("Notebook written to: ");
     p_eprint_str(output);
     p_eprint_str("\n");
     return 0;
+}
+
+/// BG462: one notebook cell of `kind` ("markdown" or "code"), its text
+/// HTML-escaped; trailing blank lines of a code cell left out.
+fn notebook_cell(kind: str, text: str) -> str {
+    var t: str = text;
+    while str_ends_with(t, "\n") {
+        t = str_slice(t, 0, str_len(t) - 1);
+    }
+    if str_len(str_trim(t)) == 0 {
+        return "";
+    }
+    return "<div class=\"cell " + kind + "\">" + escape_html(t) + "</div>\n";
 }
 
 // --- lint ----------------------------------------------------------------
@@ -5078,6 +5717,18 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, _g_timeout: i64) -> i64 {
         print("Error: --target universal (a macOS fat binary) is built by `fid emit|build <file> --target universal` (machine layer, no C compiler); ccompile takes one slice: --target x86_64-macos or aarch64-macos\n");
         return 1;
     }
+    // XT77: iOS comes from the machine layer (zig ships no iOS SDK);
+    // before the OS test, which reads `arm64-apple-ios` as macOS
+    if ios_target_platform(target) != 0 {
+        print("Error: --target " + target + ": iOS executables are built by `fid emit|build <file> --target " + target + "` (machine layer, a Mach-O, no C compiler); the C route has no iOS SDK\n");
+        return 1;
+    }
+    // XT64: zig ships no Android C library (bionic): without the NDK's
+    // clang as CC the link failed (it fell to the Windows flags, -lws2_32)
+    if tgt_os == "android" && (str_len(env_or_empty("CC")) == 0 || str_contains(env_or_empty("CC"), "zig")) {
+        print("Error: --target " + target + ": the C route needs the Android NDK's C library (bionic), which zig does not ship. Build with `fid emit|build <file> --target " + target + "` (machine layer, a static PIE, no C compiler), or set CC to the NDK's clang (e.g. aarch64-linux-android34-clang)\n");
+        return 1;
+    }
     if str_len(target) > 0 && tgt_os == "" {
         print("Unknown --target '" + target + "': use <arch>-<os>, e.g. aarch64-linux, riscv64-linux, x86_64-macos, aarch64-macos, x86_64-windows, aarch64-windows, x86_64-freebsd, wasm32-wasi\n");
         return 1;
@@ -5637,7 +6288,7 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, _g_timeout: i64) -> i64 {
                         cc_flags = " -fno-sanitize=undefined" + cc_flags;
                     }
                     // The -z options are ELF-only
-                    if tgt_os == "linux" || tgt_os == "freebsd" {
+                    if tgt_os == "linux" || tgt_os == "freebsd" || tgt_os == "openbsd" || tgt_os == "android" {
                         cc_flags = cc_flags + " -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack";
                     }
                     if tgt_os == "linux" {
@@ -5654,6 +6305,18 @@ fn cmd_ccompile(n: i64, start: i64, g_borrowck: str, _g_timeout: i64) -> i64 {
                             fb_unwind = " -lunwind";
                         }
                         cc_cmd = cc + cc_flags + " -lm -lpthread" + fb_unwind + extra_libs;
+                    } else if tgt_os == "openbsd" {
+                        // XT54: OpenBSD got the Windows flags (-lws2_32);
+                        // zig ships OpenBSD's libc stubs and its libunwind
+                        var ob_unwind: str = "";
+                        if str_contains(cc, "zig") {
+                            ob_unwind = " -lunwind";
+                        }
+                        cc_cmd = cc + cc_flags + " -lm -lpthread" + ob_unwind + extra_libs;
+                    } else if tgt_os == "android" {
+                        // XT64: the NDK's clang (refused above with zig);
+                        // bionic has pthreads in libc
+                        cc_cmd = cc + cc_flags + " -lm" + extra_libs;
                     } else if tgt_os == "macos" {
                         cc_cmd = cc + cc_flags + " -lm -lpthread" + extra_libs;
                     } else if tgt_os == "wasi" {
@@ -6052,7 +6715,8 @@ fn cmd_qualify(n: i64, start: i64) -> i64 {
     var j: str = "{\n";
     j = j + "  \"tool\": \"fid\",\n";
     j = j + "  \"compilerHash\": \"" + int_to_str(inc_compiler_hash()) + "\",\n";
-    j = j + "  \"source\": \"" + json_escape_string(input) + "\",\n";
+    // BG327: json_escape_string gives the string WITH its quotes
+    j = j + "  \"source\": " + json_escape_string(input) + ",\n";
     j = j + "  \"sourceHash\": \"" + int_to_str(hash_source(source)) + "\",\n";
     j = j + "  \"checks\": \"" + checks + "\",\n";
     j = j + "  \"errors\": [";
@@ -6061,7 +6725,7 @@ fn cmd_qualify(n: i64, start: i64) -> i64 {
         if ei > 0 {
             j = j + ", ";
         }
-        j = j + "\"" + json_escape_string(errors.get(ei)) + "\"";
+        j = j + json_escape_string(errors.get(ei));
         ei = ei + 1;
     }
     j = j + "],\n";
@@ -6080,7 +6744,7 @@ fn cmd_qualify(n: i64, start: i64) -> i64 {
         if ri > 0 {
             j = j + ",\n";
         }
-        j = j + "    {\"id\": \"" + parts.get(0) + "\", \"rule\": \"" + parts.get(1) + "\", \"requirement\": \"" + json_escape_string(parts.get(2)) + "\", \"negativeTests\": " + neg + ", \"positiveTests\": " + pos + "}";
+        j = j + "    {\"id\": \"" + parts.get(0) + "\", \"rule\": " + json_escape_string(parts.get(1)) + ", \"requirement\": " + json_escape_string(parts.get(2)) + ", \"negativeTests\": " + neg + ", \"positiveTests\": " + pos + "}";
         ri = ri + 1;
     }
     j = j + "\n  ],\n";
@@ -6149,24 +6813,34 @@ fn audit_code_only(code: str) -> str {
     return str_from_bytes(bytes);
 }
 
-/// Is `t` an `unsafe {` (or bare `unsafe`) line, matched on a token
-/// boundary so `is_unsafe {` does not count?
+/// Is `t` (a line's code, audit_code_only) an `unsafe` block: the word
+/// `unsafe` as a token (so `is_unsafe {` does not count) followed by `{`
+/// or by the end of the line, with any white space between? BG459: it
+/// matched exactly "unsafe {", so `unsafe{` (and a tab or two spaces),
+/// which the checker takes as the same block, was never listed.
 fn audit_is_unsafe_block(t: str) -> bool {
-    if t == "unsafe" {
-        return true;
-    }
-    var rest: str = t;
+    val len: i64 = str_len(t);
     var off: i64 = 0;
-    while str_len(rest) > 0 {
-        val i: i64 = str_find(rest, "unsafe {");
+    while off < len {
+        val rest: str = str_slice(t, off, len);
+        val i: i64 = str_find(rest, "unsafe");
         if i < 0 {
             return false;
         }
-        if off + i == 0 || !audit_ident_byte(str_byte_at(t, off + i - 1)) {
-            return true;
+        val at: i64 = off + i;
+        val end: i64 = at + 6;
+        val before_ok: bool = at == 0 || !audit_ident_byte(str_byte_at(t, at - 1));
+        val after_ok: bool = end >= len || !audit_ident_byte(str_byte_at(t, end));
+        if before_ok && after_ok {
+            var j: i64 = end;
+            while j < len && (str_byte_at(t, j) == 32 || str_byte_at(t, j) == 9 || str_byte_at(t, j) == 13) {
+                j = j + 1;
+            }
+            if j >= len || str_byte_at(t, j) == 123 {
+                return true;
+            }
         }
-        off = off + i + 1;
-        rest = str_slice(rest, i + 1, str_len(rest));
+        off = at + 1;
     }
     return false;
 }
@@ -7777,8 +8451,23 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     // TL6: a Windows executable from any host comes from pe_ir (machine
     // code and the PE writer are Fides: no C compiler, no download)
     var cross_windows: bool = cross_target_os(target) == "windows";
+    // XT22: Windows on ARM64 belongs to the machine layer (never pe_ir,
+    // never C here), which has no ARM64 PE writer yet (XT14): a clear
+    // error, not an x86-64 PE
+    if cross_windows && cross_target_arch(target) == "aarch64" {
+        print(aarch64_windows_error(target) + "\n");
+        return 1;
+    }
     if cross_windows && cross_target_arch(target) != "" && cross_target_arch(target) != "x86_64" {
         print("Unknown --target '" + target + "': Windows executables are x86-64 (x86_64-windows)\n");
+        return 1;
+    }
+    // XT77: an iOS target is a Mach-O of the machine layer (below, with
+    // nat_mac); a wrong architecture or version stops here
+    var nat_ios: i64 = ios_target_platform(target);
+    var ios_err: str = ios_target_error(target);
+    if str_len(ios_err) > 0 {
+        print(ios_err + "\n");
         return 1;
     }
     if cross_windows {
@@ -8158,15 +8847,46 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
     if str_contains(target, "linux") || str_contains(target, "macos") || str_starts_with(target, "thumb") || use_native {
         nat_arch = nat_target_arch(target);
     }
+    // XT44/XT50/XT54/XT64: FreeBSD, OpenBSD and Android ELFs come from the
+    // machine layer too (no zig cc), branded for their system (nat_enc.fd
+    // g_nat_elf_os); before, these targets fell through to pe_ir and wrote
+    // a Windows PE
+    var nat_bos: str = nat_elf_target_os(target);
+    g_nat_elf_os = "";
+    g_nat_elf_os_ver = 0;
+    if str_len(nat_bos) > 0 && !bare_mode && !boot_mode {
+        var nat_berr: str = nat_elf_target_error(target, nat_bos);
+        if str_len(nat_berr) > 0 {
+            print(nat_berr + "\n");
+            return 1;
+        }
+        nat_arch = nat_target_arch(target);
+        g_nat_elf_os = nat_bos;
+        if nat_bos == "freebsd" {
+            g_nat_elf_os_ver = XT_FREEBSD_VERSION;
+        } else if nat_bos == "android" {
+            g_nat_elf_os_ver = android_api_level(target);
+        }
+        if nat_bos != "android" {
+            p_eprint_str("[build] FID_IMAGE_ONLY=1: a " + nat_bos + " image over the Linux runtime, for its headers only (it does not run on " + nat_bos + ")\n");
+        }
+    }
     // `--nat`: Windows x64 through the same layer (a PE; the Linux runtime
     // over kernel32, stdlib/linux_runtime/win.fd). pe_ir stays the default.
-    var nat_win: bool = (has_flag(n, start, "--nat") || g_main_codegen_nat) && (target == "" || str_contains(target, "windows") || (!is_posix_host() && !str_contains(target, "linux")));
+    var nat_win: bool = (has_flag(n, start, "--nat") || g_main_codegen_nat) && (target == "" || str_contains(target, "windows") || (!is_posix_host() && !str_contains(target, "linux"))) && str_len(nat_bos) == 0;
     if nat_win {
         nat_arch = nat_target_arch("x86_64");
     }
     // `--target aarch64-macos|x86_64-macos` (F7): a Mach-O; the Linux
     // runtime over libSystem (stdlib/linux_runtime/darwin.fd).
     var nat_mac: bool = str_contains(target, "macos");
+    // XT77: `--target aarch64-ios[<ver>][-simulator]`: the same Mach-O and
+    // darwin runtime, its LC_BUILD_VERSION naming iOS (set below)
+    if nat_ios != 0 {
+        nat_mac = true;
+        nat_win = false;
+        nat_arch = nat_target_arch(target);
+    }
     if nat_arch != 0 && !bare_mode && !boot_mode {
         var nat_out: str = find_output_arg(n, start, "a.out");
         if nat_win {
@@ -8191,6 +8911,14 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         }
         if has_flag(n, start, "--no-pie") {
             g_nat_pie_req = 0 - 1;
+        }
+        // XT64: Android runs position-independent executables only
+        if nat_bos == "android" {
+            if g_nat_pie_req < 0 {
+                print("Error: --target " + target + ": Android runs position-independent executables only (drop --no-pie)\n");
+                return 1;
+            }
+            g_nat_pie_req = 1;
         }
         if has_flag(n, start, "--stats") || remarks {
             g_nat_stats = true;
@@ -8240,6 +8968,15 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         set_native_runtime("linux_runtime");
         g_native_rt_win = nat_win;
         g_native_rt_mac = nat_mac;
+        // XT77: the Mach-O's platform: iOS device (2) or simulator (7)
+        // with its minimum version; 0 puts back macOS 11.0
+        if nat_ios != 0 {
+            var ios_min: i64 = ios_target_minos(target);
+            nat_macho_set_platform(nat_ios, ios_min, ios_target_sdk(ios_min));
+            p_eprint_str("[build] Target: iOS " + ios_version_text(ios_min) + ios_platform_note(nat_ios) + " (Mach-O, machine layer, darwin runtime)\n");
+        } else {
+            nat_macho_set_platform(0, 0, 0);
+        }
         // @cfg sees the target, not the host
         g_cfg_os = "linux";
         if nat_win {
@@ -8247,6 +8984,11 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
         }
         if nat_mac {
             g_cfg_os = "macos";
+        }
+        // XT44/XT54: @cfg sees FreeBSD / OpenBSD; Android stays "linux"
+        // (its kernel, and the runtime the image carries)
+        if nat_bos == "freebsd" || nat_bos == "openbsd" {
+            g_cfg_os = nat_bos;
         }
         if str_contains(target, "riscv") {
             g_cfg_arch = "riscv64";
@@ -8524,6 +9266,19 @@ fn cmd_build(n: i64, start: i64, g_borrowck: str, g_timeout: i64) -> i64 {
                             }
                             print(dlist);
                             return 0;
+                        }
+                        // XT53/XT65: a program calling C functions is linked
+                        // against glibc's loader (CI2: PT_INTERP, DT_NEEDED);
+                        // bionic's linker64 and the BSDs' libc are not done
+                        if str_len(nat_bos) > 0 && g_nat_ldyn_dyn >= 0 {
+                            var xt_goal: str = "XT65 (bionic: /system/bin/linker64, libc.so)";
+                            if nat_bos == "freebsd" {
+                                xt_goal = "XT43-XT45 (FreeBSD's libc, /libexec/ld-elf.so.1)";
+                            } else if nat_bos == "openbsd" {
+                                xt_goal = "XT53 (OpenBSD's libc.so, /usr/libexec/ld.so)";
+                            }
+                            print("Error: --target " + target + ": this program calls C functions (extern \"C\"), and the machine layer links those for glibc only; dynamic linking for " + nat_bos + " is target roadmap " + xt_goal + "\n");
+                            return 1;
                         }
                         if !write_output_vec(nat_out, nat_bytes) {
                             return 1;
@@ -8836,6 +9591,10 @@ fn repro_env_prefix() -> str {
 fn crash_trace_on() -> bool {
     return str_len(env_or_empty("FID_CRASH_TRACE")) > 0;
 }
+
+/// BG486: the stage `fid run` names when the interpreted program starts:
+/// what follows on stderr is the program's own (its panic, its exit code).
+const CRASH_STAGE_PROGRAM: str = "the program (interpreted by fid run)";
 
 /// Under --crash-report, the stage about to start (stderr).
 /// FID_CRASH_TEST=<text>: a deliberate panic at the start of the stage
@@ -9326,16 +10085,10 @@ fn cmd_reduce(n: i64, start: i64, g_timeout: i64) -> i64 {
 }
 
 /// The index of the first argument after `--` (interpreter mode) or 1.
+/// BG331: as main's dispatch (main_args_start): a `--` of a native fid's
+/// command line belongs to the command.
 fn argv_first() -> i64 {
-    var n: i64 = p_argc();
-    var i: i64 = 0;
-    while i < n {
-        if p_argv(i) == "--" {
-            return i + 1;
-        }
-        i = i + 1;
-    }
-    return 1;
+    return main_args_start(p_argc());
 }
 
 /// RL20: run the command line again (without --crash-report) as a child
@@ -9405,6 +10158,20 @@ fn crash_report_run(n: i64, start: i64) -> i64 {
         k = k + 1;
     }
     var crashed: bool = panic_at >= 0 || rc < 0 || rc > 1;
+    // BG486: once `fid run` started the program, its panic and its exit
+    // code are the program's: only fid itself dying (a signal, an
+    // exception status, the C runtime's stack overflow or access
+    // violation) is a crash of fid
+    if stage == CRASH_STAGE_PROGRAM {
+        var died: bool = rc < 0 || rc > 255;
+        if panic_at >= 0 {
+            val pl: str = lines.get(panic_at);
+            if str_contains(pl, "Segmentation") || str_contains(pl, "Access violation") || (str_contains(pl, "tack overflow") && !str_contains(pl, "Panic")) {
+                died = true;
+            }
+        }
+        crashed = died;
+    }
     if !crashed {
         return rc;
     }
@@ -9595,8 +10362,27 @@ fn cmd_emit_ir(n: i64, start: i64) -> i64 {
     }
     var tos: str = cross_target_os(target);
     var arch: i64 = nat_target_arch(target);
+    // XT77: an iOS target is a Mach-O whose LC_BUILD_VERSION names iOS
+    var eir_ios: i64 = ios_target_platform(target);
+    if eir_ios != 0 {
+        var eir_ios_err: str = ios_target_error(target);
+        if str_len(eir_ios_err) > 0 {
+            print(eir_ios_err + "\n");
+            return 1;
+        }
+        tos = "macos";
+        var eir_min: i64 = ios_target_minos(target);
+        nat_macho_set_platform(eir_ios, eir_min, ios_target_sdk(eir_min));
+    } else {
+        nat_macho_set_platform(0, 0, 0);
+    }
+    // XT22: nat_generate_pe writes x86-64 only
+    if tos == "windows" && cross_target_arch(target) == "aarch64" {
+        print(aarch64_windows_error(target) + "\n");
+        return 1;
+    }
     if arch == 0 || (tos != "linux" && tos != "windows" && tos != "macos") {
-        print("Error: emit-ir: no machine-layer target '" + target + "' (x86_64-linux, aarch64-linux, riscv64-linux, x86_64-macos, aarch64-macos, x86_64-windows)\n");
+        print("Error: emit-ir: no machine-layer target '" + target + "' (x86_64-linux, aarch64-linux, riscv64-linux, x86_64-macos, aarch64-macos, aarch64-ios, aarch64-ios-simulator, x86_64-windows)\n");
         return 1;
     }
     var m: IrModule = ld.module;
@@ -9920,6 +10706,12 @@ fn print_usage() {
     p_eprint_str("  fid emit     <file.fd> --fast-alloc | --size  The fast allocator (RA14) / smaller code (TG19; RISC-V is compressed by default, FID_NAT_OFF=rvc: not)\n");
     p_eprint_str("  fid test     <file.fd> -run <test>/<row>  Only those tests, and those rows of their table tests\n");
     p_eprint_str("  fid parse-header <file.h> [-o <fd>] [--link <lib>] FFI bindings from a C header\n");
+    p_eprint_str("  fid lsp                              Language server (JSON-RPC over stdio, for editors)\n");
+    p_eprint_str("  fid repl                             Read-eval-print loop (expressions built through C)\n");
+    p_eprint_str("  fid ark      <command> ...           Package manager (init, add, install, remove, ...; fid ark help)\n");
+    p_eprint_str("  fid notebook <file.fd>               The file as an HTML page, its /// comments as text\n");
+    p_eprint_str("  fid test-rules [--smt <dir>]         Check the IR rewrite rules on values (SMT-LIB obligations)\n");
+    p_eprint_str("  fid help | --help | -h               This text\n");
 }
 
 // --- cmd_parse_header ----------------------------------------------------
@@ -9931,11 +10723,53 @@ fn cmd_scribe(n: i64, start: i64) -> i64 {
         print("scribe -- Documentation generator for Fides\n\nUSAGE:\n    scribe <file.fd> [--output <dir>] [--format html|markdown]\n");
         return 1;
     }
-    var input: str = p_argv(start + 1);
-    var format: str = get_flag_value(n, start, "--format", "html");
-    var output_dir: str = get_flag_value(n, start, "--output", "docs");
+    // BG361: scribe's own arguments (compiler/scribe.fd scribe_main): the
+    // options anywhere, `-o`/`-f` as `--output`/`--format`, one input; a
+    // second input or an unknown option is an error, not ignored
+    var input: str = "";
+    var have_input: bool = false;
+    var format: str = "html";
+    var output_dir: str = "docs";
+    var si: i64 = start + 1;
+    while si < n {
+        var a: str = p_argv(si);
+        if a == "--format" || a == "-f" {
+            if si + 1 < n {
+                format = p_argv(si + 1);
+            }
+            si = si + 1;
+        } else if a == "--output" || a == "-o" {
+            if si + 1 < n {
+                output_dir = p_argv(si + 1);
+            }
+            si = si + 1;
+        } else if a == "--help" || a == "-h" {
+            print(scribe_help_text());
+            return 0;
+        } else if str_starts_with(a, "--borrowck=") || str_starts_with(a, "--edition=") || a == "--debug" {
+            // a global flag (main's loop has read it)
+        } else if !have_input {
+            input = a;
+            have_input = true;
+        } else {
+            p_eprint_str("error: unknown argument: " + a + "\n");
+            p_eprint_str("Usage: fid doc <file.fd|dir> [--output|-o <dir>] [--format|-f html|markdown]\n");
+            return 1;
+        }
+        si = si + 1;
+    }
+    if !have_input {
+        p_eprint_str("error: no input file or directory specified\n");
+        return 1;
+    }
     // TL11: a directory is a site (a page per module, an index with search)
     var message: str = process_directory(input, output_dir, format);
+    // BG321: an input that cannot be read (or holds no .fd file) is an
+    // error on stderr, exit 1, as scribe.exe (scribe_main) reports it
+    if str_starts_with(message, "Cannot ") || str_starts_with(message, "No .fd files") {
+        p_eprint_str("error: " + message + "\n");
+        return 1;
+    }
     print(message);
     print("\n");
     return 0;
@@ -9986,6 +10820,12 @@ fn cmd_doctest(n: i64, start: i64) -> i64 {
     if p_is_dir(input) != 0 {
         scribe_collect(input, &mut files);
     } else {
+        // BG322: a missing or unreadable file is an error, not "0 examples"
+        // and exit 0 (c_file_read gives "" for both)
+        if p_file_exists(input) == 0 {
+            p_eprint_str("doctest: cannot read " + input + "\n");
+            return 1;
+        }
         files.push(input);
     }
     var n_doc: i64 = 0;

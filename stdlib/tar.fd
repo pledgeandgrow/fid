@@ -119,13 +119,18 @@ fn tar_field_str(b: &Vec<i64>, off: i64, len: i64) -> str {
 
 /// A numeric field: octal digits (leading spaces or NULs skipped, ended by
 /// a space or NUL) or, with the top bit of the first byte set, the GNU
-/// base-256 big-endian form.
+/// base-256 big-endian form. -1 when the value does not fit in i64 (a
+/// 12-byte base-256 field holds up to 2^95; BG316).
 pub fn tar_field_num(b: &Vec<i64>, off: i64, len: i64) -> i64 {
     val first: i64 = b.get(off);
     if (first & 128) != 0 {
         var v: i64 = first & 63;
         var i: i64 = 1;
         while i < len {
+            // 36028797018963967 = (i64::MAX - 255) / 256
+            if v > 36028797018963967 {
+                return -1;
+            }
             v = v * 256 + b.get(off + i);
             i = i + 1;
         }
@@ -140,6 +145,10 @@ pub fn tar_field_num(b: &Vec<i64>, off: i64, len: i64) -> i64 {
         val c: i64 = b.get(off + i);
         if c < 48 || c > 55 {
             break;
+        }
+        // 1152921504606846975 = (i64::MAX - 7) / 8
+        if v > 1152921504606846975 {
+            return -1;
         }
         v = v * 8 + (c - 48);
         i = i + 1;
@@ -249,6 +258,10 @@ fn tar_pax_parse(d: &Vec<i64>, keys: &mut Vec<str>, vals: &mut Vec<str>) -> bool
         var q: i64 = p;
         while q < d.len() && d.get(q) >= 48 && d.get(q) <= 57 {
             n = n * 10 + d.get(q) - 48;
+            if n > d.len() {
+                // longer than the data: bad, and no overflow (BG316)
+                return false;
+            }
             q = q + 1;
         }
         if n <= 0 || p + n > d.len() || q >= d.len() || d.get(q) != 32 || d.get(p + n - 1) != 10 {
@@ -273,6 +286,7 @@ fn tar_pax_parse(d: &Vec<i64>, keys: &mut Vec<str>, vals: &mut Vec<str>) -> bool
     return true;
 }
 
+/// A pax decimal value; -1 when it does not fit in i64 (BG316).
 fn tar_dec(s: str) -> i64 {
     var v: i64 = 0;
     var i: i64 = 0;
@@ -280,6 +294,10 @@ fn tar_dec(s: str) -> i64 {
         val c: i64 = str_byte_at(s, i);
         if c < 48 || c > 57 {
             break;
+        }
+        // 922337203685477579 = (i64::MAX - 9) / 10
+        if v > 922337203685477579 {
+            return -1;
         }
         v = v * 10 + c - 48;
         i = i + 1;
@@ -381,7 +399,11 @@ pub fn tar_parse(b: Vec<i64>) -> TarArchive {
             size = 0;
         }
         val dstart: i64 = off + TAR_BLOCK;
-        if dstart + size > b.len() {
+        if size < 0 {
+            // a size field that does not fit in i64 (BG316)
+            return tar_fail("bad size at " + int_to_str(off), es);
+        }
+        if size > b.len() - dstart {
             return tar_fail("truncated data at " + int_to_str(dstart), es);
         }
         var data: Vec<i64> = Vec::new();

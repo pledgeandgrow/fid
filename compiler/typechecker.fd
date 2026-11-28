@@ -1335,11 +1335,24 @@ fn TypeChecker_check_fstring_part(self: &mut TypeChecker, t: Type) {
             TypeChecker_check_fstring_part(self, TypeChecker_resolve_type(self, box_type_unbox(inner)));
             return;
         }
+        // BG303 (reference §1.8): a tuple has no text form (it printed
+        // an empty string)
+        Type::Tuple(_) => {
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): an f-string cannot show a tuple value: it has no text form.\n    Fix: destructure it first (`val (a, b) = t;`) and interpolate its elements (`{a} {b}`).");
+            return;
+        }
         _ => {
             return;
         }
     }
+    // (a HashMap shows as println shows it: the lowering calls HashMap_to_str)
     if name == "Vec" || name == "HashMap" || str_len(name) == 0 {
+        return;
+    }
+    // BG303 (reference §1.8): an enum, Option or Result has no text form
+    // either (it printed an empty string)
+    if TypeChecker_enum_pos(self, name) >= 0 || name == "Option" || name == "Result" {
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): an f-string cannot show a value of enum type '" + name + "': it has no text form.\n    Fix: match on it and interpolate the payload (`match o { Option::Some(x) => f\"{x}\", Option::None => \"none\" }`), or a function that gives its text.");
         return;
     }
     if TypeChecker_struct_pos(self, name) < 0 {
@@ -2423,6 +2436,8 @@ pub fn TypeChecker_register_program(self: &mut TypeChecker, program: Program, mo
             // the private item of whichever module had a `take` method
             var mangled: str = struct_name + "_" + method.name;
             TypeChecker_set_item_module(self, mangled, module);
+            // BG292: whether the method is `pub` (TypeChecker_check_method_visible)
+            TypeChecker_set_item_visibility(self, mangled, method.is_pub);
             // CU3: a method marked @deprecated, under its mangled name
             var mdi: i64 = 0;
             while mdi < method.annotations.len() {
@@ -2845,6 +2860,82 @@ fn TypeChecker_lg4_declared_short(self: &TypeChecker, ts: str, own: Vec<str>, im
         }
     }
     return out;
+}
+
+/// BG368: the type a `self` parameter names, without its reference
+/// (`&A`, `&mut A`, `&'a A`) or type arguments (`Wrap<T>`).
+fn tc_self_type_base(t: Type) -> str {
+    match t {
+        Type::Ref(inner, _) => {
+            return tc_self_type_base(box_type_unbox(inner));
+        }
+        Type::Named(n) => {
+            return n;
+        }
+        Type::Generic(gn, _) => {
+            return gn;
+        }
+        _ => {
+        }
+    }
+    return type_to_str(t);
+}
+
+/// BG368: the last part of a path (`m::A` -> `A`) and no type arguments
+/// (`Wrap<Vec<U>>` -> `Wrap`).
+fn tc_self_owner_base(n: str) -> str {
+    var out: str = n;
+    var lt: i64 = str_find(out, "<");
+    if lt > 0 {
+        out = str_slice(out, 0, lt);
+    }
+    var i: i64 = str_len(out) - 1;
+    while i > 0 {
+        if str_byte_at(out, i) == 58 && str_byte_at(out, i - 1) == 58 {
+            return str_slice(out, i + 1, str_len(out));
+        }
+        i = i - 1;
+    }
+    return out;
+}
+
+/// BG368: a method's `self` must be the impl's own type: `self` (Self),
+/// `self: A`, `&A` or `&mut A` in `impl A` / `impl T for A`. With any other
+/// type (`self: B`, `self: i64`) the receiver's memory was read as that
+/// type: an integer field read as a str or a Vec, in safe code.
+fn TypeChecker_check_self_param(self: &mut TypeChecker, owner: str, m: Func) {
+    if m.params.len() == 0 || m.params.get(0).name != "self" {
+        return;
+    }
+    val st: Type = m.params.get(0).ty;
+    match st {
+        Type::Infer => {
+            return;
+        }
+        _ => {
+        }
+    }
+    val base: str = tc_self_owner_base(tc_self_type_base(st));
+    val want: str = tc_self_owner_base(owner);
+    if base == "Self" || base == want {
+        return;
+    }
+    // An alias of the impl's type, or the impl's type through an alias
+    var rs: Type = TypeChecker_resolve_type(self, st);
+    match rs {
+        Type::Ref(rin, _) => {
+            rs = box_type_unbox(rin);
+        }
+        _ => {
+        }
+    }
+    if type_eq(rs, TypeChecker_resolve_type(self, Type::Named(owner))) || tc_self_owner_base(tc_self_type_base(rs)) == want {
+        return;
+    }
+    if tc_str_vec_contains(self.current_type_params, base) {
+        return;
+    }
+    self.errors.push("Type error (line " + int_to_str(m.line) + "): `self` of method '" + m.name + "' of " + want + " must be " + want + ", &" + want + " or &mut " + want + ", got " + type_to_str(st) + ".\n    The receiver is a " + want + "; reading it as another type reinterprets its memory.\n    Fix: declare it `self: " + want + "` (or `self`, `self: &" + want + "`, `self: &mut " + want + "`), or move the method to an `impl` of " + base + ".");
 }
 
 /// An impl method `im` against the trait's method `tm` (LG4): the same
@@ -3375,6 +3466,15 @@ fn annotation_targets_str(mask: i64) -> str {
 }
 
 fn check_one_annotation_fd(self: &mut TypeChecker, a: Annotation, target: str, what: str) {
+    // BG371: the bound a turbofish instance carries (mono.fd instantiate
+    // writes [type, trait]; lower.fd reads it) is the compiler's own, not
+    // an unknown annotation: its type must implement the trait
+    if a.name == "__trait_bound" {
+        if a.args.len() == 2 && TypeChecker_is_trait_name(self, a.args.get(1)) && !TypeChecker_satisfies_bound(self, Type::Named(a.args.get(0)), a.args.get(1)) {
+            self.errors.push("Type error: " + a.args.get(0) + " does not implement " + a.args.get(1) + " (required by a bound of '" + what + "', a turbofish instance).\n    Fix: add `impl " + a.args.get(1) + " for " + a.args.get(0) + " { ... }`, or give the turbofish a type that implements it.");
+        }
+        return;
+    }
     var mask: i64 = annotation_target_mask(a.name);
     if mask == 0 {
         self.errors.push("Unknown annotation '@" + a.name + "' on '" + what + "': no compiler pass consumes this name\n    and it will be silently ignored. Check the spelling.\n    Fix: fix the spelling (docs/reference/reference.md section 11 lists every annotation), or remove it.");
@@ -3657,13 +3757,10 @@ pub fn TypeChecker_check_bodies(self: &mut TypeChecker, program: Program) {
         fi2 = fi2 + 1;
     }
     // BG117: a const's literal must fit its declared type — the initializer
-    // is folded at use sites and no earlier pass type-checked it
-    var cci: i64 = 0;
-    while cci < program.consts.len() {
-        var cdef: ConstDef = program.consts.get(cci);
-        TypeChecker_check_value_fits(self, cdef.ty, cdef.ty, cdef.expr, self.current_line);
-        cci = cci + 1;
-    }
+    // is folded at use sites and no earlier pass type-checked it.
+    // BG261/BG262: the initializer of a const and of a global has the
+    // declared type, and a literal fits it (TypeChecker_check_decl_init)
+    TypeChecker_check_decl_inits(self, program);
     // Check impl method bodies
     var impi2: i64 = 0;
     while impi2 < program.impls.len() {
@@ -3677,6 +3774,8 @@ pub fn TypeChecker_check_bodies(self: &mut TypeChecker, program: Program) {
         var mi: i64 = 0;
         while mi < imp.methods.len() {
             if !tc_skips(self, "impl:" + imp.struct_name + ":" + imp.methods.get(mi).name) {
+                // BG368: `self` is the impl's own type
+                TypeChecker_check_self_param(self, imp.struct_name, imp.methods.get(mi));
                 TypeChecker_check_func(self, imp.methods.get(mi));
             }
             mi = mi + 1;
@@ -3698,6 +3797,8 @@ pub fn TypeChecker_check_bodies(self: &mut TypeChecker, program: Program) {
         var mi: i64 = 0;
         while mi < ti.methods.len() {
             if !tc_skips(self, "trait:" + ti.type_name + ":" + ti.methods.get(mi).name) {
+                // BG368: `self` is the implementing type
+                TypeChecker_check_self_param(self, ti.type_name, ti.methods.get(mi));
                 TypeChecker_check_func(self, ti.methods.get(mi));
             }
             mi = mi + 1;
@@ -3708,6 +3809,8 @@ pub fn TypeChecker_check_bodies(self: &mut TypeChecker, program: Program) {
     }
     TypeChecker_ce9_check_calls(self);
     TypeChecker_verify_method_calls(self, program);
+    // BG377: calls through `dyn` in @realtime code (recorded by the bodies)
+    TypeChecker_verify_realtime_dyn(self, program);
     // BG22, BG59: the effect rules and recursion through the method calls
     // checking the bodies recorded
     TypeChecker_verify_effects_through_methods(self, program);
@@ -4048,6 +4151,23 @@ fn TypeChecker_verify_no_races(self: &mut TypeChecker, program: Program) {
     HashMap_drop(rg.mc_head);
 }
 
+/// BG290: record a name `val (a, b) = ..` (is_mut false) or `var (a, b) =
+/// ..` binds in the innermost scope, as Stmt::Let records its name: a val
+/// as `name`, a var as `!name` (it shadows an outer val).
+fn TypeChecker_record_val(self: &mut TypeChecker, name: str, is_mut: bool) {
+    if self.val_vars_per_scope.len() > 0 {
+        var scope: Vec<str> = self.val_vars_per_scope.pop();
+        if is_mut {
+            str_vec_remove(&mut scope, name);
+            scope.push("!" + name);
+        } else {
+            str_vec_remove(&mut scope, "!" + name);
+            scope.push(name);
+        }
+        self.val_vars_per_scope.push(scope);
+    }
+}
+
 // `name` is declared with `val` in the innermost scope that declares it.
 fn TypeChecker_is_val(self: &TypeChecker, name: str) -> bool {
     var shadow: str = "!" + name;
@@ -4063,6 +4183,70 @@ fn TypeChecker_is_val(self: &TypeChecker, name: str) -> bool {
         i = i - 1;
     }
     return false;
+}
+
+/// BG377: the calls through `dyn` checking the bodies saw: the caller (as
+/// TypeChecker_record_method_call names it) and `Trait.method`.
+var g_tc_dyn_callers: Vec<str> = Vec::new();
+var g_tc_dyn_targets: Vec<str> = Vec::new();
+
+/// BG294 / BG375 / BG377: `d.m()` with d a `dyn T`, or x a value of a
+/// type parameter bound by T, runs one of T's implementations of m, which
+/// one is known only at run time (or at instantiation). Each
+/// implementation's `Type.m` is recorded as a method the caller calls, so
+/// the effect rules after the bodies (`!{..}`, @deterministic, @realtime:
+/// TypeChecker_verify_effects_through_methods) see their effects; inside
+/// `sandbox { }` the call is rejected when any implementation has an
+/// effect the sandbox revokes; a call through `dyn` is noted for
+/// @realtime (TypeChecker_verify_realtime_dyn).
+fn TypeChecker_note_trait_dispatch(self: &mut TypeChecker, trait_name: str, method: str, is_dyn: bool) {
+    var effs: Vec<str> = Vec::new();
+    var pre: str = trait_name + ":";
+    var i: i64 = 0;
+    while i < self.impl_pairs.len() {
+        var p: str = self.impl_pairs.get(i);
+        if str_starts_with(p, pre) {
+            var tn: str = str_slice(p, str_len(pre), str_len(p));
+            TypeChecker_record_method_call(self, tn, method);
+            var te: Vec<str> = TypeChecker_get_func_effects(self, tn + "." + method);
+            var k: i64 = 0;
+            while k < te.len() {
+                if !tc_str_vec_contains(effs, te.get(k)) {
+                    effs.push(te.get(k));
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if is_dyn {
+        match self.current_func_name {
+            OptString::Some(caller) => {
+                var from: str = caller;
+                match self.current_self_type {
+                    OptString::Some(t) => {
+                        from = t + "." + caller;
+                    }
+                    OptString::None => {
+                    }
+                }
+                g_tc_dyn_callers.push(from);
+                g_tc_dyn_targets.push(trait_name + "." + method);
+            }
+            OptString::None => {
+            }
+        }
+    }
+    if self.sandbox_depth > 0 {
+        var how: str = "dyn ";
+        if !is_dyn {
+            how = "a type bound by ";
+        }
+        var se: str = tc_sandbox_forbidden(effs);
+        if se != "" {
+            self.errors.push("Sandbox error: '." + method + "()' on " + how + trait_name + " has effect '!" + se + "' (an implementation of " + trait_name + "." + method + " has it) -- all capabilities are revoked inside sandbox, including in the functions it calls\n    Fix: call it before or after the `sandbox { }` block, and pass its result in.");
+        }
+    }
 }
 
 fn TypeChecker_record_method_call(self: &mut TypeChecker, owner: str, method: str) {
@@ -5179,10 +5363,14 @@ pub fn TypeChecker_verify_gas(self: &mut TypeChecker, program: Program) {
     var bodies: Vec<StmtList> = Vec::new();
     var limit_names: Vec<str> = Vec::new();
     var limits: Vec<i64> = Vec::new();
+    // BG382: the bare name of each method (parallel to names), "" for a
+    // free function
+    g_gas_mshort = Vec::new();
     var fi: i64 = 0;
     while fi < program.funcs.len() {
         var func: Func = program.funcs.get(fi);
         gas_collect(func, func.name, &mut names, &mut bodies, &mut limit_names, &mut limits);
+        g_gas_mshort.push("");
         fi = fi + 1;
     }
     var ii: i64 = 0;
@@ -5191,6 +5379,7 @@ pub fn TypeChecker_verify_gas(self: &mut TypeChecker, program: Program) {
         var mi: i64 = 0;
         while mi < imp.methods.len() {
             gas_collect(imp.methods.get(mi), imp.struct_name + "_" + imp.methods.get(mi).name, &mut names, &mut bodies, &mut limit_names, &mut limits);
+            g_gas_mshort.push(imp.methods.get(mi).name);
             mi = mi + 1;
         }
         ii = ii + 1;
@@ -5201,6 +5390,7 @@ pub fn TypeChecker_verify_gas(self: &mut TypeChecker, program: Program) {
         var tmi: i64 = 0;
         while tmi < timp.methods.len() {
             gas_collect(timp.methods.get(tmi), timp.type_name + "_" + timp.methods.get(tmi).name, &mut names, &mut bodies, &mut limit_names, &mut limits);
+            g_gas_mshort.push(timp.methods.get(tmi).name);
             tmi = tmi + 1;
         }
         ti = ti + 1;
@@ -5256,6 +5446,34 @@ fn gas_own(name: str, names: Vec<str>, bodies: Vec<StmtList>) -> i64 {
     return gas_cost_stmts(bodies.get(idx));
 }
 
+/// BG382: the bare method name of each entry of TypeChecker_verify_gas's
+/// names ("" for a free function).
+var g_gas_mshort: Vec<str> = Vec::new();
+
+/// BG382: the cost of a call as scan_stmts_for_calls records it with
+/// g_scan_dot_methods: a method call `.m` (its receiver's type is not known
+/// here) costs as much as the dearest method named m of the program, so the
+/// bound holds whatever the receiver is; any other name is the function or
+/// `Type_method` it names.
+fn gas_call_total(c: str, names: Vec<str>, bodies: Vec<StmtList>, visited: &mut Vec<str>, cache_names: &mut Vec<str>, cache_vals: &mut Vec<i64>) -> i64 {
+    if !str_starts_with(c, ".") {
+        return gas_total(c, names, bodies, visited, cache_names, cache_vals);
+    }
+    var m: str = str_slice(c, 1, str_len(c));
+    var best: i64 = 0;
+    var i: i64 = 0;
+    while i < g_gas_mshort.len() && i < names.len() {
+        if g_gas_mshort.get(i) == m {
+            var t: i64 = gas_total(names.get(i), names, bodies, visited, cache_names, cache_vals);
+            if t > best {
+                best = t;
+            }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
 /// Own cost plus the (memoized) totals of the distinct callees; a callee
 /// already on the current path counts only its own cost (cycles).
 fn gas_total(name: str, names: Vec<str>, bodies: Vec<StmtList>, visited: &mut Vec<str>, cache_names: &mut Vec<str>, cache_vals: &mut Vec<i64>) -> i64 {
@@ -5272,14 +5490,20 @@ fn gas_total(name: str, names: Vec<str>, bodies: Vec<StmtList>, visited: &mut Ve
     var idx: i64 = gas_index(name, names);
     if idx >= 0 {
         var calls: Vec<str> = Vec::new();
+        // BG382: method calls as ".m" and `Type::f(..)` as "Type_f" (the
+        // names methods are registered under); a bare method name was
+        // looked up as a free function and never charged
+        var gas_saved_dot: bool = g_scan_dot_methods;
+        g_scan_dot_methods = true;
         scan_stmts_for_calls(bodies.get(idx), &mut calls);
+        g_scan_dot_methods = gas_saved_dot;
         var seen: Vec<str> = Vec::new();
         var k: i64 = 0;
         while k < calls.len() {
             var c: str = calls.get(k);
             if gas_index(c, seen) < 0 {
                 seen.push(c);
-                callee_total = callee_total + gas_total(c, names, bodies, visited, cache_names, cache_vals);
+                callee_total = callee_total + gas_call_total(c, names, bodies, visited, cache_names, cache_vals);
             }
             k = k + 1;
         }
@@ -5337,7 +5561,7 @@ fn gas_cost_stmt(stmt: Stmt) -> i64 {
         Stmt::Let(_, _, e, _, _, _, _) => {
             cost = cost + gas_cost_expr(e);
         }
-        Stmt::LetTuple(_, e, _) => {
+        Stmt::LetTuple(_, e, _, _) => {
             cost = cost + gas_cost_expr(e);
         }
         Stmt::Expr(e, _) => {
@@ -5609,6 +5833,40 @@ pub fn TypeChecker_verify_safety_annotations(self: &mut TypeChecker, program: Pr
         ti = ti + 1;
     }
 
+    // BG378: the functions (by name) and methods (by bare name) whose
+    // result is a function value, for tc_let_init_gives_fn
+    g_tc_fnret_set = HashMap_new();
+    var frs: i64 = 0;
+    while frs < program.funcs.len() {
+        if tc_type_is_func(program.funcs.get(frs).ret_ty) {
+            HashMap_insert(g_tc_fnret_set, program.funcs.get(frs).name, 1);
+        }
+        frs = frs + 1;
+    }
+    var frm: i64 = 0;
+    while frm < program.impls.len() {
+        var frimp: ImplDef = program.impls.get(frm);
+        var frk: i64 = 0;
+        while frk < frimp.methods.len() {
+            if tc_type_is_func(frimp.methods.get(frk).ret_ty) {
+                HashMap_insert(g_tc_fnret_set, "." + frimp.methods.get(frk).name, 1);
+            }
+            frk = frk + 1;
+        }
+        frm = frm + 1;
+    }
+    var frt: i64 = 0;
+    while frt < program.trait_impls.len() {
+        var frti: TraitImpl = program.trait_impls.get(frt);
+        var frj: i64 = 0;
+        while frj < frti.methods.len() {
+            if tc_type_is_func(frti.methods.get(frj).ret_ty) {
+                HashMap_insert(g_tc_fnret_set, "." + frti.methods.get(frj).name, 1);
+            }
+            frj = frj + 1;
+        }
+        frt = frt + 1;
+    }
     // SP10: the per-call lookups inside check_safety_body are tables —
     // func_pos: name -> func_prim_lists index + 1 (first wins, as the
     // scan); msuf: every "_"-suffix of a method's qualified name -> its
@@ -6406,6 +6664,18 @@ pub fn check_safety_body(func_name: str, body: Vec<Stmt>, prims: Vec<str>, anns:
                 }
             }
         }
+        // BG378: `v.get(0)(x)` / `mk()(x)` parse as `{ val __pcall_k =
+        // v.get(0); __pcall_k(x) }` (parser.fd parse_postfix): a call of
+        // the function value another call returned, its target unknown
+        if local_at < 0 && str_starts_with(called, "__pcall_") && !HashMap_contains(func_pos, called) {
+            if has_primitive(prims, "no-indirect") {
+                errs.push("Safety error (" + label + "): function '" + func_name + "' is @no-indirect but calls the function value a call returns (`f(..)(..)`).\n    Indirect calls (function pointers, closures, dynamic dispatch) are forbidden.\n    Fix: call the function directly, or remove the safety annotation.");
+            } else if has_primitive(prims, "no-recursion") {
+                errs.push("Safety error (" + label + "): function '" + func_name + "' is @no-recursion but calls the function value a call returns (`f(..)(..)`), whose target is not known.\n    Recursion through it cannot be ruled out.\n    Fix: call the function directly, or remove the safety annotation.");
+            }
+            ci = ci + 1;
+            continue;
+        }
         if local_at >= 0 {
             if has_primitive(prims, "no-indirect") {
                 errs.push("Safety error (" + label + "): function '" + func_name + "' is @no-indirect but calls the local '" + called + "', a function value.\n    Indirect calls (function pointers, closures, dynamic dispatch) are forbidden.\n    Fix: call the function directly, or remove the safety annotation.");
@@ -6575,6 +6845,12 @@ pub fn check_safety_body(func_name: str, body: Vec<Stmt>, prims: Vec<str>, anns:
         scan_for_while_loops(body, &mut while_sites);
         var wi: i64 = 0;
         while wi < while_sites.len() {
+            if while_sites.get(wi) < 0 {
+                // BG376: a `loop { }` (its site is -line - 1)
+                errs.push("Safety error (" + label + ") (line " + int_to_str(0 - while_sites.get(wi) - 1) + "): function '" + func_name + "' is @no-unbounded but uses a 'loop' loop.\n    `loop { }` has no bound on its iterations: use 'for' loops over finite ranges/arrays.\n    Fix: replace 'loop { ... }' with 'for i in 0..N { ... }' (with a `break` to leave it early), or remove the safety annotation.");
+                wi = wi + 1;
+                continue;
+            }
             errs.push("Safety error (" + label + ") (line " + int_to_str(while_sites.get(wi)) + "): function '" + func_name + "' is @no-unbounded but uses a 'while' loop.\n    While loops are unbounded — use 'for' loops over finite ranges/arrays.\n    Fix: replace 'while cond { ... }' with 'for i in 0..N { ... }', or remove the safety annotation.");
             wi = wi + 1;
         }
@@ -6620,6 +6896,61 @@ fn tc_let_is_fn_value(lty: OptType, init: Expr) -> bool {
     return false;
 }
 
+// BG378: the program's functions ("name") and methods (".name") whose
+// result type is a function type (TypeChecker_verify_safety_annotations).
+var g_tc_fnret_set: i64 = 0;
+
+fn tc_type_is_func(t: Type) -> bool {
+    match t {
+        Type::Func(_, _) => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+fn tc_let_typed(lty: OptType) -> bool {
+    match lty {
+        OptType::Some(_) => {
+            return true;
+        }
+        OptType::None => {
+        }
+    }
+    return false;
+}
+
+// BG378: whether an untyped local's initializer is a call or method call
+// whose result may be a function value: a function or method of the
+// program that returns one, or an element taken out of a collection
+// (`v.get(0)`, `v.pop()`, `o.unwrap()`). Only consulted for a local that is
+// then called (check_safety_body), so a collection of numbers costs
+// nothing; BG152 recognised only a name, closure, field or index.
+fn tc_let_init_gives_fn(init: Expr) -> bool {
+    match init {
+        Expr::Call(callee, _) => {
+            return g_tc_fnret_set != 0 && HashMap_contains(g_tc_fnret_set, callee);
+        }
+        Expr::MethodCall(_, m, _) => {
+            if g_tc_fnret_set != 0 && HashMap_contains(g_tc_fnret_set, "." + m) {
+                return true;
+            }
+            return m == "get" || m == "pop" || m == "first" || m == "last" || m == "remove" || m == "unwrap" || m == "expect" || m == "unwrap_or" || m == "get_or" || m == "clone";
+        }
+        Expr::Try(inner) => {
+            return tc_let_init_gives_fn(box_expr_unbox(inner));
+        }
+        Expr::Coalesce(inner, _) => {
+            return tc_let_init_gives_fn(box_expr_unbox(inner));
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
 // BG151/BG152: the names `val`/`var` bind to a function value in `stmts`
 // (nested blocks too, not closures) and the expression each is bound to, in
 // order (tc_let_is_fn_value).
@@ -6628,7 +6959,9 @@ fn tc_collect_lets(stmts: Vec<Stmt>, names: &mut Vec<str>, inits: &mut Vec<Expr>
     while i < stmts.len() {
         match stmts.get(i) {
             Stmt::Let(ln, lty, init, _, _, _, _) => {
-                if tc_let_is_fn_value(lty, init) {
+                // BG378: also a call's or method's result that is a
+                // function value (`val g = mk();`, `val g = v.get(0);`)
+                if tc_let_is_fn_value(lty, init) || (!tc_let_typed(lty) && tc_let_init_gives_fn(init)) {
                     names.push(ln);
                     inits.push(init);
                 }
@@ -6720,7 +7053,7 @@ pub fn scan_stmt_for_calls(stmt: Stmt, calls: &mut Vec<str>) {
         Stmt::Let(_, _, expr, _, _, _, _) => {
             scan_expr_for_calls(expr, calls);
         }
-        Stmt::LetTuple(_, expr, _) => {
+        Stmt::LetTuple(_, expr, _, _) => {
             scan_expr_for_calls(expr, calls);
         }
         Stmt::Expr(e, _) => {
@@ -6842,6 +7175,9 @@ var g_scan_dot_methods: bool = false;  // When set, scan_expr_for_calls records 
 var g_scan_asm: bool = false;  // When set, scan_expr_for_calls also records each struct literal as
 // "{Name" (the @conserve check looks for `Money { .. }`).
 var g_scan_struct_lits: bool = false;
+// BG377: when set, scan_expr_for_calls also records `spawn e` as "spawn!"
+// and `await e` as "await!" (the @realtime check forbids both).
+var g_scan_spawn: bool = false;
 pub fn scan_expr_for_calls(expr: Expr, calls: &mut Vec<str>) {
     match expr {
         Expr::Call(callee, args) => {
@@ -6991,6 +7327,15 @@ pub fn scan_expr_for_calls(expr: Expr, calls: &mut Vec<str>) {
             scan_stmts_for_calls(stmts, calls);
         }
         Expr::PipeForward(left, right) => {
+            // BG295/BG382: `x |> f` calls f (reference §4.8): a bare name on
+            // the right is recorded as the call it is
+            match box_expr_unbox(right) {
+                Expr::Ident(pf_name) => {
+                    calls.push(pf_name);
+                }
+                _ => {
+                }
+            }
             scan_expr_for_calls(box_expr_unbox(left), calls);
             scan_expr_for_calls(box_expr_unbox(right), calls);
         }
@@ -7042,9 +7387,17 @@ pub fn scan_expr_for_calls(expr: Expr, calls: &mut Vec<str>) {
             scan_expr_for_calls(box_expr_unbox(e), calls);
         }
         Expr::Await(e) => {
+            // BG377: @realtime looks for `await` (it blocks)
+            if g_scan_spawn {
+                calls.push("await!");
+            }
             scan_expr_for_calls(box_expr_unbox(e), calls);
         }
         Expr::Spawn(e) => {
+            // BG377: @realtime looks for `spawn` (it starts a thread)
+            if g_scan_spawn {
+                calls.push("spawn!");
+            }
             scan_expr_for_calls(box_expr_unbox(e), calls);
         }
         Expr::Yield(e) => {
@@ -7279,7 +7632,7 @@ fn pr_stmts(stmts: Vec<Stmt>, wrapping: bool, safe_idx: &mut Vec<str>, safe_vec:
             Stmt::Let(_, _, expr, _, _, _, _) => {
                 pr_expr(expr, wrapping, safe_idx, safe_vec, line, lines, msgs);
             }
-            Stmt::LetTuple(_, expr, _) => {
+            Stmt::LetTuple(_, expr, _, _) => {
                 pr_expr(expr, wrapping, safe_idx, safe_vec, line, lines, msgs);
             }
             Stmt::Assign(_, aop, expr, _) => {
@@ -7676,7 +8029,7 @@ pub fn scan_stmt_for_division(stmt: Stmt, sites: &mut Vec<str>) {
         Stmt::Let(_, _, expr, _, _, _, _) => {
             scan_expr_for_division(expr, sites);
         }
-        Stmt::LetTuple(_, expr, _) => {
+        Stmt::LetTuple(_, expr, _, _) => {
             scan_expr_for_division(expr, sites);
         }
         Stmt::Expr(e, _) => {
@@ -8012,7 +8365,10 @@ pub fn scan_stmt_for_while(stmt: Stmt, sites: &mut Vec<i64>) {
             scan_expr_for_while(iterator, sites);
             scan_stmts_for_while(body, sites);
         }
-        Stmt::Loop(body, _) => {
+        Stmt::Loop(body, loop_line) => {
+            // BG376: `loop { }` has no bound at all (SR-3: "No `while` or
+            // `loop` without a bound"); its site is recorded as -line - 1
+            sites.push(0 - loop_line - 1);
             scan_stmts_for_while(body, sites);
         }
         Stmt::Defer(stmts, _) => {
@@ -8358,7 +8714,20 @@ fn ct_secret_dependence(func: Func, out_lines: &mut Vec<i64>, out_msgs: &mut Vec
         before = secret.len();
         ct_propagate(func.body, &mut secret);
     }
+    // BG374: the names holding text or a collection (`==` on them stops at
+    // the first difference)
+    var seq: Vec<str> = Vec::new();
+    var si: i64 = 0;
+    while si < func.params.len() {
+        if ct_type_is_seq(func.params.get(si).ty) {
+            seq.push(func.params.get(si).name);
+        }
+        si = si + 1;
+    }
+    ct_collect_seq_lets(func.body, &mut seq);
+    g_ct_seq_names = seq;
     ct_check_stmts(func.body, secret, out_lines, out_msgs);
+    g_ct_seq_names = Vec::new();
 }
 
 fn ct_mark(secret: &mut Vec<str>, name: str) {
@@ -8580,7 +8949,7 @@ fn ct_propagate(stmts: Vec<Stmt>, secret: &mut Vec<str>) {
                     ct_mark(secret, name);
                 }
             }
-            Stmt::LetTuple(names, expr, _) => {
+            Stmt::LetTuple(names, expr, _, _) => {
                 if ct_secret(expr, secret) {
                     var ni: i64 = 0;
                     while ni < names.len() {
@@ -8761,7 +9130,7 @@ fn ct_check_stmts(stmts: Vec<Stmt>, secret: Vec<str>, out_lines: &mut Vec<i64>, 
             Stmt::Let(_, _, expr, _, _, _, _) => {
                 ct_check_expr(expr, secret, line, out_lines, out_msgs);
             }
-            Stmt::LetTuple(_, expr, _) => {
+            Stmt::LetTuple(_, expr, _, _) => {
                 ct_check_expr(expr, secret, line, out_lines, out_msgs);
             }
             Stmt::Assign(target, aop, expr, _) => {
@@ -8877,6 +9246,10 @@ fn ct_check_expr(e: Expr, secret: Vec<str>, line: i64, out_lines: &mut Vec<i64>,
                     _ => {
                     }
                 }
+                // BG374: `==` on secret text or a secret collection
+                if (binop_eq(op, BinOp::Eq) || binop_eq(op, BinOp::Neq)) && ct_seq_compare(left, right, secret) {
+                    ct_push(out_lines, out_msgs, line, "compares secret text or a secret collection with `==`/`!=`, which stops at the first difference");
+                }
             }
             ct_check_expr(left, secret, line, out_lines, out_msgs);
             ct_check_expr(right, secret, line, out_lines, out_msgs);
@@ -8893,6 +9266,10 @@ fn ct_check_expr(e: Expr, secret: Vec<str>, line: i64, out_lines: &mut Vec<i64>,
             var indexes: bool = method == "get" || method == "set" || method == "remove" || method == "insert" || method == "get_or";
             if indexes && args.len() > 0 && ct_secret(args.get(0), secret) {
                 ct_push(out_lines, out_msgs, line, "indexes memory with secret data");
+            }
+            // BG374: a search or comparison that stops at the first match
+            if ct_early_exit_method(method) && (ct_secret(box_expr_deref(recv), secret) || ct_any_secret(args, secret)) {
+                ct_push(out_lines, out_msgs, line, "searches or compares secret data with `." + method + "()`, which stops at the first match or difference");
             }
             ct_check_expr(box_expr_deref(recv), secret, line, out_lines, out_msgs);
             ct_check_exprs(args, secret, line, out_lines, out_msgs);
@@ -8973,7 +9350,11 @@ fn ct_check_expr(e: Expr, secret: Vec<str>, line: i64, out_lines: &mut Vec<i64>,
             ct_check_expr(box_expr_deref(l), secret, line, out_lines, out_msgs);
             ct_check_expr(box_expr_deref(r), secret, line, out_lines, out_msgs);
         }
-        Expr::Call(_, args) => {
+        Expr::Call(ct_callee, args) => {
+            // BG374: str_equal(a, b) and the like stop at the first difference
+            if ct_early_exit_fn(ct_callee) && ct_any_secret(args, secret) {
+                ct_push(out_lines, out_msgs, line, "compares or searches secret data with '" + ct_callee + "()', which stops at the first difference");
+            }
             ct_check_exprs(args, secret, line, out_lines, out_msgs);
         }
         Expr::EnumLit(_, _, args) => {
@@ -8998,12 +9379,149 @@ fn ct_check_expr(e: Expr, secret: Vec<str>, line: i64, out_lines: &mut Vec<i64>,
         Expr::TryBlock(b) => {
             ct_check_stmts(b, secret, out_lines, out_msgs);
         }
-        Expr::Closure(_, b, _) => {
-            ct_check_stmts(b, secret, out_lines, out_msgs);
+        Expr::Closure(cps, b, _) => {
+            // BG374: a closure of a @constant_time function may be called
+            // with a secret: its parameters (not marked @public) are secret,
+            // and a `return` before its end is an early return
+            var csecret: Vec<str> = secret.clone();
+            var cpi: i64 = 0;
+            while cpi < cps.len() {
+                if !ct_has_annotation(cps.get(cpi).annotations, "public") {
+                    ct_mark(&mut csecret, cps.get(cpi).name);
+                }
+                cpi = cpi + 1;
+            }
+            var cbefore: i64 = -1;
+            while cbefore != csecret.len() {
+                cbefore = csecret.len();
+                ct_propagate(b, &mut csecret);
+            }
+            ct_check_stmts(b, csecret, out_lines, out_msgs);
+            var cret: Vec<i64> = Vec::new();
+            ct_scan_early_returns(b, &mut cret);
+            var cri: i64 = 0;
+            while cri < cret.len() {
+                ct_push(out_lines, out_msgs, cret.get(cri), "returns early inside a closure (a `return` before the closure's end)");
+                cri = cri + 1;
+            }
         }
         _ => {
         }
     }
+}
+
+/// BG374: the secret names of a @constant_time function that hold a str,
+/// a Vec or a HashMap (parameters, and locals declared with such a type):
+/// `==` on them compares element by element and stops at the first
+/// difference. Set by ct_secret_dependence.
+var g_ct_seq_names: Vec<str> = Vec::new();
+
+fn ct_type_is_seq(t: Type) -> bool {
+    match t {
+        Type::Str => {
+            return true;
+        }
+        Type::Generic(gn, _) => {
+            return gn == "Vec" || gn == "HashMap";
+        }
+        Type::Named(nn) => {
+            return nn == "Vec" || nn == "HashMap" || nn == "String";
+        }
+        Type::Ref(inner, _) => {
+            return ct_type_is_seq(box_type_unbox(inner));
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// BG374: the locals of `stmts` declared with a str, Vec or HashMap type
+/// (nested blocks too), added to `out`.
+fn ct_collect_seq_lets(stmts: Vec<Stmt>, out: &mut Vec<str>) {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        match stmts.get(i) {
+            Stmt::Let(ln, lty, _, _, _, _, _) => {
+                match lty {
+                    OptType::Some(t) => {
+                        if ct_type_is_seq(t) {
+                            out.push(ln);
+                        }
+                    }
+                    OptType::None => {
+                    }
+                }
+            }
+            Stmt::If(_, tb, eb, _) => {
+                ct_collect_seq_lets(tb, out);
+                match eb {
+                    OptStmts::Some(b) => {
+                        ct_collect_seq_lets(b, out);
+                    }
+                    OptStmts::None => {
+                    }
+                }
+            }
+            Stmt::For(_, _, b, _) => {
+                ct_collect_seq_lets(b, out);
+            }
+            Stmt::While(_, b, _) => {
+                ct_collect_seq_lets(b, out);
+            }
+            Stmt::Loop(b, _) => {
+                ct_collect_seq_lets(b, out);
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+}
+
+/// BG374: `a == b` / `a != b` where a side is secret text or a secret
+/// collection (or a string literal against a secret): the comparison stops
+/// at the first difference, the textbook password and MAC timing leak.
+fn ct_seq_compare(l: Expr, r: Expr, secret: Vec<str>) -> bool {
+    var lsec: bool = ct_secret(l, secret);
+    var rsec: bool = ct_secret(r, secret);
+    if !lsec && !rsec {
+        return false;
+    }
+    return ct_is_seq_expr(l) || ct_is_seq_expr(r);
+}
+
+fn ct_is_seq_expr(e: Expr) -> bool {
+    match e {
+        Expr::Ident(n) => {
+            return str_vec_contains(g_ct_seq_names, n);
+        }
+        Expr::StringLit(_) => {
+            return true;
+        }
+        Expr::FString(_) => {
+            return true;
+        }
+        Expr::Ref(x, _) => {
+            return ct_is_seq_expr(box_expr_deref(x));
+        }
+        Expr::Deref(x) => {
+            return ct_is_seq_expr(box_expr_deref(x));
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// BG374: builtin methods and functions that search or compare and stop at
+/// the first match or difference.
+fn ct_early_exit_method(m: str) -> bool {
+    return m == "contains" || m == "contains_key" || m == "find" || m == "rfind" || m == "position" || m == "index_of" || m == "starts_with" || m == "ends_with" || m == "eq" || m == "cmp" || m == "compare" || m == "find_opt" || m == "position_opt" || m == "contains_val" || m == "any" || m == "all";
+}
+
+fn ct_early_exit_fn(f: str) -> bool {
+    return f == "str_equal" || f == "str_compare" || f == "str_find" || f == "str_contains" || f == "str_starts_with" || f == "str_ends_with" || f == "p_str_equal" || f == "p_bytes_eq";
 }
 
 /// Calls forbidden in @realtime code: allocation, blocking IO, spawning,
@@ -9016,6 +9534,19 @@ fn tc_rt_forbidden_call(c: str) -> bool {
 pub fn TypeChecker_verify_realtime(self: &mut TypeChecker, program: Program) {
     // @realtime: real-time deadline guarantee
     // Rejects IO/Net/Spawn effects that could block indefinitely.
+    // BG377: the program's method names (TypeChecker_realtime_forms)
+    g_tc_rt_user_methods = HashMap_new();
+    var umi: i64 = 0;
+    while umi < program.impls.len() {
+        var uimp: ImplDef = program.impls.get(umi);
+        var umk: i64 = 0;
+        while umk < uimp.methods.len() {
+            HashMap_insert(g_tc_rt_user_methods, uimp.methods.get(umk).name, 1);
+            umk = umk + 1;
+        }
+        umi = umi + 1;
+    }
+    var rt_idx: i64 = 0;
     var fi: i64 = 0;
     while fi < program.funcs.len() {
         var func: Func = program.funcs.get(fi);
@@ -9029,6 +9560,14 @@ pub fn TypeChecker_verify_realtime(self: &mut TypeChecker, program: Program) {
         }
         if is_rt {
             TypeChecker_realtime_one(self, func, func.name);
+            // BG377: recursion through other functions (`f` calls `g`
+            // calls `f`) has the same unbounded depth as a self-call
+            if rt_idx == 0 {
+                rt_idx = tc_body_index(program);
+            }
+            if tc_calls_reach(program, rt_idx, func.name, func.name) {
+                self.errors.push("Real-time error: function '" + func.name + "' is part of a recursion cycle (it calls functions that call it back). Recursion has unbounded stack depth.\n    Fix: break the cycle with a bounded `for` loop, or remove @realtime.");
+            }
         }
         fi = fi + 1;
     }
@@ -9067,8 +9606,13 @@ fn TypeChecker_realtime_one(self: &mut TypeChecker, func: Func, label: str) {
     scan_stmts_for_calls(func.body, &mut calls);
     var while_sites: Vec<i64> = Vec::new();
     scan_for_while_loops(func.body, &mut while_sites);
+    // BG376: a site below 0 is a `loop { }`
+    var rt_loop_kw: str = "while";
+    if while_sites.len() > 0 && while_sites.get(0) < 0 {
+        rt_loop_kw = "loop";
+    }
     if while_sites.len() > 0 {
-        self.errors.push("Real-time error: function '" + label + "' contains a 'while' loop. While loops have unbounded iteration counts.\n    Fix: loop a bounded number of times (`for i in 0..N { ... }`), or remove @realtime.");
+        self.errors.push("Real-time error: function '" + label + "' contains a '" + rt_loop_kw + "' loop. While loops have unbounded iteration counts.\n    Fix: loop a bounded number of times (`for i in 0..N { ... }`), or remove @realtime.");
     }
     var reported: Vec<str> = Vec::new();
     var ci: i64 = 0;
@@ -9084,6 +9628,158 @@ fn TypeChecker_realtime_one(self: &mut TypeChecker, func: Func, label: str) {
         }
         ci = ci + 1;
     }
+    TypeChecker_realtime_forms(self, func, label, reported);
+}
+
+/// BG377: the forms @realtime forbids (reference §11: no Spawn, no
+/// allocating, blocking or dynamic-dispatch call) that are no call of a
+/// listed name: `spawn` and `await`, string `+` and f-strings, an
+/// allocating builtin method (`.clone()`, `.to_str()`, `.split()`, ...)
+/// and an allocating `Type::f(..)` (`Box::new`, `Vec::with_capacity`,
+/// `Vec::filled`). Dynamic dispatch through `dyn` is checked after the
+/// bodies (TypeChecker_verify_realtime_dyn), indirect recursion in
+/// TypeChecker_verify_realtime. `reported` holds what the name scan reported.
+fn TypeChecker_realtime_forms(self: &mut TypeChecker, func: Func, label: str, reported: Vec<str>) {
+    var calls: Vec<str> = Vec::new();
+    var saved_dot: bool = g_scan_dot_methods;
+    var saved_spawn: bool = g_scan_spawn;
+    g_scan_dot_methods = true;
+    g_scan_spawn = true;
+    scan_stmts_for_calls(func.body, &mut calls);
+    g_scan_dot_methods = saved_dot;
+    g_scan_spawn = saved_spawn;
+    var afuncs: Vec<str> = tc_alloc_func_names();
+    var ameths: Vec<str> = tc_alloc_method_names();
+    var seen: Vec<str> = Vec::new();
+    var ci: i64 = 0;
+    while ci < calls.len() {
+        var c: str = calls.get(ci);
+        ci = ci + 1;
+        if tc_str_vec_contains(seen, c) {
+            continue;
+        }
+        seen.push(c);
+        if c == "spawn!" {
+            self.errors.push("Real-time error: function '" + label + "' starts a thread with `spawn`. Starting a thread allocates and goes through the scheduler, with no bound on its time.\n    Fix: start the task before the real-time part, and hand it its work over a Channel, or remove @realtime.");
+        } else if c == "await!" {
+            self.errors.push("Real-time error: function '" + label + "' waits with `await`, which blocks until another task finishes, with no bound on its time.\n    Fix: wait outside '" + label + "' and pass the result in, or remove @realtime.");
+        } else if c == ".+" {
+            self.errors.push("Real-time error: function '" + label + "' uses string `+` or an f-string, which allocates.\n    Fix: build the text outside '" + label + "', or write into a buffer made before the real-time part, or remove @realtime.");
+        } else if str_starts_with(c, ".") {
+            var m: str = str_slice(c, 1, str_len(c));
+            var user_m: bool = g_tc_rt_user_methods != 0 && HashMap_contains(g_tc_rt_user_methods, m);
+            if !user_m && tc_vec_contains_str(ameths, m) && !tc_str_vec_contains(reported, m) && !tc_rt_forbidden_call(m) {
+                self.errors.push("Real-time error: function '" + label + "' calls '." + m + "()', which allocates.\n    Fix: do that call outside '" + label + "' (before the real-time part starts), or remove @realtime.");
+            }
+        } else if c == "." + func.name || c == func.name {
+            // a method calling itself (`self.m()`) is ".m" here; a free
+            // function's self-call was reported by the name scan
+            if !tc_str_vec_contains(reported, func.name) && str_find(label, ".") >= 0 && c == "." + func.name {
+                self.errors.push("Real-time error: function '" + label + "' calls itself. Recursion has unbounded stack depth.\n    Fix: rewrite the recursion as a bounded `for` loop, or remove @realtime.");
+            }
+        } else if tc_vec_contains_str(afuncs, c) && !tc_str_vec_contains(reported, c) && !tc_rt_forbidden_call(c) {
+            var shown: str = c;
+            var us: i64 = str_find(c, "_");
+            if us > 0 && str_byte_at(c, 0) >= 65 && str_byte_at(c, 0) <= 90 {
+                shown = str_slice(c, 0, us) + "::" + str_slice(c, us + 1, str_len(c));
+            }
+            self.errors.push("Real-time error: function '" + label + "' calls '" + shown + "', which allocates.\n    Fix: do that call outside '" + label + "' (before the real-time part starts), or remove @realtime.");
+        }
+    }
+}
+
+/// BG377: the bare names of the program's impl methods, while
+/// TypeChecker_verify_realtime runs (a `.m()` of a user method is that
+/// method's, not a builtin's).
+var g_tc_rt_user_methods: i64 = 0;
+
+/// BG377: whether the functions `start` calls (through any number of
+/// calls) reach `target`: @realtime rejected only a direct self-call, so
+/// `f` calling `g` calling `f` passed.
+fn tc_calls_reach(program: Program, idx: i64, start: str, target: str) -> bool {
+    var visited: Vec<str> = Vec::new();
+    var stack: Vec<str> = Vec::new();
+    var first: Vec<str> = Vec::new();
+    match tc_find_body_indexed(program, idx, start) {
+        OptStmtList::Some(b0) => {
+            scan_stmts_for_calls(b0, &mut first);
+        }
+        OptStmtList::None => {
+            return false;
+        }
+    }
+    var fi: i64 = 0;
+    while fi < first.len() {
+        if first.get(fi) != start {
+            stack.push(first.get(fi));
+        }
+        fi = fi + 1;
+    }
+    while stack.len() > 0 {
+        var cur: str = stack.pop();
+        if cur == target {
+            return true;
+        }
+        if tc_str_vec_contains(visited, cur) {
+            continue;
+        }
+        visited.push(cur);
+        match tc_find_body_indexed(program, idx, cur) {
+            OptStmtList::Some(b) => {
+                var cs: Vec<str> = Vec::new();
+                scan_stmts_for_calls(b, &mut cs);
+                var k: i64 = 0;
+                while k < cs.len() {
+                    stack.push(cs.get(k));
+                    k = k + 1;
+                }
+            }
+            OptStmtList::None => {
+            }
+        }
+    }
+    return false;
+}
+
+/// BG377: a call through `dyn T` in a @realtime function (or method)
+/// picks the implementation at run time (reference §11: no
+/// dynamic-dispatch call). Checking the bodies recorded each such call
+/// (TypeChecker_note_trait_dispatch).
+fn TypeChecker_verify_realtime_dyn(self: &mut TypeChecker, program: Program) {
+    if g_tc_dyn_callers.len() == 0 {
+        return;
+    }
+    var rt: i64 = HashMap_new();
+    var fi: i64 = 0;
+    while fi < program.funcs.len() {
+        if tc_has_annotation(program.funcs.get(fi).annotations, "realtime") {
+            HashMap_insert(rt, program.funcs.get(fi).name, 1);
+        }
+        fi = fi + 1;
+    }
+    var ii: i64 = 0;
+    while ii < program.impls.len() {
+        var imp: ImplDef = program.impls.get(ii);
+        var mi: i64 = 0;
+        while mi < imp.methods.len() {
+            if tc_has_annotation(imp.methods.get(mi).annotations, "realtime") {
+                HashMap_insert(rt, imp.struct_name + "." + imp.methods.get(mi).name, 1);
+            }
+            mi = mi + 1;
+        }
+        ii = ii + 1;
+    }
+    var done: Vec<str> = Vec::new();
+    var k: i64 = 0;
+    while k < g_tc_dyn_callers.len() {
+        var caller: str = g_tc_dyn_callers.get(k);
+        if HashMap_contains(rt, caller) && !tc_str_vec_contains(done, caller) {
+            done.push(caller);
+            self.errors.push("Real-time error: function '" + caller + "' calls '" + g_tc_dyn_targets.get(k) + "' through `dyn`, a dynamic dispatch: which implementation runs, and how long it takes, is not known.\n    Fix: call the method on a value of a concrete type (or in a function generic over `T: Trait`), or remove @realtime.");
+        }
+        k = k + 1;
+    }
+    HashMap_drop(rt);
 }
 
 pub fn TypeChecker_verify_differentiable(self: &mut TypeChecker, program: Program) {
@@ -9959,7 +10655,7 @@ fn tf_stmt(gl: &mut TfGlobal, ctx: &mut TfCtx, s: Stmt) {
             var t: bool = tf_expr(gl, ctx, e);
             tf_bind(ctx, n, t);
         }
-        Stmt::LetTuple(ns, e, _) => {
+        Stmt::LetTuple(ns, e, _, _) => {
             var t: bool = tf_expr(gl, ctx, e);
             var i: i64 = 0;
             while i < ns.len() {
@@ -10405,6 +11101,84 @@ pub struct LoCtx {
     pub efrom: Vec<str>,
     pub eto: Vec<str>,
     pub ewhere: Vec<str>,
+    // BG235: inside a closure body, its own parameters (no named lock);
+    // the closures bound by `val c = fn ..` so far and the locks each
+    // takes, in this function's names (a call `c()` takes them)
+    pub shadow: Vec<str>,
+    pub clo_names: Vec<str>,
+    pub clo_acq: Vec<Vec<str>>,
+}
+
+/// BG413: the names of the function being summarized (lo_summary) that
+/// hold a SyncMutex or a SyncRwLock: parameters of that type, and locals
+/// declared with it or bound to `SyncMutex::new()` / `SyncRwLock::new()`.
+var g_lo_mutex_vars: Vec<str> = Vec::new();
+
+fn lo_is_mutex_type(t: Type) -> bool {
+    match t {
+        Type::Named(n) => {
+            return n == "SyncMutex" || n == "SyncRwLock";
+        }
+        Type::Ref(inner, _) => {
+            return lo_is_mutex_type(box_type_unbox(inner));
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+fn lo_is_mutex_init(e: Expr) -> bool {
+    match e {
+        Expr::MethodCall(r, m, _) => {
+            if m == "new" {
+                match box_expr_unbox(r) {
+                    Expr::Ident(tn) => {
+                        return tn == "SyncMutex" || tn == "SyncRwLock";
+                    }
+                    _ => {
+                    }
+                }
+            }
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+/// BG413: `recv.m()` with recv a SyncMutex/SyncRwLock name: the lock of
+/// `recv.handle` is taken or released.
+fn lo_mutex_method(gl: &mut LoGlobal, ctx: &mut LoCtx, recv: Expr, m: str, nargs: i64) {
+    if nargs != 0 {
+        return;
+    }
+    var take: bool = m == "lock" || m == "write_lock" || m == "read_lock";
+    var give: bool = m == "unlock" || m == "write_unlock" || m == "read_unlock";
+    if !take && !give {
+        return;
+    }
+    match recv {
+        Expr::Ident(n) => {
+            if !str_vec_contains(g_lo_mutex_vars, n) || str_vec_contains(ctx.shadow, n) {
+                return;
+            }
+        }
+        _ => {
+            return;
+        }
+    }
+    var r: str = lo_ref(gl, ctx, recv);
+    if r == "" {
+        return;
+    }
+    var lr: str = r + ".handle";
+    if take {
+        lo_take(ctx, lr);
+        ctx.held.push(lr);
+    } else {
+        lo_release(ctx, lr);
+    }
 }
 
 fn lo_acquire_name(c: str) -> bool {
@@ -10434,6 +11208,9 @@ fn lo_copy(v: Vec<str>) -> Vec<str> {
 fn lo_ref(gl: &LoGlobal, ctx: &LoCtx, e: Expr) -> str {
     match e {
         Expr::Ident(n) => {
+            if str_vec_contains(ctx.shadow, n) {
+                return "";
+            }
             var i: i64 = 0;
             while i < ctx.params.len() {
                 if ctx.params.get(i) == n {
@@ -10568,15 +11345,23 @@ fn lo_release(ctx: &mut LoCtx, l: str) {
 fn lo_summary(gl: &mut LoGlobal, fi: i64) -> i64 {
     var f: Func = gl.funcs.get(fi);
     var params: Vec<str> = Vec::new();
+    // BG413: the function's SyncMutex/SyncRwLock names
+    var lo_saved_mv: Vec<str> = g_lo_mutex_vars;
+    var lo_mv: Vec<str> = Vec::new();
     var i: i64 = 0;
     while i < f.params.len() {
         params.push(f.params.get(i).name);
+        if lo_is_mutex_type(f.params.get(i).ty) {
+            lo_mv.push(f.params.get(i).name);
+        }
         i = i + 1;
     }
+    g_lo_mutex_vars = lo_mv;
     var ctx: LoCtx = LoCtx {
-        fname: f.name, params: params, held: Vec::new(), line: 0, acq: Vec::new(), efrom: Vec::new(), eto: Vec::new(), ewhere: Vec::new()
+        fname: f.name, params: params, held: Vec::new(), line: 0, acq: Vec::new(), efrom: Vec::new(), eto: Vec::new(), ewhere: Vec::new(), shadow: Vec::new(), clo_names: Vec::new(), clo_acq: Vec::new()
     };
     lo_stmts(gl, &mut ctx, f.body);
+    g_lo_mutex_vars = lo_saved_mv;
     var size: i64 = ctx.acq.len() + ctx.efrom.len();
     gl.sums.set(fi, LoSum {
         acq: ctx.acq, efrom: ctx.efrom, eto: ctx.eto, ewhere: ctx.ewhere
@@ -10649,11 +11434,32 @@ fn lo_call(gl: &mut LoGlobal, ctx: &mut LoCtx, callee: str, args: Vec<Expr>, spa
         var r: str = lo_ref(gl, ctx, args.get(0));
         match args.get(1) {
             Expr::Ident(fname) => {
+                var wc: i64 = lo_clo_find(ctx, fname);
                 var fs: i64 = HashMap_get(gl.index, fname);
-                if r != "" && fs != 0 {
+                if r != "" && wc >= 0 {
+                    // BG235: a closure bound in this function
+                    lo_take(ctx, r);
+                    ctx.held.push(r);
+                    lo_take_all(ctx, ctx.clo_acq.get(wc));
+                    lo_release(ctx, r);
+                } else if r != "" && fs != 0 {
                     lo_take(ctx, r);
                     ctx.held.push(r);
                     lo_apply(gl, ctx, fs - 1, Vec::new(), false);
+                    lo_release(ctx, r);
+                }
+            }
+            Expr::Closure(wps, wbody, _) => {
+                // BG235: a closure literal runs with the lock held
+                if r != "" {
+                    lo_take(ctx, r);
+                    ctx.held.push(r);
+                    var wacq: Vec<str> = lo_closure(gl, ctx, wps, wbody, lo_copy(ctx.held));
+                    var wi: i64 = 0;
+                    while wi < wacq.len() {
+                        lo_add_acq(ctx, wacq.get(wi));
+                        wi = wi + 1;
+                    }
                     lo_release(ctx, r);
                 }
             }
@@ -10662,11 +11468,76 @@ fn lo_call(gl: &mut LoGlobal, ctx: &mut LoCtx, callee: str, args: Vec<Expr>, spa
         }
         return;
     }
+    // BG235: a call of a closure bound in this function takes the locks
+    // its body takes, under the locks held here (a spawned one, under none)
+    var ci: i64 = lo_clo_find(ctx, callee);
+    if ci >= 0 {
+        var csaved: Vec<str> = lo_copy(ctx.held);
+        if spawned {
+            ctx.held = Vec::new();
+        }
+        lo_take_all(ctx, ctx.clo_acq.get(ci));
+        ctx.held = csaved;
+        return;
+    }
     var slot: i64 = HashMap_get(gl.index, callee);
     if slot == 0 {
         return;
     }
     lo_apply(gl, ctx, slot - 1, args, spawned);
+}
+
+/// BG235: the closure bound to `name` in this function (its index in
+/// clo_names, the latest binding), -1 for none.
+fn lo_clo_find(ctx: &LoCtx, name: str) -> i64 {
+    var i: i64 = ctx.clo_names.len() - 1;
+    while i >= 0 {
+        if ctx.clo_names.get(i) == name {
+            return i;
+        }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+/// Take each lock of `locks` (an edge from every lock held).
+fn lo_take_all(ctx: &mut LoCtx, locks: Vec<str>) {
+    var i: i64 = 0;
+    while i < locks.len() {
+        lo_take(ctx, locks.get(i));
+        i = i + 1;
+    }
+}
+
+/// BG235: a closure's body, walked where it is written, in this function's
+/// lock names (a captured variable is this function's local or parameter;
+/// the closure's own parameters name no lock), starting with the locks
+/// `held` (none: it runs when it is called). Its order edges join this
+/// function's; the locks it takes are returned (taken where it is called).
+/// Before, the locks taken in a closure body were not checked at all.
+fn lo_closure(gl: &mut LoGlobal, ctx: &mut LoCtx, cps: Vec<Param>, body: Vec<Stmt>, held: Vec<str>) -> Vec<str> {
+    var shadow: Vec<str> = lo_copy(ctx.shadow);
+    var i: i64 = 0;
+    while i < cps.len() {
+        shadow.push(cps.get(i).name);
+        i = i + 1;
+    }
+    var cacq: Vec<Vec<str>> = Vec::new();
+    i = 0;
+    while i < ctx.clo_acq.len() {
+        cacq.push(ctx.clo_acq.get(i));
+        i = i + 1;
+    }
+    var sub: LoCtx = LoCtx {
+        fname: ctx.fname, params: lo_copy(ctx.params), held: held, line: ctx.line, acq: Vec::new(), efrom: Vec::new(), eto: Vec::new(), ewhere: Vec::new(), shadow: shadow, clo_names: lo_copy(ctx.clo_names), clo_acq: cacq
+    };
+    lo_stmts(gl, &mut sub, body);
+    i = 0;
+    while i < sub.efrom.len() {
+        lo_add_edge(ctx, sub.efrom.get(i), sub.eto.get(i), sub.ewhere.get(i));
+        i = i + 1;
+    }
+    return sub.acq;
 }
 
 fn lo_stmts(gl: &mut LoGlobal, ctx: &mut LoCtx, stmts: Vec<Stmt>) {
@@ -10707,10 +11578,37 @@ fn lo_opt_expr(gl: &mut LoGlobal, ctx: &mut LoCtx, oe: OptBoxExpr) {
 fn lo_stmt(gl: &mut LoGlobal, ctx: &mut LoCtx, s: Stmt) {
     ctx.line = stmt_line(s);
     match s {
-        Stmt::Let(_, _, e, _, _, _, _) => {
-            lo_expr(gl, ctx, e);
+        Stmt::Let(ln, lo_lty, e, _, _, _, _) => {
+            // BG413: a SyncMutex/SyncRwLock local
+            var lo_ism: bool = lo_is_mutex_init(e);
+            match lo_lty {
+                OptType::Some(lo_t) => {
+                    lo_ism = lo_ism || lo_is_mutex_type(lo_t);
+                }
+                OptType::None => {
+                }
+            }
+            if lo_ism && !str_vec_contains(g_lo_mutex_vars, ln) {
+                g_lo_mutex_vars.push(ln);
+            }
+            match e {
+                Expr::Closure(cps, cbody, _) => {
+                    // BG235: `val c = fn ..`: what c() takes
+                    var cacq: Vec<str> = lo_closure(gl, ctx, cps, cbody, Vec::new());
+                    ctx.clo_names.push(ln);
+                    ctx.clo_acq.push(cacq);
+                }
+                _ => {
+                    lo_expr(gl, ctx, e);
+                    if lo_clo_find(ctx, ln) >= 0 {
+                        // the name no longer holds that closure
+                        ctx.clo_names.push(ln);
+                        ctx.clo_acq.push(Vec::new());
+                    }
+                }
+            }
         }
-        Stmt::LetTuple(_, e, _) => {
+        Stmt::LetTuple(_, e, _, _) => {
             lo_expr(gl, ctx, e);
         }
         Stmt::Assign(_, _, e, _) => {
@@ -10826,9 +11724,13 @@ fn lo_expr(gl: &mut LoGlobal, ctx: &mut LoCtx, e: Expr) {
                 }
             }
         }
-        Expr::MethodCall(r, _, args) => {
+        Expr::MethodCall(r, lo_m, args) => {
             lo_expr(gl, ctx, box_expr_unbox(r));
             lo_exprs(gl, ctx, args);
+            // BG413: `m.lock()` / `m.unlock()` on a SyncMutex (SyncRwLock:
+            // read_/write_lock) locks `m.handle`, as SyncMutex::lock does
+            // (`sync_mutex_lock(self.handle)`); a method call took no lock
+            lo_mutex_method(gl, ctx, box_expr_unbox(r), lo_m, args.len());
         }
         Expr::Binary(_, l, r) => {
             lo_expr(gl, ctx, box_expr_unbox(l));
@@ -10902,6 +11804,11 @@ fn lo_expr(gl: &mut LoGlobal, ctx: &mut LoCtx, e: Expr) {
         }
         Expr::EnumLit(_, _, es) => {
             lo_exprs(gl, ctx, es);
+        }
+        Expr::Closure(cps, cbody, _) => {
+            // BG235: a closure written anywhere else (an argument, a
+            // spawn): its own order edges count
+            lo_closure(gl, ctx, cps, cbody, Vec::new());
         }
         _ => {
         }
@@ -11417,7 +12324,7 @@ fn pf_stmt(s: Stmt, f: &mut PfFacts) {
             pf_add_let(f, n);
             pf_expr(e, f);
         }
-        Stmt::LetTuple(ns, e, _) => {
+        Stmt::LetTuple(ns, e, _, _) => {
             var i: i64 = 0;
             while i < ns.len() {
                 pf_add_let(f, ns.get(i));
@@ -12588,7 +13495,7 @@ fn cs_stmts(stmts: Vec<Stmt>, callees: &mut Vec<str>, argss: &mut Vec<Vec<Expr>>
             Stmt::Let(_, _, e, _, _, _, _) => {
                 cs_expr(e, callees, argss);
             }
-            Stmt::LetTuple(_, e, _) => {
+            Stmt::LetTuple(_, e, _, _) => {
                 cs_expr(e, callees, argss);
             }
             Stmt::Expr(e, _) => {
@@ -13082,6 +13989,9 @@ pub fn TypeChecker_check_func(self: &mut TypeChecker, func: Func) {
     // @medical): string `+` allocates, so the typed check below reports it
     var saved_no_alloc: bool = self.in_no_alloc;
     self.in_no_alloc = has_primitive(expand_safety_primitives(func.annotations), "no-alloc");
+    // BG377: a @realtime body may not use string `+` either (typed check)
+    var saved_in_rt: bool = g_tc_in_realtime;
+    g_tc_in_realtime = tc_has_annotation(func.annotations, "realtime");
     if whole {
         self.unsafe_depth = self.unsafe_depth + 1;
     }
@@ -13091,7 +14001,12 @@ pub fn TypeChecker_check_func(self: &mut TypeChecker, func: Func) {
     }
     self.in_conserve = saved_conserve;
     self.in_no_alloc = saved_no_alloc;
+    g_tc_in_realtime = saved_in_rt;
 }
+
+/// BG377: whether the body being checked is @realtime (string `+` is no
+/// call, so the name scan of TypeChecker_realtime_one cannot see it).
+var g_tc_in_realtime: bool = false;
 
 fn TypeChecker_check_func_body(self: &mut TypeChecker, func: Func) {
     self.current_func_name = OptString::Some(func.name);
@@ -13189,7 +14104,8 @@ fn TypeChecker_check_func_body(self: &mut TypeChecker, func: Func) {
     var vp_types: Vec<Type> = Vec::new();
     var vpi: i64 = 0;
     while vpi < func.params.len() {
-        var vpt: Type = TypeChecker_resolve_type(self, func.params.get(vpi).ty);
+        // BG397: `self` (Self) is the impl's type
+        var vpt: Type = TypeChecker_resolve_type(self, TypeChecker_resolve_self_type(self, func.params.get(vpi).ty));
         var aggregate: bool = false;
         match vpt {
             Type::Generic(gn, _) => {
@@ -13201,9 +14117,13 @@ fn TypeChecker_check_func_body(self: &mut TypeChecker, func: Func) {
             _ => {
             }
         }
-        if aggregate && func.params.get(vpi).name != "self" {
+        // BG397: a by-value `self: T` is a by-value parameter too (reference
+        // §5.3): it was left out, so `self.x = 5` or `self.inc()` (an
+        // `&mut self` method) in `fn m(self: T)` changed the caller's
+        // struct, which is passed by address
+        if aggregate {
             vp_names.push(func.params.get(vpi).name);
-            vp_types.push(func.params.get(vpi).ty);
+            vp_types.push(vpt);
         }
         vpi = vpi + 1;
     }
@@ -13261,6 +14181,8 @@ fn TypeChecker_check_func_body(self: &mut TypeChecker, func: Func) {
         TypeChecker_declare(self, cp.a, ty);
         cpi = cpi + 1;
     }
+    // BG263: default parameter values (each sees the parameters before it)
+    TypeChecker_check_param_defaults(self, func);
     // Declare parameters
     var pi: i64 = 0;
     while pi < func.params.len() {
@@ -13363,8 +14285,15 @@ fn TypeChecker_check_func_body(self: &mut TypeChecker, func: Func) {
                 _ => {
                 }
             }
-            if returns_value && func.name != "main" && !stmts_always_leave(func.body) {
+            // BG334: only the program's entry `main` is exempt, not a method
+            // named main nor a `main` of an imported module
+            var bg334_entry: bool = func.name == "main" && mangled == "" && (self.current_module == "main" || self.current_module == g_tc_program_module || str_len(self.current_module) == 0);
+            if returns_value && !bg334_entry && !stmts_always_leave(func.body) {
                 self.errors.push("Type error: '" + func.name + "' is declared to return " + type_to_str(declared) + " but can reach the end of its body without returning\n    Fix: add a `return` (of a " + type_to_str(declared) + ") at the end of '" + func.name + "', or on every path that reaches it.");
+            }
+            // BG265: a `-> !` body never returns
+            if type_eq(declared, Type::Never) {
+                TypeChecker_check_never_body(self, func);
             }
         }
         OptType::None => {
@@ -13616,6 +14545,728 @@ pub fn stmts_have_break(stmts: Vec<Stmt>) -> bool {
         i = i + 1;
     }
     return false;
+}
+
+// --- tc-a (Nov 27 evening): BG261-BG470 checks, out of line ---------------
+
+/// BG261, BG262: a const's or a global's initializer has the declared type
+/// and, for an integer type, a literal fits it (reference §2.7, §3.4).
+/// Before, only a const's literal was fit-checked (BG117) and a global's
+/// initializer not at all: `const C: i64 = "abc"` made C a str and
+/// `var G: i64 = "str"` held the string's address. The initializer is
+/// checked as the module that declares it (its private functions are its
+/// own); a handle kept in an i64 (`var g: i64 = HashMap_new()`, the
+/// runtime layer's convention) stays accepted. A declaration has no line:
+/// the errors say which const or global they are about.
+fn TypeChecker_check_decl_init(self: &mut TypeChecker, name: str, declared: Type, init: Expr, what: str) {
+    var saved_module: str = self.current_module;
+    var saved_line: i64 = self.current_line;
+    var saved_fn: str = self.checking_fn;
+    match TypeChecker_get_item_module(self, name) {
+        OptString::Some(m) => {
+            self.current_module = m;
+        }
+        OptString::None => {
+        }
+    }
+    self.checking_fn = what + ":" + name;
+    self.current_line = 0;
+    var err_from: i64 = self.errors.len();
+    var want: Type = TypeChecker_resolve_type(self, declared);
+    TypeChecker_push_scope(self);
+    var got: Type = TypeChecker_check_expr_with_hint(self, init, want);
+    TypeChecker_pop_scope(self);
+    TypeChecker_check_value_fits(self, declared, got, init, 0);
+    var unknown: bool = str_len(TypeChecker_ce6_unknown_type(self, declared)) > 0;
+    var known: bool = !type_eq(got, Type::Never) && !type_eq(got, Type::Infer) && !type_eq(want, Type::Infer);
+    if known && !unknown && !TypeChecker_types_compatible(self, want, got) && !is_handle_int_pair(want, got) {
+        self.errors.push("Type error: cannot assign " + type_to_str(got) + " to " + what + " '" + name + "' of type " + type_to_str(declared) + ".\n    Expected: " + type_to_str(declared) + "\n    Found:    " + type_to_str(got) + "\n    Fix: give '" + name + "' a value of type " + type_to_str(declared) + " (for a number, cast it: `x as " + type_to_str(declared) + "`), or change its declared type.");
+    }
+    // the fit check says "(line 0)": no line is known
+    var ei: i64 = err_from;
+    while ei < self.errors.len() {
+        var e: str = self.errors.get(ei);
+        if str_starts_with(e, "Type error (line 0): ") {
+            // "Type error: <first line> (in the value of const 'C')" and the
+            // rest (Expected/Found/Fix) as it was
+            var body: str = str_slice(e, 21, str_len(e));
+            var at: str = " (in the value of " + what + " '" + name + "')";
+            var nl: i64 = str_find(body, "\n");
+            if nl >= 0 {
+                body = str_slice(body, 0, nl) + at + str_slice(body, nl, str_len(body));
+            } else {
+                body = body + at;
+            }
+            self.errors.set(ei, str_slice(e, 0, 10) + ": " + body);
+        }
+        ei = ei + 1;
+    }
+    if self.current_module != saved_module && str_len(self.current_module) > 0 && self.current_module != "main" {
+        tc_tag_module_errors(self, err_from, self.current_module);
+    }
+    self.current_module = saved_module;
+    self.current_line = saved_line;
+    self.checking_fn = saved_fn;
+}
+
+/// BG261, BG262: every const and global of the program.
+fn TypeChecker_check_decl_inits(self: &mut TypeChecker, program: Program) {
+    var ci: i64 = 0;
+    while ci < program.consts.len() {
+        var cdef: ConstDef = program.consts.get(ci);
+        TypeChecker_check_decl_init(self, cdef.name, cdef.ty, cdef.expr, "const");
+        ci = ci + 1;
+    }
+    var gi: i64 = 0;
+    while gi < program.globals.len() {
+        var g: GlobalVar = program.globals.get(gi);
+        TypeChecker_check_decl_init(self, g.name, g.ty, g.init, "global");
+        gi = gi + 1;
+    }
+}
+
+/// BG263: a parameter's default value has the parameter's type, and a
+/// literal fits it, as an argument written at the call would: the default
+/// is put in at each call that leaves the argument out, unchecked, so
+/// `x: u8 = 500` held 500 and `x: i64 = "hello"` a string's address. It is
+/// checked where the function is, in a scope of the parameters before it
+/// (BG424: `b: i64 = a * 2` names the earlier parameter `a`).
+fn TypeChecker_check_param_defaults(self: &mut TypeChecker, func: Func) {
+    var any: bool = false;
+    var di: i64 = 0;
+    while di < func.params.len() {
+        if func.params.get(di).has_default {
+            any = true;
+        }
+        di = di + 1;
+    }
+    if !any {
+        return;
+    }
+    TypeChecker_push_scope(self);
+    var pi: i64 = 0;
+    while pi < func.params.len() {
+        var p: Param = func.params.get(pi);
+        if p.has_default {
+            var want: Type = TypeChecker_resolve_self_type(self, p.ty);
+            var got: Type = TypeChecker_check_expr_with_hint(self, p.default_expr, want);
+            TypeChecker_check_value_fits(self, want, got, p.default_expr, func.line);
+            var known: bool = !type_eq(got, Type::Never) && !type_eq(got, Type::Infer) && !type_eq(want, Type::Infer) && str_len(TypeChecker_ce6_unknown_type(self, p.ty)) == 0 && !TypeChecker_type_contains_param(self, want);
+            if known && !TypeChecker_types_compatible(self, want, got) && !(is_runtime_layer(self.current_module) && is_handle_int_pair(want, got)) {
+                self.errors.push("Type error (line " + int_to_str(func.line) + "): cannot assign " + type_to_str(got) + " to parameter '" + p.name + "' of type " + type_to_str(want) + " (its default value in '" + func.name + "').\n    Expected: " + type_to_str(want) + "\n    Found:    " + type_to_str(got) + "\n    Fix: give '" + p.name + "' a default of type " + type_to_str(want) + ", or change the parameter's type.");
+            }
+        }
+        TypeChecker_declare(self, p.name, TypeChecker_resolve_self_type(self, p.ty));
+        pi = pi + 1;
+    }
+    // (the parameters are declared again, with the rest, by the caller;
+    // popping drops this scope's linear and val records with it)
+    TypeChecker_pop_scope(self);
+}
+
+/// BG265: whether `stmts` has a `return` (in a nested block too; a
+/// closure's own returns are expressions and are not looked at).
+fn tc_stmts_have_return(stmts: Vec<Stmt>) -> bool {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        match stmts.get(i) {
+            Stmt::Return(_, _) => {
+                return true;
+            }
+            Stmt::If(_, tb, eb, _) => {
+                if tc_stmts_have_return(tb) {
+                    return true;
+                }
+                match eb {
+                    OptStmts::Some(eb2) => {
+                        if tc_stmts_have_return(eb2) {
+                            return true;
+                        }
+                    }
+                    OptStmts::None => {
+                    }
+                }
+            }
+            Stmt::While(_, b, _) => {
+                if tc_stmts_have_return(b) {
+                    return true;
+                }
+            }
+            Stmt::For(_, _, b, _) => {
+                if tc_stmts_have_return(b) {
+                    return true;
+                }
+            }
+            Stmt::Loop(b, _) => {
+                if tc_stmts_have_return(b) {
+                    return true;
+                }
+            }
+            Stmt::Match(_, arms, _) => {
+                var ai: i64 = 0;
+                while ai < arms.len() {
+                    if tc_stmts_have_return(arms.get(ai).body) {
+                        return true;
+                    }
+                    ai = ai + 1;
+                }
+            }
+            Stmt::Unsafe(b, _) => {
+                if tc_stmts_have_return(b) {
+                    return true;
+                }
+            }
+            Stmt::Sandbox(b, _) => {
+                if tc_stmts_have_return(b) {
+                    return true;
+                }
+            }
+            Stmt::Txn(b, _) => {
+                if tc_stmts_have_return(b) {
+                    return true;
+                }
+            }
+            Stmt::RegionBlock(_, _, _, _, _, b, _) => {
+                if tc_stmts_have_return(b) {
+                    return true;
+                }
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// BG265: whether a call of `callee` never comes back: panic, exit, or a
+/// function declared `-> !`.
+fn TypeChecker_call_diverges(self: &TypeChecker, callee: str) -> bool {
+    if callee == "panic" || callee == "p_panic" || callee == "exit" || callee == "p_exit" || callee == "unreachable" || callee == "abort" || callee == "p_abort" || callee == "todo" || callee == "unimplemented" || callee == "process_exit" {
+        return true;
+    }
+    match TypeChecker_lookup_func_cache(self, callee) {
+        OptFuncSig::Some(sig) => {
+            return type_eq(sig.ret_ty, Type::Never);
+        }
+        OptFuncSig::None => {
+        }
+    }
+    return false;
+}
+
+/// BG265: whether running `stmts` can never reach their end: a statement
+/// in them is a call that never returns, an endless loop, or an if/else or
+/// match all of whose branches never end. (stmts_always_leave takes any
+/// trailing expression for the block's value, so it cannot tell.)
+fn TypeChecker_stmts_never_end(self: &TypeChecker, stmts: Vec<Stmt>) -> bool {
+    var i: i64 = 0;
+    while i < stmts.len() {
+        match stmts.get(i) {
+            Stmt::Expr(e, _) => {
+                match e {
+                    Expr::Call(callee, _) => {
+                        if TypeChecker_call_diverges(self, callee) {
+                            return true;
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            Stmt::Return(_, _) => {
+                return true;
+            }
+            Stmt::If(_, tb, eb, _) => {
+                match eb {
+                    OptStmts::Some(eb2) => {
+                        if TypeChecker_stmts_never_end(self, tb) && TypeChecker_stmts_never_end(self, eb2) {
+                            return true;
+                        }
+                    }
+                    OptStmts::None => {
+                    }
+                }
+            }
+            Stmt::Match(_, arms, _) => {
+                if arms.len() > 0 {
+                    var all: bool = true;
+                    var ai: i64 = 0;
+                    while ai < arms.len() {
+                        if !TypeChecker_stmts_never_end(self, arms.get(ai).body) {
+                            all = false;
+                        }
+                        ai = ai + 1;
+                    }
+                    if all {
+                        return true;
+                    }
+                }
+            }
+            Stmt::Loop(b, _) => {
+                if !stmts_have_break(b) {
+                    return true;
+                }
+            }
+            Stmt::While(cond, b, _) => {
+                match cond {
+                    Expr::BoolLit(cb) => {
+                        if cb && !stmts_have_break(b) {
+                            return true;
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            Stmt::Unsafe(b, _) => {
+                if TypeChecker_stmts_never_end(self, b) {
+                    return true;
+                }
+            }
+            Stmt::Sandbox(b, _) => {
+                if TypeChecker_stmts_never_end(self, b) {
+                    return true;
+                }
+            }
+            Stmt::Txn(b, _) => {
+                if TypeChecker_stmts_never_end(self, b) {
+                    return true;
+                }
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// BG265: a `-> !` function never returns (reference §2.1): no `return` in
+/// it, and no path to the end of its body. Its callers' missing-return
+/// check trusts that a call of it leaves, so a body that came back made
+/// them fall off their end with no value.
+fn TypeChecker_check_never_body(self: &mut TypeChecker, func: Func) {
+    // a `return` in it is already an error ("'f' returns void but is
+    // declared to return never", TypeChecker_check_return_type)
+    if tc_stmts_have_return(func.body) {
+        return;
+    }
+    if !TypeChecker_stmts_never_end(self, func.body) {
+        self.errors.push("Type error: '" + func.name + "' is declared `-> !` (it never returns) but can return: control can reach the end of its body\n    Fix: end every path with a call that does not return (`panic(..)`, `exit(..)` or another `-> !` function) or an endless `loop`, or declare the type it returns.");
+    }
+}
+
+/// BG288: a closure declared to return a value must not fall off the end
+/// of its body, as a named function must not (E047; reference §2.1).
+fn TypeChecker_check_closure_returns(self: &mut TypeChecker, body: Vec<Stmt>, ret_ty: OptType) {
+    match ret_ty {
+        OptType::Some(rt) => {
+            var t: Type = TypeChecker_resolve_self_type(self, rt);
+            match t {
+                Type::Void => {
+                    return;
+                }
+                Type::Never => {
+                    return;
+                }
+                Type::Infer => {
+                    return;
+                }
+                _ => {
+                }
+            }
+            if !stmts_always_leave(body) {
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): the closure is declared to return " + type_to_str(t) + " but can reach the end of its body without returning\n    Fix: add a `return` (of a " + type_to_str(t) + ") at the end of the closure's body, or on every path that reaches it.");
+            }
+        }
+        OptType::None => {
+        }
+    }
+}
+
+/// BG280: the error for a map whose key type is a float, "" for any other
+/// key: a float key is hashed and compared as a string address by the
+/// compiled backends (a crash in hm_hash) and merged by `fid run`.
+fn TypeChecker_float_key_error(self: &TypeChecker, key: Type) -> str {
+    var k: Type = TypeChecker_resolve_type(self, key);
+    if type_eq(k, Type::F64) || type_eq(k, Type::F32) {
+        return "Type error (line " + int_to_str(self.current_line) + "): a HashMap key cannot be " + type_to_str(k) + ": float keys are not supported (a float is not hashed by its value).\n    Fix: key the map by an integer or a string made from the number (`(x * 1000.0) as i64`, or `f\"{x}\"`).";
+    }
+    // BG343: a Vec key is hashed and compared as its handle, so two equal
+    // Vecs were two keys (`==` on Vecs compares the elements)
+    match k {
+        Type::Generic(gn, _) => {
+            if gn == "Vec" {
+                return "Type error (line " + int_to_str(self.current_line) + "): a HashMap key cannot be " + type_to_str(k) + ": Vec keys are not supported (a Vec key is hashed by its handle, not its elements).\n    Fix: key the map by a string made from the elements (`f\"{v}\"`), or by a tuple or struct of the values.";
+            }
+        }
+        _ => {
+        }
+    }
+    return "";
+}
+
+/// BG289: `&mut x` of a `val x` holding a number, bool or string lets `*r =
+/// v` (or a `&mut` parameter) assign x again, which `x = v` may not
+/// (reference §5.1). A `val` Vec, map or struct may still be changed
+/// through `&mut` (as by its methods): only its name is fixed.
+fn TypeChecker_check_mut_ref_val(self: &mut TypeChecker, e: Expr) {
+    match e {
+        Expr::Ident(name) => {
+            if !TypeChecker_is_val(self, name) {
+                return;
+            }
+            match TypeChecker_lookup(self, name) {
+                OptType::Some(ty) => {
+                    var t: Type = TypeChecker_resolve_type(self, ty);
+                    if TypeChecker_is_integer(self, t) || TypeChecker_is_float(self, t) || type_eq(t, Type::Bool) || type_eq(t, Type::Str) {
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot assign to '" + name + "' through `&mut " + name + "`: it is declared with `val`.\n    Fix: declare it with `var` if you need to change it through a reference.");
+                    }
+                }
+                OptType::None => {
+                }
+            }
+        }
+        _ => {
+        }
+    }
+}
+
+/// BG291: declare a name a `for`, a closure parameter or a match pattern
+/// binds. Like a `var`, it shadows an outer `val` of the same name (as
+/// Stmt::Let records "!name"), so assigning it is not taken for assigning
+/// that `val`.
+fn TypeChecker_declare_shadow(self: &mut TypeChecker, name: str, ty: Type) {
+    TypeChecker_declare(self, name, ty);
+    if self.val_vars_per_scope.len() > 0 {
+        var scope: Vec<str> = self.val_vars_per_scope.pop();
+        str_vec_remove(&mut scope, name);
+        str_vec_remove(&mut scope, "!" + name);
+        scope.push("!" + name);
+        self.val_vars_per_scope.push(scope);
+    }
+}
+
+/// BG292: the module item `key` (a struct, enum, type alias, or a method
+/// as `Type_m`) is private to, when that is not the current module; ""
+/// when it is visible here. The compiler's own modules (compiler::*) and
+/// core are left out: their structs and methods were never held to it.
+fn TypeChecker_item_hidden(self: &TypeChecker, key: str) -> str {
+    var vslot: i64 = HashMap_get(self.item_visibility_index, key);
+    if vslot == 0 {
+        return "";
+    }
+    if self.item_visibility.get(vslot - 1).val {
+        return "";
+    }
+    match TypeChecker_get_item_module(self, key) {
+        OptString::Some(m) => {
+            if m == self.current_module || str_len(m) == 0 || str_starts_with(m, "compiler") || m == "core" || str_starts_with(self.current_module, "compiler") {
+                return "";
+            }
+            return m;
+        }
+        OptString::None => {
+        }
+    }
+    return "";
+}
+
+/// BG292: a private struct, enum or type alias of another module used by
+/// name (reference §2.9: an item without `pub` used from another module
+/// is an error); `what` says how ("struct", "enum", "type").
+fn TypeChecker_check_item_visible(self: &mut TypeChecker, name: str, what: str) {
+    var m: str = TypeChecker_item_hidden(self, name);
+    if str_len(m) > 0 {
+        self.errors.push("Visibility error: " + what + " '" + name + "' is private to module '" + m + "' (not accessible from '" + self.current_module + "')\n    Fix: mark it `pub` in module '" + m + "', or use a public function of that module instead.");
+    }
+}
+
+/// BG292: a method of another module's type called without `pub`.
+fn TypeChecker_check_method_visible(self: &mut TypeChecker, owner: str, method: str) {
+    var m: str = TypeChecker_item_hidden(self, owner + "_" + method);
+    if str_len(m) > 0 {
+        self.errors.push("Visibility error: method '" + owner + "." + method + "' is private to module '" + m + "' (not accessible from '" + self.current_module + "')\n    Fix: mark it `pub fn` in module '" + m + "', or use a public method of that type instead.");
+    }
+}
+
+/// BG292: a declared type naming a private struct, enum or alias of
+/// another module (`val z: PrivAlias = 3`), at any depth.
+fn TypeChecker_check_type_visible(self: &mut TypeChecker, t: Type) {
+    match t {
+        Type::Named(n) => {
+            TypeChecker_check_item_visible(self, n, "type");
+        }
+        Type::Generic(gn, gargs) => {
+            TypeChecker_check_item_visible(self, gn, "type");
+            var i: i64 = 0;
+            while i < gargs.len() {
+                TypeChecker_check_type_visible(self, gargs.get(i));
+                i = i + 1;
+            }
+        }
+        Type::Ref(inner, _) => {
+            TypeChecker_check_type_visible(self, box_type_unbox(inner));
+        }
+        _ => {
+        }
+    }
+}
+
+/// BG293: a private field of another module's struct written (`p.y = 9`)
+/// or given in a struct literal (`Pt { y: 6 }`), as reading it is an
+/// error (E078, reference §2.2).
+fn TypeChecker_check_private_field_write(self: &mut TypeChecker, sname: str, field: str) {
+    var pidx: i64 = HashMap_get(self.private_fields, sname + "." + field);
+    if pidx <= 0 {
+        return;
+    }
+    var struct_module: str = self.private_field_modules.get(pidx - 1);
+    if struct_module == self.current_module || str_starts_with(struct_module, "compiler") {
+        return;
+    }
+    self.errors.push("Privacy error: field '" + field + "' of struct '" + sname + "' is private. It was defined in module '" + struct_module + "', which is not the current module '" + self.current_module + "', so it cannot be set here.\n    Fix: mark the field `pub` in module '" + struct_module + "', or use a public function of that module to set it.");
+}
+
+/// BG297: `break` / `continue` apply to the innermost loop (reference
+/// §5.4); outside any loop the lowering dropped them, so the code meant to
+/// be skipped ran.
+fn TypeChecker_check_loop_jump(self: &mut TypeChecker, what: str, line: i64) {
+    if self.loop_depth > 0 {
+        return;
+    }
+    var l: i64 = line;
+    if l <= 0 {
+        l = self.current_line;
+    }
+    self.errors.push("Type error (line " + int_to_str(l) + "): `" + what + "` outside a loop\n    Fix: remove it, or put it in the body of a `while`, `for` or `loop` (to leave the function early, use `return`).");
+}
+
+/// BG414: a match guard `if g` is a condition, as an `if`'s is (E045):
+/// bool, i32 or i64. Before, its type was ignored and a str, struct or
+/// float guard silently never let its arm run.
+fn TypeChecker_check_guard(self: &mut TypeChecker, g: Expr) {
+    var gt: Type = TypeChecker_check_expr(self, g);
+    var r: Type = TypeChecker_resolve_type(self, gt);
+    if !type_eq(r, Type::Bool) && !type_eq(r, Type::I32) && !type_eq(r, Type::I64) && !type_eq(r, Type::Infer) && !TypeChecker_is_reported(self, r) {
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): if condition must be bool, got " + type_to_str(r) + " (the guard `if ...` of a match arm)\n    Fix: compare to get a bool, e.g. `3 if x != 0 => ...` or `s if s != \"\" => ...`.");
+    }
+}
+
+/// BG324: whether `name` (a function, or a method as `T_m`) belongs to
+/// the program being linted, not to a module it imports: the
+/// unused-import lint looks only at the calls the program itself makes
+/// (an imported module's own calls of its functions made every import
+/// look used). Everything counts when no program was registered.
+fn tc_lint_is_program_item(self: &TypeChecker, name: str) -> bool {
+    if HashMap_len(self.last_fn_names) == 0 {
+        return true;
+    }
+    return HashMap_contains(self.last_fn_names, name);
+}
+
+/// BG324: whether const or global `name` is the program's own.
+fn tc_lint_is_program_decl(self: &TypeChecker, name: str) -> bool {
+    if HashMap_len(self.last_fn_names) == 0 {
+        return true;
+    }
+    match TypeChecker_get_item_module(self, name) {
+        OptString::Some(m) => {
+            return m == g_tc_program_module || m == "main";
+        }
+        OptString::None => {
+        }
+    }
+    return true;
+}
+
+// BG470: the runtime builtins (`p_*` names some backend implements), built
+// once. Generated Nov 27 from the names the interpreter (interp.fd), the
+// lowering (lower.fd), the C generator (codegen_c.fd, its runtime's
+// definitions included), pe_ir, nat_ir, wasm and ir.fd know and from the
+// `fn p_X` / `fn pert_X` of stdlib and the runtimes (p_remove left out:
+// only effect tables name it). A builtin added to a backend later must be
+// added here too, or a program's own call of it is "no runtime has a
+// builtin of that name" (only the program's own module is checked).
+var g_tc_builtins: i64 = 0;
+
+fn tc_builtin_names() -> str {
+    var s: str = "";
+    s = s + "p_abs p_acos_user p_acpi_shutdown p_add_i64 p_add_u64 p_all_gather p_all_reduce p_alloc ";
+    s = s + "p_alloc_chunk p_alloc_recommit p_alloc_thread_end p_alloc_trim p_allocator_alloc ";
+    s = s + "p_allocator_create p_allocator_free p_allocator_stats p_arena_restore p_arena_save ";
+    s = s + "p_argc p_argv p_argv__raw p_asin_user p_assert p_ata_read p_ata_write p_atan p_atan2 ";
+    s = s + "p_atan2_user p_atan_user p_atomic_ p_atomic_add p_atomic_cas p_atomic_load ";
+    s = s + "p_atomic_store p_atomic_sub p_atomic_xchg32 p_auto_user p_autograd_backward ";
+    s = s + "p_autograd_begin p_autograd_end p_bool p_bool_to_str p_break_user p_broadcast p_byte_of ";
+    s = s + "p_bytes p_bytes_eq p_c_ p_c__snprintf p_c_abort p_c_abs p_c_bsearch p_c_calloc ";
+    s = s + "p_c_clock_gettime p_c_cos p_c_exit p_c_exp p_c_fid_proc_close_in p_c_fid_proc_code ";
+    s = s + "p_c_fid_proc_free p_c_fid_proc_kill p_c_fid_proc_pid p_c_fid_proc_read ";
+    s = s + "p_c_fid_proc_spawn p_c_fid_proc_spawn_io p_c_fid_proc_wait p_c_fid_proc_write p_c_fmod ";
+    s = s + "p_c_free p_c_getchar p_c_getenv p_c_getgid p_c_getpagesize p_c_getpid p_c_getppid ";
+    s = s + "p_c_getuid p_c_labs p_c_log p_c_malloc p_c_memcmp p_c_memcpy p_c_memmove p_c_memset ";
+    s = s + "p_c_nat_fma p_c_p_co_stack p_c_pledge_asset_load_font p_c_pledge_asset_load_mesh ";
+    s = s + "p_c_pledge_asset_load_sound p_c_pledge_asset_load_texture p_c_pledge_asset_mtime ";
+    s = s + "p_c_pledge_asset_unload p_c_pledge_net_bind p_c_pledge_net_close p_c_pledge_net_connect ";
+    s = s + "p_c_pledge_net_inet_addr p_c_pledge_net_recv p_c_pledge_net_recvfrom ";
+    s = s + "p_c_pledge_net_send p_c_pledge_net_sendto p_c_pledge_net_set_nonblocking ";
+    s = s + "p_c_pledge_net_set_recv_timeout p_c_pledge_net_socket p_c_pow p_c_printf p_c_putchar ";
+    s = s + "p_c_puts p_c_qsort p_c_raise p_c_sin p_c_strcmp p_c_strlen p_c_sysconf p_c_system ";
+    s = s + "p_c_tan p_calloc_user p_cap_revoke p_cap_revoked p_case_user p_ceil p_ceil_user p_chan_ ";
+    s = s + "p_chan_close p_chan_create p_chan_is_closed p_chan_recv p_chan_send p_chan_try_recv ";
+    s = s + "p_chan_try_recv_into p_chan_try_send p_char p_char_to_str p_char_user p_checkpoint_ ";
+    s = s + "p_checkpoint_begin p_checkpoint_end p_cli p_clock p_clock_mono_ms p_clock_now ";
+    s = s + "p_clock_now_ms p_clock_now_us p_clock_user p_cmos_read p_cmos_write p_co_ p_co_accept ";
+    s = s + "p_co_async p_co_async_v p_co_connect p_co_detach p_co_done p_co_go p_co_pool_call ";
+    s = s + "p_co_recv p_co_result p_co_run p_co_send p_co_sleep p_co_spawn_v p_co_stack p_co_tick ";
+    s = s + "p_co_wait_fd p_co_worker p_co_workers p_co_yield p_const_user p_context_restore ";
+    s = s + "p_context_save p_continue_user p_copy p_copy_words p_cos p_cos_user p_cpuid ";
+    s = s + "p_cpuid_leaf p_cr0_read p_cr0_write p_cr2_read p_cr3_read p_cr3_write p_cr4_read ";
+    s = s + "p_cr4_write p_crash_report p_ctx_switch_bench p_db_ p_db_connect p_db_exec p_db_get ";
+    s = s + "p_db_get__raw p_db_mem_close p_db_mem_exec p_db_mem_find p_db_mem_open p_db_mem_query ";
+    s = s + "p_db_mem_query__raw p_db_query p_db_set p_default_user p_dequantize p_dequantize_q8 ";
+    s = s + "p_dir_ p_dir_list p_dir_list__raw p_div p_dl_ p_dl_call p_dl_close p_dl_find p_dl_load ";
+    s = s + "p_dl_open p_dl_sym p_dl_unload p_dns_ p_do_user p_double_user p_dp_ p_dp_budget_ ";
+    s = s + "p_dp_budget_check p_dp_budget_reset p_dp_noise p_dropout p_ecs_add p_ecs_create_entity ";
+    s = s + "p_ecs_entity_count p_ecs_find_component p_ecs_get p_ecs_get_or_create_component ";
+    s = s + "p_ecs_has p_ecs_remove p_else_user p_enter_user_mode p_enum_user p_env_ p_eprint ";
+    s = s + "p_eprint_str p_exec p_executor_block_on p_executor_cancel p_executor_new ";
+    s = s + "p_executor_poll_all p_executor_run_all p_executor_spawn p_executor_spawn_v p_exit ";
+    s = s + "p_exit_now p_exp p_exp_user p_extern_user p_f32_from_bits p_f32_to_bits p_f64_from_bits ";
+    s = s + "p_f64_to_bits p_fabs p_fabs_user p_fb_fill p_fb_init p_fb_plot p_file_ p_file_append ";
+    s = s + "p_file_append_vec p_file_delete p_file_exists p_file_hash p_file_mtime_ms p_file_read ";
+    s = s + "p_file_read_ p_file_read__raw p_file_read_at p_file_read_bytes p_file_size p_file_write ";
+    s = s + "p_file_write_bin p_file_write_vec p_find_quant_params p_find_quant_params__raw p_float ";
+    s = s + "p_float_to_int p_float_to_str p_float_user p_floor p_floor_user p_flush p_flush_stdout ";
+    s = s + "p_fmod_user p_for_user p_free p_free_user p_fs_ p_fs_copy_file p_fs_map p_fs_read_async ";
+    s = s + "p_fs_unmap p_future_ p_future_poll p_future_ready p_gaussian_ p_gaussian_noise ";
+    s = s + "p_gdt_set_entry p_get_grad p_get_rbp p_get_rsp p_getenv p_getenv__raw p_getpid ";
+    s = s + "p_goto_user p_grad_ p_grad_count p_grad_get p_grad_zero p_gt_current p_gt_get_result ";
+    s = s + "p_gt_is_done p_gt_reset p_gt_run_all p_gt_spawn p_gt_yield p_hash p_hlt p_hpet_read ";
+    s = s + "p_hpet_write p_http_ p_http_build_response p_http_build_response__raw p_http_listen ";
+    s = s + "p_http_parse_request p_http_parse_request__raw p_http_reason p_http_recv_request ";
+    s = s + "p_http_send_response p_idt_set_entry p_if_user p_inb p_inl p_inline_user p_int ";
+    s = s + "p_int_to_float p_int_user p_intern_str p_invlpg p_inw p_io_spawn p_io_worker ";
+    s = s + "p_ioapic_read p_ioapic_write p_is_dir p_is_space_at p_is_ws_c p_isalpha_user ";
+    s = s + "p_isdigit_user p_isspace_user p_json_ p_json_append p_json_append_float ";
+    s = s + "p_json_append_int p_json_at p_json_at__raw p_json_dump p_json_dump__raw ";
+    s = s + "p_json_dump_pretty p_json_get p_json_get__raw p_json_get_bool p_json_get_float ";
+    s = s + "p_json_get_int p_json_len p_json_new_array p_json_new_object p_json_object_get ";
+    s = s + "p_json_parse p_json_parse__raw p_json_pretty p_json_pretty__raw p_json_set ";
+    s = s + "p_json_set_bool p_json_set_float p_json_set_int p_json_string p_json_string__raw ";
+    s = s + "p_json_type p_kv_cache_ p_kv_cache_append p_kv_cache_clear p_kv_cache_evict ";
+    s = s + "p_kv_cache_get p_kv_cache_len p_kv_cache_new p_lapic_eoi p_lapic_read p_lapic_write ";
+    s = s + "p_leak_exit p_leak_free p_leak_malloc p_lgdt p_lidt p_lim_give p_lim_take ";
+    s = s + "p_lim_watch_main p_limits_boot p_ln p_log_user p_long_user p_malloc p_malloc_persistent ";
+    s = s + "p_malloc_uninit p_malloc_user p_map_ p_map_clear p_map_clone p_map_contains p_map_get ";
+    s = s + "p_map_get_or p_map_insert p_map_is_empty p_map_keys p_map_len p_map_new p_map_remove ";
+    s = s + "p_map_set p_map_values p_math p_max p_mem p_mem_copy p_mem_find p_mem_find_byte ";
+    s = s + "p_mem_find_byte_tail p_mem_read16 p_mem_read32 p_mem_read64 p_mem_read8 p_mem_resident ";
+    s = s + "p_mem_write16 p_mem_write32 p_mem_write64 p_mem_write8 p_memcpy_user p_memset ";
+    s = s + "p_memset_user p_min p_mkdir p_mmap_anon p_mmap_file p_mmap_find p_mmap_len p_mmap_slot ";
+    s = s + "p_msr_read p_msr_write p_msync p_mul_i64 p_mul_u32 p_mul_u64 p_munmap p_mutex_ ";
+    s = s + "p_mutex_init p_mutex_lock p_mutex_unlock p_net_ p_net_close p_net_connect ";
+    s = s + "p_net_connect_sync p_net_read p_net_send_file p_net_write p_os_random_u64 p_outb p_outl ";
+    s = s + "p_outw p_page_map p_page_unmap p_panic p_parse p_pci_read p_pci_write p_phys_read16 ";
+    s = s + "p_phys_read32 p_phys_read64 p_phys_read8 p_phys_write16 p_phys_write32 p_phys_write64 ";
+    s = s + "p_phys_write8 p_pic_eoi p_pic_mask p_pic_remap p_pit_set_frequency p_poller_main ";
+    s = s + "p_pool_main p_pow p_pow2_at_least p_pow_user p_print p_print_bool p_print_float ";
+    s = s + "p_print_int p_print_line_begin p_print_line_end p_print_map p_print_newline p_print_str ";
+    s = s + "p_print_tensor p_print_vec p_printf p_prng_gaussian p_prng_next p_prng_uniform ";
+    s = s + "p_process_ p_process_close p_process_code p_process_run p_process_stderr ";
+    s = s + "p_process_stderr__raw p_process_stdout p_process_stdout__raw p_prof_ p_prof_boot ";
+    s = s + "p_prof_exit p_prof_report p_prof_sampler_main p_prof_samples p_prof_start p_prof_stop ";
+    s = s + "p_prof_watch_main p_qmatmul p_quantize p_quantize_q8 p_rand_user p_rc_ p_rc_decr ";
+    s = s + "p_rc_incr p_rdmsr_gs_base p_read_line p_read_line__raw p_read_stdin p_read_stdin__raw ";
+    s = s + "p_realloc_user p_recv_tensor p_regex_match p_region_free p_region_word p_register_user ";
+    s = s + "p_remove_user p_rename p_requires_grad p_restrict_user p_return_user p_ring3_enter ";
+    s = s + "p_rmdir p_round p_round_user p_sandbox_enter p_sandbox_exit p_sb_ p_sb_append p_sb_free ";
+    s = s + "p_sb_len p_sb_new p_sb_to_str p_sb_to_str__raw p_scatter p_send_copy p_send_tensor ";
+    s = s + "p_sens_find p_sens_ld p_sens_st p_sens_table p_sensitive p_sensitive_check ";
+    s = s + "p_sensitive_free p_sensitive_mark p_sensitive_remark p_sensitive_unmark ";
+    s = s + "p_sensitive_wipes p_serial_available p_serial_getc p_serial_init p_serial_putc ";
+    s = s + "p_serial_read p_serial_ready p_serial_write p_set_checkpoint p_set_max_recursion ";
+    s = s + "p_setenv p_shared_ p_shared_alloc p_short_user p_signal_ p_signal_check p_signal_raise ";
+    s = s + "p_signal_register p_signal_trampoline p_signed_user p_simd_ p_simd_add p_simd_div ";
+    s = s + "p_simd_dot p_simd_from_vec p_simd_mul p_simd_scale p_simd_sub p_simd_sum p_simd_to_str ";
+    s = s + "p_simd_to_str__raw p_sin p_sin_user p_sizeof_user p_slen p_socket p_socket_ ";
+    s = s + "p_socket_accept p_socket_close p_socket_listen p_socket_nonblock p_socket_poll ";
+    s = s + "p_socket_read p_socket_recv_str p_socket_recv_str__raw p_socket_write ";
+    s = s + "p_socket_write_str p_spawn p_spawn_process p_sqlite3_ p_sqlite3_column_double ";
+    s = s + "p_sqlite3_column_name p_sqlite3_column_text p_sqlite3_column_type p_sqlite3_errmsg ";
+    s = s + "p_sqlite3_free p_sqlite3_prepare_v2 p_sqlite3_step p_sqrt p_sqrt_user p_srand_user ";
+    s = s + "p_static_user p_stdin_eof p_sti p_str p_str_ p_str_adopt p_str_alloc p_str_alloc_c ";
+    s = s + "p_str_alloc_uninit p_str_append p_str_buf p_str_cmp p_str_compare p_str_concat ";
+    s = s + "p_str_concat_int p_str_copy p_str_copy_c p_str_copy_n p_str_count_of p_str_cstr_len ";
+    s = s + "p_str_equal p_str_free p_str_free_c p_str_from_bytes_c p_str_from_ptr p_str_give ";
+    s = s + "p_str_has_header p_str_hash p_str_hdr_c p_str_hdr_len p_str_join_n p_str_join_n__raw ";
+    s = s + "p_str_len p_str_len_word p_str_length p_str_literal_dup p_str_map_case p_str_no_header ";
+    s = s + "p_str_own_c p_str_own_libc_c p_str_send_copy p_str_take p_str_to_float p_str_to_int ";
+    s = s + "p_str_zeroize p_strcat_user p_strcmp_user p_strcpy_user p_string_ p_string_bytes ";
+    s = s + "p_string_char_at p_string_char_at__raw p_string_clone p_string_contains p_string_copy ";
+    s = s + "p_string_ends_with p_string_find p_string_from p_string_from__raw p_string_is_empty ";
+    s = s + "p_string_len p_string_parse_int p_string_push_str p_string_push_str__raw ";
+    s = s + "p_string_repeat p_string_repeat__raw p_string_replace p_string_replace__raw ";
+    s = s + "p_string_rfind p_string_slice p_string_slice__raw p_string_split p_string_starts_with ";
+    s = s + "p_string_substring p_string_substring__raw p_string_to_lowercase ";
+    s = s + "p_string_to_lowercase__raw p_string_to_str p_string_to_string p_string_to_uppercase ";
+    s = s + "p_string_to_uppercase__raw p_string_trim p_string_trim__raw p_strlen_user p_struct_user ";
+    s = s + "p_sub_i64 p_sub_u64 p_swapgs p_switch_user p_syscall_set_handler p_system p_tan ";
+    s = s + "p_tan_user p_task_ p_task_chain p_task_is_ready p_task_poll p_task_poll_nonblocking ";
+    s = s + "p_task_set_token p_task_token p_tcp_ p_tensor_ p_tensor_add p_tensor_at p_tensor_clone ";
+    s = s + "p_tensor_dot p_tensor_filled p_tensor_from p_tensor_from_vec p_tensor_get p_tensor_len ";
+    s = s + "p_tensor_matmul p_tensor_max p_tensor_mean p_tensor_min p_tensor_mul p_tensor_ndim ";
+    s = s + "p_tensor_new p_tensor_ones p_tensor_relu p_tensor_reshape p_tensor_scale p_tensor_set ";
+    s = s + "p_tensor_shape p_tensor_sigmoid p_tensor_size p_tensor_softmax p_tensor_sub ";
+    s = s + "p_tensor_sum p_tensor_to_json p_tensor_to_json__raw p_tensor_to_str ";
+    s = s + "p_tensor_to_str__raw p_tensor_transpose p_tensor_zeros p_thread_ p_thread_join ";
+    s = s + "p_thread_main p_thread_register p_thread_spawn p_thread_spawn_v p_thread_wrapper ";
+    s = s + "p_time_user p_tls_ p_tls_create p_tls_get p_tls_set p_to_str p_to_str__raw ";
+    s = s + "p_to_str_bool p_to_str_bool__raw p_to_str_float p_to_str_float__raw p_to_str_map ";
+    s = s + "p_to_str_str p_to_str_str__raw p_to_str_vec p_tolower_user p_toupper_user p_tp_ ";
+    s = s + "p_tp_exit p_tp_init p_tp_rank p_tp_world_size p_tss_init p_tss_load p_type_name ";
+    s = s + "p_typedef_user p_udp_ p_union_user p_unix_ p_unix_connect p_unix_listen p_unsigned_user ";
+    s = s + "p_vblk_cmpz p_vblk_copy p_vblk_diff p_vblk_find p_vec_ p_vec_capacity p_vec_clear ";
+    s = s + "p_vec_clone p_vec_contains p_vec_extend p_vec_first p_vec_get p_vec_insert ";
+    s = s + "p_vec_is_empty p_vec_last p_vec_len p_vec_new p_vec_new_with p_vec_pop p_vec_push ";
+    s = s + "p_vec_push_str p_vec_remove p_vec_resize p_vec_reverse p_vec_set p_vec_sort ";
+    s = s + "p_vec_to_str p_vec_truncate p_vec_zeroize p_void_user p_volatile_ p_volatile_load ";
+    s = s + "p_volatile_load16 p_volatile_load32 p_volatile_load8 p_volatile_store ";
+    s = s + "p_volatile_store16 p_volatile_store32 p_volatile_store8 p_volatile_user p_while_user ";
+    s = s + "p_worker_main p_write p_wrmsr_gs_base p_wrmsr_kernel_gs_base p_zero p_zero_words ";
+    return s;
+}
+
+/// BG470: whether `name` is a runtime builtin.
+fn tc_is_runtime_builtin(name: str) -> bool {
+    if g_tc_builtins == 0 {
+        g_tc_builtins = HashMap_new();
+        var names: Vec<str> = str_split(tc_builtin_names(), " ");
+        var i: i64 = 0;
+        while i < names.len() {
+            if str_len(names.get(i)) > 0 {
+                HashMap_insert(g_tc_builtins, names.get(i), 1);
+            }
+            i = i + 1;
+        }
+    }
+    return HashMap_contains(g_tc_builtins, name);
+}
+
+/// BG470: a call of a `p_` name no runtime has (`p_bogus_xyz(1)`, or
+/// `p_remove`, which reference.md names) was typed i64 and failed later,
+/// differently on each backend. Checked in the program's own module only:
+/// the standard library and the compiler call the runtime they are built
+/// with.
+fn TypeChecker_check_runtime_builtin(self: &mut TypeChecker, callee: str) {
+    var own: bool = self.current_module == "main" || (self.current_module == g_tc_program_module && !g_tc_program_in_std && !str_starts_with(self.current_module, "compiler"));
+    if !own || tc_is_runtime_builtin(callee) {
+        return;
+    }
+    if TypeChecker_first_report(self, callee + "()") {
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): undefined function '" + callee + "': no runtime has a builtin of that name\n    Fix: check the name, or call the library function that wraps the builtin (`read_file`, `env_var`, ...); a C function is declared with `extern fn`.");
+    }
 }
 
 // --- Scope operations ----------------------------------------------------
@@ -15138,6 +16789,13 @@ fn tc_cast_dst_is_value(self: &TypeChecker, t: Type) -> bool {
             return true;
         }
         Type::ShapedTensor(_, _) => {
+            return true;
+        }
+        Type::Func(_, _) => {
+            // BG367: a function value is called with no `unsafe`, so one
+            // made from an integer or a raw pointer (`12345 as fn(i64) ->
+            // i64`) is a jump to any address (a raw pointer, unlike it,
+            // cannot be used without `unsafe`)
             return true;
         }
         Type::Named(n) => {
@@ -16747,6 +18405,12 @@ fn TypeChecker_check_param_change(self: &mut TypeChecker, root: str) {
                 OptString::None => {
                 }
             }
+            if root == "self" {
+                // BG397: a by-value receiver
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): 'self' is a by-value receiver" + in_fn + " and cannot be changed: the caller would not see the change.\n    Fix: take `self: &mut " + type_to_str(ty) + "` (the caller's value is then changed), or change a copy: `var c = self;`.");
+                TypeChecker_forget_value_param(self, root);
+                return;
+            }
             self.errors.push("Type error (line " + int_to_str(self.current_line) + "): '" + root + "' is a by-value parameter" + in_fn + " and cannot be changed: the caller would not see the change.\n    Fix: take `" + root + ": &mut " + type_to_str(ty) + "` and pass `&mut ...`, or change a copy: `var " + root + " = " + root + ";`.");
             // one error per parameter
             TypeChecker_forget_value_param(self, root);
@@ -16787,7 +18451,8 @@ fn TypeChecker_check_shared_change(self: &mut TypeChecker, root: str, place: str
     }
     match TypeChecker_lookup(self, root) {
         OptType::Some(rt) => {
-            match rt {
+            // BG252: through an alias of `&T` as through `&T`
+            match TypeChecker_resolve_type(self, rt) {
                 Type::Ref(rin, is_mut) => {
                     if !is_mut {
                         var tn: str = type_to_str(box_type_unbox(rin));
@@ -17334,6 +18999,8 @@ fn tc_alloc_func_names() -> Vec<str> {
     alloc_funcs.push("String_push");
     alloc_funcs.push("Vec_with_capacity");
     alloc_funcs.push("Vec_filled_typed");
+    // BG373/BG417: `Vec::filled(n, x)` is recorded as the call "Vec_filled"
+    alloc_funcs.push("Vec_filled");
     alloc_funcs.push("Vec_clone");
     alloc_funcs.push("Box_new");
     alloc_funcs.push("StringBuilder_new");
@@ -17371,6 +19038,41 @@ fn TypeChecker_budget_heap(self: &mut TypeChecker, what: str, bytes: i64) {
         }
     }
     self.region_budgets.push(rb);
+}
+
+/// BG373 / BG417: `s += t` (or `o.f += t`) on a str is `s = s + t`: the
+/// lowering makes the same concatenation, so a `@no-alloc` function may not
+/// use it and a region with a budget counts it, as both do string `+`
+/// (Expr::Binary). `target_ty` is the type of what is assigned to.
+fn TypeChecker_check_str_add_assign(self: &mut TypeChecker, target_ty: Type, op: AssignOp) {
+    var is_add: bool = false;
+    match op {
+        AssignOp::AddAssign => {
+            is_add = true;
+        }
+        _ => {
+        }
+    }
+    if !is_add {
+        return;
+    }
+    var t: Type = TypeChecker_resolve_type(self, target_ty);
+    if tc_is_borrowed_str(t) {
+        t = Type::Str;
+    }
+    if !type_eq(t, Type::Str) {
+        return;
+    }
+    if self.region_budgets.len() > 0 {
+        TypeChecker_budget_heap(self, "string `+=`", -1);
+    }
+    if self.in_no_alloc {
+        self.errors.push("Safety error (" + self.checking_fn + "): function '" + self.checking_fn + "' is @no-alloc but uses string `+=`, which allocates.\n    Dynamic allocation is forbidden — deterministic memory usage required.\n    Fix: use a fixed-size array or a buffer passed in, or remove the safety annotation.");
+    }
+    // BG377: @realtime forbids allocating too
+    if g_tc_in_realtime {
+        self.errors.push("Real-time error: function '" + self.checking_fn + "' uses string `+=`, which allocates.\n    Fix: build the text outside '" + self.checking_fn + "', or write into a buffer made before the real-time part, or remove @realtime.");
+    }
 }
 
 /// RT8: builtins only core (and the runtimes merged into it) may call:
@@ -17956,6 +19658,52 @@ fn TypeChecker_sandbox_reject(self: &mut TypeChecker, what: str, effs: Vec<str>)
     self.errors.push("Sandbox error: '" + what + "' has effect '!" + e + "' -- all capabilities are revoked inside sandbox, including in the functions it calls\n    Fix: call '" + what + "' before or after the `sandbox { }` block, and pass its result in.");
 }
 
+/// BG375: the effects of every implementation of every method of the trait
+/// bounds of generic function `callee` (nothing for a function that is not
+/// generic or has no bound), added to `effs`.
+fn TypeChecker_bound_method_effects(self: &TypeChecker, callee: str, effs: &mut Vec<str>) {
+    var gi: i64 = 0;
+    while gi < self.func_generic_names.len() {
+        if self.func_generic_names.get(gi) == callee {
+            var bounds: Vec<StrPair> = self.func_generic_bounds.get(gi);
+            var bi: i64 = 0;
+            while bi < bounds.len() {
+                var tr: str = bounds.get(bi).b;
+                match map_traits_get(self.traits, tr) {
+                    OptTraitMethodMap::Some(tms) => {
+                        var pre: str = tr + ":";
+                        var mi: i64 = 0;
+                        while mi < tms.len() {
+                            var m: str = tms.get(mi).key;
+                            var pi: i64 = 0;
+                            while pi < self.impl_pairs.len() {
+                                var p: str = self.impl_pairs.get(pi);
+                                if str_starts_with(p, pre) {
+                                    var te: Vec<str> = TypeChecker_get_func_effects(self, str_slice(p, str_len(pre), str_len(p)) + "." + m);
+                                    var k: i64 = 0;
+                                    while k < te.len() {
+                                        if !str_vec_contains_ref(effs, te.get(k)) {
+                                            effs.push(te.get(k));
+                                        }
+                                        k = k + 1;
+                                    }
+                                }
+                                pi = pi + 1;
+                            }
+                            mi = mi + 1;
+                        }
+                    }
+                    OptTraitMethodMap::None => {
+                    }
+                }
+                bi = bi + 1;
+            }
+            return;
+        }
+        gi = gi + 1;
+    }
+}
+
 /// A call inside sandbox: the builtin's effect (p_file_read is IO, ...),
 /// the inferred effects of a user function (transitive), and for a
 /// higher-order callee the effects of the functions passed to it. A call
@@ -17985,6 +19733,11 @@ fn TypeChecker_check_sandbox_call(self: &mut TypeChecker, callee: str, args: Vec
             hk = hk + 1;
         }
     }
+    // BG375: a generic callee (`fn g<X: T>(x: X) { x.t() }`) runs the
+    // methods of its bounds, whose implementations' effects its own
+    // inferred effects do not have (they are known per instance): every
+    // implementation of every method of each bound counts
+    TypeChecker_bound_method_effects(self, callee, &mut effs);
     if tc_sandbox_forbidden(effs) == "" && HashMap_get(self.func_effects_index, callee) == 0 {
         match TypeChecker_lookup(self, callee) {
             OptType::Some(t) => {
@@ -18019,6 +19772,70 @@ var g_tc_try_depth: i64 = 0;
 /// whose body is being checked: a `return` leaves the scopes from there on,
 /// so their linear variables must be consumed by then.
 var g_tc_linear_base: i64 = 0;
+
+/// BG416: the names the statement being checked reads (set by
+/// TypeChecker_check_stmt only while a linear variable is live), so a `?`
+/// does not report a linear value its own statement consumes before it
+/// (`val r = eat(t) + g()?;`).
+var g_tc_lin_stmt_names: Vec<str> = Vec::new();
+var g_tc_lin_stmt_set: bool = false;
+
+/// BG416: whether a linear variable of the function's scopes is live.
+fn TypeChecker_linear_any_live(self: &TypeChecker) -> bool {
+    var si: i64 = g_tc_linear_base;
+    if si < 0 {
+        si = 0;
+    }
+    while si < self.scope_linear_vars.len() {
+        if self.scope_linear_vars.get(si).len() > 0 {
+            return true;
+        }
+        si = si + 1;
+    }
+    return false;
+}
+
+/// BG416: `e?` returns from the function on None/Err, as a `return` does:
+/// a linear variable still live there (not consumed, and not read by the
+/// statement of the `?`, which may consume it before) is lost on that path.
+/// Only Stmt::Return checked this, so `val x = g()?;` between a linear
+/// value's creation and its use passed. Inside `try { }` the `?` does not
+/// leave the function. Unlike a `return`, the value stays live after the
+/// `?` (the path on Some/Ok goes on), so it is not marked consumed.
+fn TypeChecker_linear_check_try(self: &mut TypeChecker) {
+    if g_tc_try_depth > 0 {
+        return;
+    }
+    var si: i64 = g_tc_linear_base;
+    if si < 0 {
+        si = 0;
+    }
+    while si < self.scope_linear_vars.len() {
+        var lvs: Vec<LinearVar> = self.scope_linear_vars.get(si);
+        var i: i64 = 0;
+        while i < lvs.len() {
+            var lv: LinearVar = lvs.get(i);
+            var lv_done: bool = tc_str_vec_contains(self.consumed_vars, lv.name);
+            if !lv_done && g_tc_lin_stmt_set && tc_str_vec_contains(g_tc_lin_stmt_names, lv.name) {
+                lv_done = true;
+            }
+            if !lv_done {
+                match TypeChecker_lookup(self, lv.name) {
+                    OptType::Some(lty) => {
+                        lv_done = TypeChecker_linear_fields_moved(self, lv.name, lty);
+                    }
+                    OptType::None => {
+                    }
+                }
+            }
+            if !lv_done {
+                self.errors.push("Linear type error (line " + int_to_str(lv.line) + "): variable '" + lv.name + "' is linear but was never consumed.\n    It is lost on the path through the `?` on line " + int_to_str(self.current_line) + ", which returns from the function on None or Err.\n    Fix: consume it (pass it on or return it) before that `?`, or match the value instead of using `?` and consume it on the None/Err path too.");
+            }
+            i = i + 1;
+        }
+        si = si + 1;
+    }
+}
 
 /// A `return` ends the function on its path: every linear variable still
 /// live there (a parameter or a local of the function's scopes, not yet
@@ -19855,7 +21672,25 @@ pub fn TypeChecker_check_stmt(self: &mut TypeChecker, stmt: Stmt) {
     }
 
     var first_err: i64 = self.errors.len();
+    // BG416: while a linear value is live, a `?` in this statement must know
+    // which names the statement reads (TypeChecker_linear_check_try)
+    var lin_track: bool = TypeChecker_linear_any_live(self);
+    var lin_saved_names: Vec<str> = Vec::new();
+    var lin_saved_set: bool = g_tc_lin_stmt_set;
+    if lin_track {
+        lin_saved_names = g_tc_lin_stmt_names;
+        var lin_one: Vec<Stmt> = Vec::new();
+        lin_one.push(stmt);
+        var lin_names: Vec<str> = Vec::new();
+        esc_idents_stmts(lin_one, &mut lin_names);
+        g_tc_lin_stmt_names = lin_names;
+        g_tc_lin_stmt_set = true;
+    }
     TypeChecker_check_stmt_inner(self, stmt);
+    if lin_track {
+        g_tc_lin_stmt_names = lin_saved_names;
+        g_tc_lin_stmt_set = lin_saved_set;
+    }
     tc_add_stmt_line(self, first_err, stmt_line(stmt));
     self.check_depth = self.check_depth - 1;
 }
@@ -19993,7 +21828,7 @@ fn tc_place_fn_errors(self: &mut TypeChecker, from: i64, program: Program) {
 /// value fits the element type (as a `val x: T = v` checks it). A type not
 /// known here (an inferred one, or an error already reported) is not
 /// checked further.
-fn TypeChecker_check_index_assign(self: &mut TypeChecker, array: str, target_ty: Type, idx_ty: Type, val_ty: Type, line: i64) {
+fn TypeChecker_check_index_assign(self: &mut TypeChecker, array: str, target_ty: Type, idx_ty: Type, val_ty: Type, val_expr: Expr, line: i64) {
     var t: Type = TypeChecker_resolve_type(self, target_ty);
     match t {
         Type::Ref(rin, _) => {
@@ -20048,6 +21883,10 @@ fn TypeChecker_check_index_assign(self: &mut TypeChecker, array: str, target_ty:
     var vt: Type = TypeChecker_resolve_self_type(self, val_ty);
     if !TypeChecker_types_compatible(self, et, vt) && !(is_runtime_layer(self.current_module) && is_handle_int_pair(et, vt)) {
         self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(vt) + " to an element of '" + array + "', whose elements are " + type_to_str(et) + ".\n    Expected: " + type_to_str(et) + "\n    Found:    " + type_to_str(vt) + "\n    Fix: store a " + type_to_str(et) + " (for a number, cast it: `x as " + type_to_str(et) + "`), or declare '" + array + "' with elements of " + type_to_str(vt) + ".");
+    } else {
+        // BG286: a literal must fit the element type (`v[0] = 513` on a
+        // Vec<u8> stored 1), and a wider integer needs `as`
+        TypeChecker_check_value_fits(self, et, vt, val_expr, line);
     }
 }
 
@@ -20145,6 +21984,8 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             match ty {
                 OptType::Some(declared) => {
                     TypeChecker_check_value_fits(self, declared, expr_ty, expr, line);
+                    // BG292: a private type of another module named here
+                    TypeChecker_check_type_visible(self, declared);
                     var ce6_never: bool = false;
                     if !TypeChecker_types_compatible(self, declared, expr_ty) && !(is_runtime_layer(self.current_module) && is_handle_int_pair(declared, expr_ty)) {
                         // CE6: an annotation naming no type is that one
@@ -20246,7 +22087,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                 }
             }
         }
-        Stmt::LetTuple(names, expr, line) => {
+        Stmt::LetTuple(names, expr, line, tuple_mut) => {
             var expr_ty: Type = TypeChecker_check_expr(self, expr);
             TypeChecker_consume_linear_in_expr(self, expr, line);
             match expr_ty {
@@ -20265,6 +22106,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                             }
                         }
                         TypeChecker_declare(self, names.get(i), elem_ty);
+                        TypeChecker_record_val(self, names.get(i), tuple_mut);
                         i = i + 1;
                     }
                 }
@@ -20278,6 +22120,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                     var ni: i64 = 0;
                     while ni < names.len() {
                         TypeChecker_declare(self, names.get(ni), Type::Never);
+                        TypeChecker_record_val(self, names.get(ni), tuple_mut);
                         ni = ni + 1;
                     }
                 }
@@ -20419,6 +22262,21 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             // or a unit's dimension rule): the result must fit x
             // BG128: an enum literal assigned takes the variable's type
             var assigned_ty: Type = TypeChecker_check_expr_with_hint(self, TypeChecker_compound_struct_expr(self, target, cl10_aop, expr), TypeChecker_assign_enum_hint(self, target, expr));
+            // BG373/BG417: `s += t` on a str allocates as `s = s + t` does
+            match TypeChecker_lookup(self, target) {
+                OptType::Some(bg373_ty) => {
+                    TypeChecker_check_str_add_assign(self, bg373_ty, cl10_aop);
+                }
+                OptType::None => {
+                    match TypeChecker_lookup_global_cache(self, target) {
+                        OptType::Some(bg373_gty) => {
+                            TypeChecker_check_str_add_assign(self, bg373_gty, cl10_aop);
+                        }
+                        OptType::None => {
+                        }
+                    }
+                }
+            }
             if rt6_count() > 0 {
                 TypeChecker_rt6_assigned(self, target, expr);
             }
@@ -20517,7 +22375,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             self.current_line = ia_line;
             match TypeChecker_lookup(self, array) {
                 OptType::Some(ia_ty) => {
-                    TypeChecker_check_index_assign(self, array, ia_ty, ia_idx_ty, ia_val_ty, ia_line);
+                    TypeChecker_check_index_assign(self, array, ia_ty, ia_idx_ty, ia_val_ty, expr, ia_line);
                 }
                 OptType::None => {
                     // A module-level global Vec or array (known-bugs 2g.74):
@@ -20525,7 +22383,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                     // assignment to it is
                     match TypeChecker_lookup_global_cache(self, array) {
                         OptType::Some(ia_gty) => {
-                            TypeChecker_check_index_assign(self, array, ia_gty, ia_idx_ty, ia_val_ty, ia_line);
+                            TypeChecker_check_index_assign(self, array, ia_gty, ia_idx_ty, ia_val_ty, expr, ia_line);
                             if self.txn_depth > 0 {
                                 self.errors.push("Transaction error (line " + int_to_str(ia_line) + "): an element of global '" + array + "' is assigned inside txn { }." + "
     abort; rolls back the local variables of the function, not globals." + "
@@ -20546,7 +22404,9 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             }
         }
         Stmt::DerefAssign(ptr_expr, _, expr, da_line) => {
-            var da_ptr_ty: Type = TypeChecker_check_expr(self, ptr_expr);
+            // BG252: an alias of `&mut T` is `&mut T` (resolved here, so the
+            // arms below see it)
+            var da_ptr_ty: Type = TypeChecker_resolve_type(self, TypeChecker_check_expr(self, ptr_expr));
             self.current_line = da_line;
             match da_ptr_ty {
                 Type::RawPtr(_, _) => {
@@ -20566,7 +22426,13 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                     } else {
                         var da_val_ty: Type = TypeChecker_check_expr(self, expr);
                         self.current_line = da_line;
+                        var bg286_errs: i64 = self.errors.len();
                         TypeChecker_check_deref_value(self, ptr_expr, box_type_unbox(da_in), da_val_ty, da_line);
+                        // BG286: a literal must fit `*r`'s type (`*r = 260`
+                        // with r: &mut u8 stored 4), a wider integer needs `as`
+                        if self.errors.len() == bg286_errs {
+                            TypeChecker_check_value_fits(self, box_type_unbox(da_in), da_val_ty, expr, da_line);
+                        }
                     }
                 }
                 _ => {
@@ -20587,7 +22453,9 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                 ow1_base = ow1_base + "." + field;
             }
             TypeChecker_check_shared_change(self, tc_place_root(object), ow1_base);
-            var obj_ty: Type = TypeChecker_check_expr(self, object);
+            // BG252: an alias (of `&mut T`, or of the struct) is resolved,
+            // as a field read resolves it
+            var obj_ty: Type = TypeChecker_resolve_type(self, TypeChecker_check_expr(self, object));
             self.current_line = line;
             // Unwrap references
             var effective_ty: Type = obj_ty;
@@ -20629,11 +22497,19 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                             // CL10: `obj.f += e` on a struct field is `obj.f = obj.f + e`
                             // BG128: an enum literal takes the field's type
                             var expr_ty: Type = TypeChecker_check_expr_with_hint(self, TypeChecker_compound_field_expr(self, object, field, op, fty, expr), tc_enum_lit_hint(expr, fty));
+                            // BG373/BG417: `o.f += t` on a str field allocates
+                            TypeChecker_check_str_add_assign(self, fty, op);
                             TypeChecker_consume_linear_in_expr(self, expr, line);
                             var compatible: bool = type_eq(expr_ty, fty) || type_eq(expr_ty, Type::Never) || (TypeChecker_is_integer(self, expr_ty) && TypeChecker_is_integer(self, fty)) || TypeChecker_types_compatible(self, fty, expr_ty);
                             if !compatible {
                                 self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(expr_ty) + " to field '" + field + "' of type " + type_to_str(fty) + "\n    Fix: assign a " + type_to_str(fty) + " (for a number, cast it: `x as " + type_to_str(fty) + "`), or change the field's type.");
+                            } else {
+                                // BG286: a literal must fit the field, and a
+                                // wider integer needs `as` (as `x = e` does)
+                                TypeChecker_check_value_fits(self, fty, expr_ty, expr, line);
                             }
+                            // BG293: another module's private field
+                            TypeChecker_check_private_field_write(self, name, field);
                         }
                         OptType::None => {
                             self.errors.push("Type error (line " + int_to_str(line) + "): struct '" + name + "' has no field '" + field + "'\n    Fix: use one of the fields struct '" + name + "' declares, or add `" + field + ": T` to it.");
@@ -20675,7 +22551,12 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                             var gok: bool = type_eq(gexpr_ty, fty) || type_eq(gexpr_ty, Type::Never) || (TypeChecker_is_integer(self, gexpr_ty) && TypeChecker_is_integer(self, fty)) || TypeChecker_types_compatible(self, fty, gexpr_ty);
                             if !gok {
                                 self.errors.push("Type error (line " + int_to_str(line) + "): cannot assign " + type_to_str(gexpr_ty) + " to field '" + field + "' of type " + type_to_str(fty) + "\n    Fix: assign a " + type_to_str(fty) + " (for a number, cast it: `x as " + type_to_str(fty) + "`), or change the field's type.");
+                            } else {
+                                // BG286: as for a field of a plain struct
+                                TypeChecker_check_value_fits(self, fty, gexpr_ty, expr, line);
                             }
+                            // BG293: another module's private field
+                            TypeChecker_check_private_field_write(self, gsn, field);
                         }
                         OptType::None => {
                             self.errors.push("Type error (line " + int_to_str(line) + "): struct '" + gsn + "' has no field '" + field + "'\n    Fix: use one of the fields struct '" + gsn + "' declares, or add `" + field + ": T` to it.");
@@ -20791,7 +22672,8 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             // BG20: the body may run zero times: what it assigns may not be
             var fu_before: Vec<str> = self.uninit_vars.clone();
             TypeChecker_push_scope(self);
-            TypeChecker_declare(self, var_name, elem_ty);
+            // BG291: the loop variable shadows an outer `val` of its name
+            TypeChecker_declare_shadow(self, var_name, elem_ty);
             self.loop_depth = self.loop_depth + 1;
             var si: i64 = 0;
             while si < body.len() {
@@ -20813,7 +22695,9 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
             self.loop_depth = self.loop_depth - 1;
             TypeChecker_pop_scope(self);
         }
-        Stmt::Break(opt_expr, _) => {
+        Stmt::Break(opt_expr, bk_line) => {
+            // BG297: only inside a loop
+            TypeChecker_check_loop_jump(self, "break", bk_line);
             match opt_expr {
                 OptBoxExpr::Some(e) => {
                     TypeChecker_check_expr(self, box_expr_unbox(e));
@@ -20822,7 +22706,8 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                 }
             }
         }
-        Stmt::Continue(_) => {
+        Stmt::Continue(ct_line) => {
+            TypeChecker_check_loop_jump(self, "continue", ct_line);
         }
         Stmt::Defer(body, _) => {
             TypeChecker_push_scope(self);
@@ -20860,7 +22745,8 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                         // `None =>` on an Option is the variant, as `Some(x)`
                         // is (reference §6): it binds nothing
                         if !TypeChecker_bare_pattern_is_unit_variant(self, match_ty, name) {
-                            TypeChecker_declare(self, name, match_ty);
+                            // BG291: a binding shadows an outer `val`
+                            TypeChecker_declare_shadow(self, name, match_ty);
                         }
                     }
                     Pattern::EnumVariant(enum_name, variant, bindings) => {
@@ -20868,7 +22754,7 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                         var tys: Vec<Type> = TypeChecker_pattern_binding_types(self, match_ty, enum_name, variant, bindings);
                         var bi: i64 = 0;
                         while bi < bindings.len() && bi < tys.len() {
-                            TypeChecker_declare(self, bindings.get(bi).name, tys.get(bi));
+                            TypeChecker_declare_shadow(self, bindings.get(bi).name, tys.get(bi));
                             bi = bi + 1;
                         }
                     }
@@ -20879,10 +22765,10 @@ fn TypeChecker_check_stmt_inner(self: &mut TypeChecker, stmt: Stmt) {
                     _ => {
                     }
                 }
-                // Check guard
+                // Check guard (BG414: a condition, as an `if`'s)
                 match arm.guard {
                     OptBoxExpr::Some(g) => {
-                        TypeChecker_check_expr(self, box_expr_unbox(g));
+                        TypeChecker_check_guard(self, box_expr_unbox(g));
                     }
                     OptBoxExpr::None => {
                     }
@@ -21362,6 +23248,8 @@ fn TypeChecker_check_struct_lit(self: &mut TypeChecker, name: str, fields: Vec<F
     while si < si_lim {
         if self.structs.get(si).key == real_name {
             var struct_fields: Vec<StructField> = self.structs.get(si).val;
+            // BG292: another module's struct without `pub`
+            TypeChecker_check_item_visible(self, real_name, "struct");
             // A generic struct (known-bugs 2f.11): its type
             // arguments are those of the field values, as for a
             // generic function's arguments; the literal has type
@@ -21406,6 +23294,17 @@ fn TypeChecker_check_struct_lit(self: &mut TypeChecker, name: str, fields: Vec<F
             while fi < fields.len() {
                 var fname: str = fields.get(fi).name;
                 var fexpr: Expr = fields.get(fi).value;
+                // BG335: a field named twice (the later value won silently)
+                var dup_k: i64 = 0;
+                while dup_k < fi {
+                    if fields.get(dup_k).name == fname {
+                        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): field '" + fname + "' given twice in the struct literal of '" + name + "'\n    Fix: give each field once; if you meant another field, write its name.");
+                        dup_k = fi;
+                    }
+                    dup_k = dup_k + 1;
+                }
+                // BG293: another module's private field set by the literal
+                TypeChecker_check_private_field_write(self, real_name, fname);
                 // BG128: an enum literal takes the field's type
                 var fty: Type = TypeChecker_check_expr_with_hint(self, fexpr, tc_field_enum_hint(struct_fields, fname, fexpr, stps));
                 var found: bool = false;
@@ -21640,6 +23539,10 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             // scan for calls cannot see: `+` is not a call)
             if self.in_no_alloc && binop_eq(op, BinOp::Add) && (type_eq(lt_r, Type::Str) || type_eq(rt_r, Type::Str)) {
                 self.errors.push("Safety error (" + self.checking_fn + "): function '" + self.checking_fn + "' is @no-alloc but uses string `+`, which allocates.\n    Dynamic allocation is forbidden — deterministic memory usage required.\n    Fix: use a fixed-size array or a buffer passed in, or remove the safety annotation.");
+            }
+            // BG377: @realtime forbids allocating (reference §11)
+            if g_tc_in_realtime && binop_eq(op, BinOp::Add) && (type_eq(lt_r, Type::Str) || type_eq(rt_r, Type::Str)) {
+                self.errors.push("Real-time error: function '" + self.checking_fn + "' uses string `+` or an f-string, which allocates.\n    Fix: build the text outside '" + self.checking_fn + "', or write into a buffer made before the real-time part, or remove @realtime.");
             }
             // A str is text: comparing it with a number has no meaning outside
             // the runtime layer and the compiler, where a str is a word
@@ -22288,6 +24191,8 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             }
             // Check for runtime builtin functions (p_*)
             if str_starts_with(callee, "p_") {
+                // BG470: a name no runtime has is an error (own module only)
+                TypeChecker_check_runtime_builtin(self, callee);
                 if callee == "p_json_dump" || callee == "p_json_type" || callee == "p_json_pretty" || callee == "p_json_string" || callee == "p_tensor_to_str" || callee == "p_tensor_to_json" || callee == "p_simd_to_str" || callee == "p_socket_recv_str" || callee == "p_http_build_response" || callee == "p_db_mem_query" || callee == "p_process_stdout" || callee == "p_process_stderr" || callee == "p_dir_list" || callee == "p_intern_str" || callee == "p_str_join_n" {
                     return Type::Str;
                 }
@@ -22713,12 +24618,16 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
         Expr::Ref(e, is_mut) => {
             if is_mut {
                 TypeChecker_check_param_change(self, tc_place_root(box_expr_unbox(e)));
+                // BG289: `&mut x` of a `val x` would let it be assigned
+                TypeChecker_check_mut_ref_val(self, box_expr_unbox(e));
             }
             var inner_ty: Type = TypeChecker_check_expr(self, box_expr_unbox(e));
             return Type::Ref(Box::new(inner_ty), is_mut);
         }
         Expr::Deref(e) => {
-            var ty: Type = TypeChecker_check_expr(self, box_expr_unbox(e));
+            // BG252: an alias of a reference type (`type Ref = &A;`) is
+            // resolved first, as the write side (check_deref_other) does
+            var ty: Type = TypeChecker_resolve_type(self, TypeChecker_check_expr(self, box_expr_unbox(e)));
             match ty {
                 Type::Ref(inner, _) => {
                     var t: Type = box_type_unbox(inner);
@@ -22775,6 +24684,8 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             } else {
                 // BG23: the error passed on must be the function's error type
                 TypeChecker_check_try_error_type(self, ty);
+                // BG416: a linear value still live is lost when `?` returns
+                TypeChecker_linear_check_try(self);
             }
             match ty {
                 Type::Generic(name, args) => {
@@ -22870,7 +24781,8 @@ fn TypeChecker_check_expr_inner(self: &mut TypeChecker, expr: Expr, hint: Type) 
             TypeChecker_push_scope(self);
             var pi: i64 = 0;
             while pi < params.len() {
-                TypeChecker_declare(self, params.get(pi).name, TypeChecker_resolve_type(self, params.get(pi).ty));
+                // BG291: a parameter shadows an outer `val` of its name
+                TypeChecker_declare_shadow(self, params.get(pi).name, TypeChecker_resolve_type(self, params.get(pi).ty));
                 pi = pi + 1;
             }
             var saved_closure_ret: OptType = self.current_ret_ty;
@@ -23631,6 +25543,11 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                 match hint {
                     Type::Generic(hn, hargs) => {
                         if hn == "HashMap" && hargs.len() == 2 {
+                            // BG280: a float key is not supported
+                            var fk_err: str = TypeChecker_float_key_error(self, hargs.get(0));
+                            if str_len(fk_err) > 0 {
+                                self.errors.push(fk_err);
+                            }
                             return Type::Generic("HashMap", hargs);
                         }
                     }
@@ -23669,6 +25586,8 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                     if mei >= 0 {
                         var info: MethodInfo = self.methods.get(TypeChecker_methods_at(self, name)).val.get(mei).val;
                         TypeChecker_warn_deprecated_method(self, name, method);
+                        // BG292: another module's associated function without `pub`
+                        TypeChecker_check_method_visible(self, name, method);
                         // Release M10: `S::f(..)` of an @unsafe f
                         TypeChecker_require_unsafe_call(self, name + "_" + method, name + "::" + method);
                         // BG18: the arguments' number (defaults may be left
@@ -23786,6 +25705,10 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                         } else {
                             self.errors.push("Type error: cannot store " + tc_operand_type_str(args.get(stored), arg_types.get(stored)) + " in a Vec<" + type_to_str(elem_ty) + "> (" + method + ") in '" + self.checking_fn + "'\n    Fix: store a " + type_to_str(elem_ty) + " (cast with `as` for a number), or declare the Vec as Vec<" + tc_operand_type_str(args.get(stored), arg_types.get(stored)) + ">.");
                         }
+                    } else if tc_is_constant_expr(args.get(stored)) {
+                        // BG287: a literal stored must fit the element type
+                        // (`Vec<u8>.push(999)` stored 231)
+                        TypeChecker_check_value_fits(self, elem_ty, arg_types.get(stored), args.get(stored), self.current_line);
                     }
                 }
                 if method == "push" {
@@ -24239,6 +26162,8 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                                 self.errors.push("Type error (line " + int_to_str(self.current_line) + "): method '" + method + "' of trait '" + trait_name + "' is generic (fn " + method + tc_lg4_tps_str(info.type_params) + "), so it cannot be called through `dyn " + trait_name + "`: a trait object holds one function per method, and a generic method has one per type.\n    Fix: call it on a value of a concrete type, or in a function generic over `T: " + trait_name + "`.");
                                 return Type::Never;
                             }
+                            // BG294/BG375/BG377: one of the implementations runs
+                            TypeChecker_note_trait_dispatch(self, trait_name, method, true);
                             return info.ret_ty;
                         }
                         OptTraitMethodInfo::None => {
@@ -24391,6 +26316,8 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                 var method_map: Vec<MethodMapEntry> = self.methods.get(mi).val;
                 TypeChecker_record_method_call(self, struct_name, method);
                 TypeChecker_warn_deprecated_method(self, struct_name, method);
+                // BG292: another module's method without `pub`
+                TypeChecker_check_method_visible(self, struct_name, method);
                 // Release M10: `x.m(..)` of an @unsafe method m
                 TypeChecker_require_unsafe_call(self, struct_name + "_" + method, struct_name + "." + method);
                 if self.sandbox_depth > 0 {
@@ -24441,6 +26368,8 @@ pub fn TypeChecker_check_method_call(self: &mut TypeChecker, receiver: Expr, met
                             OptTraitMethodMap::Some(trait_methods) => {
                                 match trait_method_map_get(trait_methods, method) {
                                     OptTraitMethodInfo::Some(info) => {
+                                        // BG294/BG375: the bound's implementations
+                                        TypeChecker_note_trait_dispatch(self, self.current_type_param_bounds.get(bi).val, method, false);
                                         // LG4: a generic trait method, bound at the call
                                         if info.type_params.len() > 0 {
                                             return TypeChecker_lg4_method_call(self, struct_name, method, info.type_params, info.type_param_bounds, tc_lg4_args_of(info.param_types, info.has_self), info.ret_ty, arg_types, hint);
@@ -25064,6 +26993,8 @@ pub fn TypeChecker_check_return_type(self: &mut TypeChecker, actual: Type) {
 pub fn TypeChecker_check_enum_constructor(self: &mut TypeChecker, enum_name: str, variant: str, arg_tys: Vec<Type>, args: Vec<Expr>) {
     var n_args: i64 = arg_tys.len();
     var resolved: str = TypeChecker_resolve_struct_name(self, enum_name);
+    // BG292: another module's enum without `pub`
+    TypeChecker_check_item_visible(self, resolved, "enum");
     var ei: i64 = 0;
     while ei < self.enum_variants.len() {
         var key: str = self.enum_variants.get(ei).key;
@@ -25919,6 +27850,17 @@ pub fn TypeChecker_check_enum_pattern(self: &mut TypeChecker, match_ty: Type, en
             return;
         }
     }
+    // BG393 / BG489: a variant pattern against a value that is no enum at
+    // all (a number, a str, a Vec, a struct: `match v.pop() { Some(x) => }`
+    // on a Vec<i64>) read the value's word as a tag and a payload
+    if TypeChecker_scrutinee_enum(self, match_ty) == "" && TypeChecker_scrutinee_is_no_enum(self, match_ty) {
+        var pshown: str = variant;
+        if enum_name != "" {
+            pshown = enum_name + "::" + variant;
+        }
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): pattern " + pshown + " is a variant of enum '" + ename + "', but the value matched is a '" + type_to_str(match_ty) + "', which is no enum.\n    Fix: match a value of enum '" + ename + "' (Vec's pop() and get() give the element itself), or match this value by its own patterns (literals, a name, `_`).");
+        return;
+    }
     var ei: i64 = 0;
     while ei < self.enum_variants.len() {
         if self.enum_variants.get(ei).key == ename {
@@ -25929,6 +27871,9 @@ pub fn TypeChecker_check_enum_pattern(self: &mut TypeChecker, match_ty: Type, en
                     var n_payload: i64 = variants.get(vi).payload_types.len();
                     if bindings.len() > 0 && bindings.len() != n_payload {
                         self.errors.push("Type error (line " + int_to_str(self.current_line) + "): pattern " + ename + "::" + variant + " binds " + int_to_str(bindings.len()) + " field(s) but the variant has " + int_to_str(n_payload) + "\n    Fix: bind " + int_to_str(n_payload) + " name(s): `" + ename + "::" + variant + "(a, ...)`, `_` for a field you do not need.");
+                    } else {
+                        // BG379: a binding's written type is the payload's
+                        TypeChecker_check_binding_annotations(self, match_ty, enum_name, ename, variant, bindings);
                     }
                     return;
                 }
@@ -25979,6 +27924,147 @@ fn TypeChecker_scrutinee_enum(self: &TypeChecker, match_ty: Type) -> str {
         ei = ei + 1;
     }
     return found;
+}
+
+// BG393 / BG489: whether a match's scrutinee is known to be no enum: a
+// number, a bool, a str, a Vec or HashMap, a struct, a tuple, an array, a
+// function value or a `dyn` value. A type not known yet (inferred, a type
+// parameter, an error already reported, a name the checker cannot place) is
+// not: the pattern is then left as it was. The compiler's own modules and
+// core (where values are raw words) are not checked.
+fn TypeChecker_scrutinee_is_no_enum(self: &TypeChecker, match_ty: Type) -> bool {
+    if str_starts_with(self.current_module, "compiler") || is_runtime_layer(self.current_module) {
+        return false;
+    }
+    var t: Type = match_ty;
+    match match_ty {
+        Type::Ref(inner, _) => {
+            t = box_type_unbox(inner);
+        }
+        _ => {
+        }
+    }
+    t = unbox_ty(TypeChecker_resolve_type(self, t));
+    if type_eq(t, Type::Never) || type_eq(t, Type::Infer) || type_eq(t, Type::Void) || TypeChecker_is_reported(self, t) || TypeChecker_type_contains_param(self, t) {
+        return false;
+    }
+    if TypeChecker_is_integer(self, t) || TypeChecker_is_float(self, t) || type_eq(t, Type::Bool) || type_eq(t, Type::Str) || tc_is_borrowed_str(t) {
+        return true;
+    }
+    match t {
+        Type::Named(n) => {
+            if n == "Self" {
+                return false;
+            }
+            if n == "Vec" || n == "HashMap" {
+                return true;
+            }
+            match TypeChecker_lookup_struct_cache(self, n) {
+                OptVecStructField::Some(_) => {
+                    return true;
+                }
+                OptVecStructField::None => {
+                }
+            }
+            return false;
+        }
+        Type::Generic(gn, _) => {
+            if gn == "Vec" || gn == "HashMap" {
+                return true;
+            }
+            match TypeChecker_lookup_struct_cache(self, gn) {
+                OptVecStructField::Some(_) => {
+                    return true;
+                }
+                OptVecStructField::None => {
+                }
+            }
+            return false;
+        }
+        Type::Tuple(_) => {
+            return true;
+        }
+        Type::Array(_, _) => {
+            return true;
+        }
+        Type::ArrayConst(_, _) => {
+            return true;
+        }
+        Type::Func(_, _) => {
+            return true;
+        }
+        Type::Dyn(_) => {
+            return true;
+        }
+        _ => {
+        }
+    }
+    return false;
+}
+
+// BG379: the scalar kind of a type for a pattern binding's annotation: 1 an
+// integer, 2 a float, 3 a bool, 4 a str, 0 anything else.
+fn TypeChecker_binding_kind(self: &TypeChecker, t: Type) -> i64 {
+    if TypeChecker_is_integer(self, t) {
+        return 1;
+    }
+    if TypeChecker_is_float(self, t) {
+        return 2;
+    }
+    if type_eq(t, Type::Bool) {
+        return 3;
+    }
+    if type_eq(t, Type::Str) || tc_is_borrowed_str(t) {
+        return 4;
+    }
+    return 0;
+}
+
+// BG379: a typed binding (`Option::Some(v: str)`) must name the payload's
+// type. The checker typed `v` as the payload and the lowering as what is
+// written, so `Some(v: str)` on an Option<i64> read the integer as a str.
+// A written type the checker takes as the binding's own (a type parameter's
+// payload, pattern_binding_types) agrees with itself; integers of another
+// width are left to the integer rules.
+fn TypeChecker_check_binding_annotations(self: &mut TypeChecker, match_ty: Type, enum_name: str, ename: str, variant: str, bindings: Vec<Binding>) {
+    var any: bool = false;
+    var bi: i64 = 0;
+    while bi < bindings.len() {
+        if !str_is_empty(bindings.get(bi).ty) {
+            any = true;
+        }
+        bi = bi + 1;
+    }
+    if !any {
+        return;
+    }
+    var tys: Vec<Type> = TypeChecker_pattern_binding_types(self, match_ty, enum_name, variant, bindings);
+    bi = 0;
+    while bi < bindings.len() && bi < tys.len() {
+        var ann: str = bindings.get(bi).ty;
+        if !str_is_empty(ann) {
+            var pt: Type = TypeChecker_resolve_type(self, tys.get(bi));
+            var at: Type = TypeChecker_resolve_type(self, type_from_annotation(ann));
+            var bad: bool = false;
+            if !(type_eq(pt, Type::Never) || type_eq(pt, Type::Infer) || TypeChecker_type_contains_param(self, pt) || TypeChecker_type_contains_param(self, at) || type_eq(pt, at)) {
+                var pk: i64 = TypeChecker_binding_kind(self, pt);
+                var ak: i64 = TypeChecker_binding_kind(self, at);
+                if pk != ak {
+                    bad = true;
+                } else if pk == 0 {
+                    // Two non-scalar types: the names must agree
+                    // (`Some(p: Point)` on an Option<Point>)
+                    var pn: str = tc_self_owner_base(tc_self_type_base(pt));
+                    var an: str = tc_self_owner_base(tc_self_type_base(at));
+                    bad = pn != an && type_to_str(pt) != ann;
+                }
+            }
+            if bad {
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): binding '" + bindings.get(bi).name + "' of pattern " + ename + "::" + variant + " is written as " + ann + ", but the payload is a " + type_to_str(tys.get(bi)) + ".\n    Fix: write `" + bindings.get(bi).name + ": " + type_to_str(tys.get(bi)) + "`, or leave the type out (`" + ename + "::" + variant + "(" + bindings.get(bi).name + ")`).");
+            }
+        }
+        bi = bi + 1;
+    }
 }
 
 // BG146: `x is V` tests x's tag against variant V of x's own enum. It
@@ -26078,6 +28164,34 @@ fn TypeChecker_check_literal_pattern(self: &mut TypeChecker, match_ty: Type, pat
     mt = TypeChecker_resolve_type(self, mt);
     if type_eq(mt, Type::Never) || type_eq(mt, Type::Infer) || TypeChecker_is_reported(self, mt) || TypeChecker_type_contains_param(self, mt) {
         return;
+    }
+    // BG380: an integer pattern is no pattern of a float (reference §6:
+    // "Integer patterns are non-negative literals"; a float has no pattern
+    // form): types_compatible lets an i64 meet an f64, and the backends
+    // then compared the pattern with the float's value or its bits
+    match pat {
+        Pattern::IntLit(fv) => {
+            if TypeChecker_is_float(self, mt) {
+                self.errors.push("Type error (line " + int_to_str(self.current_line) + "): pattern " + shown + " is an integer, but the value matched is a '" + type_to_str(match_ty) + "': a float has no pattern form.\n    Fix: compare the float in an `if` (`if x == 3.0 { ... }`), or match an integer (`match x as i64 { 3 => ... }`).");
+                return;
+            }
+            // BG380: an integer pattern that does not fit the scrutinee's
+            // type (`300` against a u8) can never match
+            var fb: i64 = tc_int_bits(mt);
+            if fb > 0 {
+                var fneg: bool = fv < 0;
+                var fmag: i64 = fv;
+                if fneg {
+                    fmag = 0 - fv;
+                }
+                if !tc_literal_fits(fmag, fneg, fb, tc_int_signed(mt)) {
+                    self.errors.push("Type error (line " + int_to_str(self.current_line) + "): pattern " + shown + " does not fit the value matched, a '" + type_to_str(match_ty) + "': the arm can never match.\n    Fix: match values of type " + type_to_str(match_ty) + ".");
+                    return;
+                }
+            }
+        }
+        _ => {
+        }
     }
     if TypeChecker_types_compatible(self, mt, lit_ty) || (type_eq(lit_ty, Type::Str) && type_eq(mt, Type::Named("String"))) {
         return;
@@ -26449,7 +28563,7 @@ pub fn TypeChecker_scan_stmt_for_effects(self: &TypeChecker, stmt: Stmt, effects
                 g_tc_eff_finits.push(expr);
             }
         }
-        Stmt::LetTuple(_, expr, _) => {
+        Stmt::LetTuple(_, expr, _, _) => {
             TypeChecker_scan_expr_for_effects(self, expr, effects);
         }
         Stmt::Expr(expr, _) => {
@@ -26883,8 +28997,35 @@ pub fn TypeChecker_scan_expr_for_effects(self: &TypeChecker, expr: Expr, effects
         Expr::ComptimeReflect(_, _) => {
         }
         Expr::PipeForward(left, right) => {
-            TypeChecker_scan_expr_for_effects(self, box_expr_unbox(left), effects);
-            TypeChecker_scan_expr_for_effects(self, box_expr_unbox(right), effects);
+            // BG295: `x |> f` is `f(x)` (reference §4.8), `x |> f(a)` is
+            // `f(x, a)` and `x |> .m(a)` is `x.m(a)`: scanned as the call
+            // they are (a bare `f` scanned as an expression added nothing,
+            // so a `!{}` function could print through a pipe)
+            var pf_left: Expr = box_expr_unbox(left);
+            match box_expr_unbox(right) {
+                Expr::Ident(pf_name) => {
+                    var pf_args: Vec<Expr> = Vec::new();
+                    pf_args.push(pf_left);
+                    TypeChecker_scan_expr_for_effects(self, Expr::Call(pf_name, pf_args), effects);
+                }
+                Expr::Call(pf_callee, pf_cargs) => {
+                    var pf_all: Vec<Expr> = Vec::new();
+                    pf_all.push(pf_left);
+                    var pfi: i64 = 0;
+                    while pfi < pf_cargs.len() {
+                        pf_all.push(pf_cargs.get(pfi));
+                        pfi = pfi + 1;
+                    }
+                    TypeChecker_scan_expr_for_effects(self, Expr::Call(pf_callee, pf_all), effects);
+                }
+                Expr::MethodCall(_, pf_m, pf_margs) => {
+                    TypeChecker_scan_expr_for_effects(self, Expr::MethodCall(Box::new(pf_left), pf_m, pf_margs), effects);
+                }
+                _ => {
+                    TypeChecker_scan_expr_for_effects(self, pf_left, effects);
+                    TypeChecker_scan_expr_for_effects(self, box_expr_unbox(right), effects);
+                }
+            }
         }
         Expr::QuantCast(e, _) => {
             TypeChecker_scan_expr_for_effects(self, box_expr_unbox(e), effects);
@@ -26990,7 +29131,7 @@ pub fn TypeChecker_collect_called_funcs_stmt(self: &TypeChecker, stmt: Stmt, cal
         Stmt::Let(_, _, expr, _, _, _, _) => {
             TypeChecker_collect_called_funcs_expr(self, expr, called);
         }
-        Stmt::LetTuple(_, expr, _) => {
+        Stmt::LetTuple(_, expr, _, _) => {
             TypeChecker_collect_called_funcs_expr(self, expr, called);
         }
         Stmt::Expr(expr, _) => {
@@ -27182,7 +29323,15 @@ pub fn TypeChecker_collect_called_funcs_expr(self: &TypeChecker, expr: Expr, cal
         Expr::OptionalFieldAccess(e, _) => {
             TypeChecker_collect_called_funcs_expr(self, box_expr_unbox(e), called);
         }
-        Expr::StructLit(_, fields, spread) => {
+        Expr::StructLit(sl_name, fields, spread) => {
+            // BG324: a module's struct built by name uses the module
+            match TypeChecker_get_item_module(self, sl_name) {
+                OptString::Some(_) => {
+                    called.push(sl_name);
+                }
+                OptString::None => {
+                }
+            }
             var fi: i64 = 0;
             while fi < fields.len() {
                 TypeChecker_collect_called_funcs_expr(self, fields.get(fi).value, called);
@@ -27331,11 +29480,16 @@ pub fn TypeChecker_lint_unused_imports(self: &mut TypeChecker, program: Program)
         return;
     }
 
-    // Collect all function names called in the program
+    // Collect all function names called in the program. BG324: only by
+    // the program's own functions (tc_lint_is_program_item): on the merged
+    // program of a file with imports, a module's calls of its own
+    // functions made every import of it look used
     var called: Vec<str> = Vec::new();
     var fi: i64 = 0;
     while fi < program.funcs.len() {
-        TypeChecker_collect_called_funcs(self, program.funcs.get(fi).body, &mut called);
+        if tc_lint_is_program_item(self, program.funcs.get(fi).name) {
+            TypeChecker_collect_called_funcs(self, program.funcs.get(fi).body, &mut called);
+        }
         fi = fi + 1;
     }
     var impi: i64 = 0;
@@ -27343,7 +29497,9 @@ pub fn TypeChecker_lint_unused_imports(self: &mut TypeChecker, program: Program)
         var imp: ImplDef = program.impls.get(impi);
         var mi: i64 = 0;
         while mi < imp.methods.len() {
-            TypeChecker_collect_called_funcs(self, imp.methods.get(mi).body, &mut called);
+            if tc_lint_is_program_item(self, imp.struct_name + "_" + imp.methods.get(mi).name) {
+                TypeChecker_collect_called_funcs(self, imp.methods.get(mi).body, &mut called);
+            }
             mi = mi + 1;
         }
         impi = impi + 1;
@@ -27353,7 +29509,9 @@ pub fn TypeChecker_lint_unused_imports(self: &mut TypeChecker, program: Program)
         var timp: TraitImpl = program.trait_impls.get(timpi);
         var tmi: i64 = 0;
         while tmi < timp.methods.len() {
-            TypeChecker_collect_called_funcs(self, timp.methods.get(tmi).body, &mut called);
+            if tc_lint_is_program_item(self, timp.type_name + "_" + timp.methods.get(tmi).name) {
+                TypeChecker_collect_called_funcs(self, timp.methods.get(tmi).body, &mut called);
+            }
             tmi = tmi + 1;
         }
         timpi = timpi + 1;
@@ -27361,12 +29519,16 @@ pub fn TypeChecker_lint_unused_imports(self: &mut TypeChecker, program: Program)
     // N5: calls in the initializers of consts and globals
     var cdi: i64 = 0;
     while cdi < program.consts.len() {
-        TypeChecker_collect_called_funcs_expr(self, program.consts.get(cdi).expr, &mut called);
+        if tc_lint_is_program_decl(self, program.consts.get(cdi).name) {
+            TypeChecker_collect_called_funcs_expr(self, program.consts.get(cdi).expr, &mut called);
+        }
         cdi = cdi + 1;
     }
     var gvi: i64 = 0;
     while gvi < program.globals.len() {
-        TypeChecker_collect_called_funcs_expr(self, program.globals.get(gvi).init, &mut called);
+        if tc_lint_is_program_decl(self, program.globals.get(gvi).name) {
+            TypeChecker_collect_called_funcs_expr(self, program.globals.get(gvi).init, &mut called);
+        }
         gvi = gvi + 1;
     }
     called = tc_dedupe_strs(called);
@@ -27437,7 +29599,7 @@ pub fn scan_stmt_for_floats(stmt: Stmt, found: &mut Vec<str>) {
             }
             scan_expr_for_floats(expr, found);
         }
-        Stmt::LetTuple(_, expr, _) => {
+        Stmt::LetTuple(_, expr, _, _) => {
             scan_expr_for_floats(expr, found);
         }
         Stmt::Expr(expr, _) => {
@@ -27972,6 +30134,8 @@ fn TypeChecker_check_closure_body(self: &mut TypeChecker, body: Vec<Stmt>, ret_t
             }
         }
     }
+    // BG288: a closure with a declared result may not fall off its end (E047)
+    TypeChecker_check_closure_returns(self, body, ret_ty);
     return TypeChecker_check_stmts_value(self, body);
 }
 
@@ -28260,7 +30424,8 @@ fn TypeChecker_check_match_value(self: &mut TypeChecker, expr: Expr, arms: Vec<M
                 // `None =>` on an Option is the variant, as `Some(x)` is
                 // (reference §6): it binds nothing
                 if !TypeChecker_bare_pattern_is_unit_variant(self, match_ty, name) {
-                    TypeChecker_declare(self, name, match_ty);
+                    // BG291: a binding shadows an outer `val`
+                    TypeChecker_declare_shadow(self, name, match_ty);
                 }
             }
             Pattern::EnumVariant(enum_name, variant, bindings) => {
@@ -28268,7 +30433,7 @@ fn TypeChecker_check_match_value(self: &mut TypeChecker, expr: Expr, arms: Vec<M
                 var tys: Vec<Type> = TypeChecker_pattern_binding_types(self, match_ty, enum_name, variant, bindings);
                 var bi: i64 = 0;
                 while bi < bindings.len() && bi < tys.len() {
-                    TypeChecker_declare(self, bindings.get(bi).name, tys.get(bi));
+                    TypeChecker_declare_shadow(self, bindings.get(bi).name, tys.get(bi));
                     bi = bi + 1;
                 }
             }
@@ -28279,9 +30444,10 @@ fn TypeChecker_check_match_value(self: &mut TypeChecker, expr: Expr, arms: Vec<M
             _ => {
             }
         }
+        // BG414: the guard is a condition, as an `if`'s
         match arm.guard {
             OptBoxExpr::Some(g) => {
-                TypeChecker_check_expr(self, box_expr_unbox(g));
+                TypeChecker_check_guard(self, box_expr_unbox(g));
             }
             OptBoxExpr::None => {
             }
@@ -28793,7 +30959,7 @@ fn TypeChecker_collect_captured_stmts(self: &TypeChecker, stmts: Vec<Stmt>, name
             Stmt::Let(_, _, e, _, _, _, _) => {
                 TypeChecker_collect_captured_vars(self, e, names, types);
             }
-            Stmt::LetTuple(_, e, _) => {
+            Stmt::LetTuple(_, e, _, _) => {
                 TypeChecker_collect_captured_vars(self, e, names, types);
             }
             Stmt::Expr(e, _) => {
@@ -29022,6 +31188,25 @@ fn tc_type_unknown_here(t: Type) -> bool {
     return false;
 }
 
+/// BG381: "Option" or "Result" for a type `?` works on, else "".
+fn tc_try_kind(t: Type) -> str {
+    match t {
+        Type::Generic(n, _) => {
+            if n == "Option" || n == "Result" {
+                return n;
+            }
+        }
+        Type::Named(n) => {
+            if n == "Option" || n == "Result" {
+                return n;
+            }
+        }
+        _ => {
+        }
+    }
+    return "";
+}
+
 /// BG23: `e?` with e a Result<T, E1> in a function returning Result<U, E2>
 /// returns e's error as the function's: the lowering copies the payload
 /// word as it is (lower.fd Lowerer_lower_try_expr). With E1 not an E2 the
@@ -29032,6 +31217,39 @@ fn tc_type_unknown_here(t: Type) -> bool {
 /// error) are not checked.
 fn TypeChecker_check_try_error_type(self: &mut TypeChecker, ty: Type) {
     if g_tc_try_depth > 0 {
+        return;
+    }
+    // BG381: `?` on an Option in a function returning a Result returned
+    // `Err` holding the word 0 (a struct error then faulted), and `?` on a
+    // Result in a function returning an Option dropped the error into None
+    // (reference §4.5: `e?` returns "with that value", which must be one of
+    // the function's result)
+    var op_kind: str = tc_try_kind(TypeChecker_resolve_type(self, ty));
+    var fn_kind: str = "";
+    var fn_ret_shown: str = "";
+    match self.current_ret_ty {
+        OptType::Some(bg381_rt) => {
+            var bg381_r: Type = TypeChecker_resolve_type(self, TypeChecker_resolve_self_type(self, bg381_rt));
+            fn_kind = tc_try_kind(bg381_r);
+            fn_ret_shown = type_to_str(bg381_r);
+        }
+        OptType::None => {
+        }
+    }
+    if op_kind != "" && fn_kind != "" && op_kind != fn_kind {
+        var kfname: str = "this function";
+        match self.current_func_name {
+            OptString::Some(kcfn) => {
+                kfname = "'" + kcfn + "'";
+            }
+            OptString::None => {
+            }
+        }
+        if op_kind == "Option" {
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): the ? operator on an Option returns its None, but " + kfname + " returns " + fn_ret_shown + ": None is no value of a Result.\n    `?` returns what it stops on as it is; it does not make an error out of None.\n    Fix: turn the Option into a Result first (`match o { Option::Some(v) => v, Option::None => { return Result::Err(..); } }`), or make the function return an Option.");
+        } else {
+            self.errors.push("Type error (line " + int_to_str(self.current_line) + "): the ? operator on a Result returns its Err, but " + kfname + " returns " + fn_ret_shown + ": an Err is no value of an Option, and its error would be lost.\n    `?` returns what it stops on as it is; it does not turn an error into None.\n    Fix: match the Result and return Option::None on Err explicitly, or make the function return a Result.");
+        }
         return;
     }
     var from_err: Type = Type::Infer;
@@ -29259,6 +31477,18 @@ fn TypeChecker_check_comparison(self: &mut TypeChecker, op: BinOp, left: Expr, r
     var rn: str = tc_cmp_user_type(self, rt);
     if ln != "" && rn != "" && ln != rn {
         self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot compare " + ln + " with " + rn + " (`" + sym + "` takes two values of one type).\n    Fix: convert one side so both have one type (`x as f64`, int_to_str(n), parse_int(s)).");
+        return true;
+    }
+    // BG415: `<` `>` `<=` `>=` on two values of one struct or enum ordered
+    // their handle words (heap addresses), and `fid run` and pe_ir gave
+    // opposite answers: only `==` and `!=` are defined on them (reference
+    // §4.2; a unit's ordering is checked before this)
+    if ordering && ln != "" && ln == rn {
+        var bg415_kind: str = "enum";
+        if tc_is_struct(self, ln) {
+            bg415_kind = "struct";
+        }
+        self.errors.push("Type error (line " + int_to_str(self.current_line) + "): cannot order two values of " + bg415_kind + " '" + ln + "' with `" + sym + "`: only `==` and `!=` are defined for a struct or an enum.\n    Fix: compare what orders them (a field, `a.x < b.x`, or a number you give each variant), or write a method that does (`fn less(self: &" + ln + ", o: &" + ln + ") -> bool`).");
         return true;
     }
     // BG60: numbers of different types — `i64 < f64` orders an int's bits

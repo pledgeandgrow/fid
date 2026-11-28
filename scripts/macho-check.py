@@ -14,7 +14,9 @@
 # symtab/strtab bounds, and the ad-hoc code signature (CodeDirectory,
 # SHA-256 page hashes recomputed, codeLimit = signature offset).
 #
-# Usage: python3 scripts/macho-check.py <file> [--quiet]
+# Usage: python3 scripts/macho-check.py <file> [--quiet] [--platform=N]
+# --platform=N: the LC_BUILD_VERSION platform expected (default 1, macOS;
+# 2 iOS and 7 the iOS simulator, XT77's `--target aarch64-ios[-simulator]`).
 # Exit 0 if every check passes, else 1.
 
 import hashlib, struct, sys
@@ -29,6 +31,8 @@ LC_MAIN=0x80000028; LC_DATA_IN_CODE=0x29; LC_BUILD_VERSION=0x32
 LC_DYLD_CHAINED_FIXUPS=0x80000034; LC_DYLD_EXPORTS_TRIE=0x80000033
 CPU_ARM64=0x0100000C; CPU_X86_64=0x01000007; MH_PIE=0x200000
 R=1; W=2; X=4
+PLATFORMS={1:"macOS",2:"iOS",7:"iOS simulator"}
+WANT_PLATFORM=1
 
 class C:
     def __init__(s, d): s.d=d; s.fails=[]; s.log=[]; s.segs=[]; s.sects=[]
@@ -148,7 +152,7 @@ class C:
             if not ok: s.bad("LC_MAIN entry 0x%x not in a code section"%s.entryoff)
             if s.arm and s.entryoff%4: s.bad("arm64 entry not 4-aligned")
         if not hasattr(s,"bv"): s.bad("no LC_BUILD_VERSION")
-        elif s.bv[0]!=1: s.bad("platform %d not macOS"%s.bv[0])
+        elif s.bv[0]!=WANT_PLATFORM: s.bad("platform %d, expected %d (%s)"%(s.bv[0],WANT_PLATFORM,PLATFORMS.get(WANT_PLATFORM,"?")))
         if not hasattr(s,"symtab"): s.bad("no LC_SYMTAB")
         if not hasattr(s,"dyld") and LC_DYLD_CHAINED_FIXUPS not in s.blobs: s.bad("nothing binds imports")
         if s.arm and LC_CODE_SIGNATURE not in s.blobs: s.bad("arm64 without code signature")
@@ -281,6 +285,9 @@ class C:
         else: s.say("all %d page hashes verified"%ncode)
 
 def main():
+    global WANT_PLATFORM
+    for a in sys.argv[1:]:
+        if a.startswith("--platform="): WANT_PLATFORM=int(a.split("=",1)[1],0)
     args=[a for a in sys.argv[1:] if not a.startswith("--")]
     quiet="--quiet" in sys.argv
     if not args: print("usage: macho-check.py <file> [--quiet]"); return 2

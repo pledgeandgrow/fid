@@ -1,0 +1,131 @@
+// BG243 (docs/roadmap/bugs-roadmap.md): the DWARF of inlined calls in a
+// debug build of the default Windows backend (compiler/pe_ir_enc.fd
+// pe_add_dwarf, g_pe_dwarf_inl; compiler/nat_enc.fd nat_dwarf_build,
+// g_nat_dbg_inl: an abstract DW_TAG_subprogram per callee, with
+// DW_AT_inline and its `fn` line, and a DW_TAG_inlined_subroutine per call
+// in its caller, with the code range, DW_AT_call_file and DW_AT_call_line).
+// A stand-in .text with one function, `outer`, into which `inner` (lines
+// below) was inlined twice: bytes [8, 20) for the call on line 52 and
+// [30, 34) for the one on line 53; the image goes to $PE_DWARF_OUT (when
+// set) for tests/nattools/pe_dwarf_inl_check.py, which decodes it (and
+// runs llvm-dwarfdump --verify when installed).
+// Run (from the repository root):
+//   fid run tests/nattools/pe_dwarf_inl_unit.fd
+// Expected output:
+// sections 6
+// abbrev 21 22 true
+// globals restored true
+// without calls: abbrev 21 false
+use core;
+use vec;
+use string;
+use file;
+use compiler::nat_enc;
+use compiler::pe_ir_enc;
+
+fn inner(x: i64) -> i64 {
+    return x * 3;
+}
+
+fn le16(b: & Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8);
+}
+
+fn le32(b: & Vec<i64>, at: i64) -> i64 {
+    return b.get(at) | (b.get(at + 1) << 8) | (b.get(at + 2) << 16) | (b.get(at + 3) << 24);
+}
+
+/// Is there an abbreviation `code` in the image's .debug_abbrev? (the
+/// codes this writer uses are one byte, each followed by its tag)
+fn has_abbrev(img: & Vec<i64>, code: i64, tag: i64) -> bool {
+    var i: i64 = 0;
+    while i + 2 < img.len() {
+        if img.get(i) == 0 && img.get(i + 1) == 0 && img.get(i + 2) == code && i + 3 < img.len() && img.get(i + 3) == tag {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn outer(a: i64) -> i64 {
+    var b: i64 = inner(a);
+    var c: i64 = inner(b);
+    return b + c;
+}
+
+fn main() {
+    var text: Vec<i64> = Vec::new();
+    // push rbp; mov rbp, rsp; nops; pop rbp; ret
+    text.push(0x55);
+    text.push(0x48);
+    text.push(0x89);
+    text.push(0xE5);
+    var i: i64 = 4;
+    while i < 62 {
+        text.push(0x90);
+        i = i + 1;
+    }
+    text.push(0x5D);
+    text.push(0xC3);
+    var rdata: Vec<i64> = Vec::new();
+    while rdata.len() < 64 {
+        rdata.push(0);
+    }
+    var names: Vec<str> = Vec::new();
+    names.push("outer");
+    var starts: Vec<i64> = Vec::new();
+    starts.push(0);
+    var ends: Vec<i64> = Vec::new();
+    ends.push(64);
+    // rows [offset, line, end?]: outer's `fn` line, its body, the inlined
+    // body's line (a nop each), the end
+    var rows: Vec<i64> = Vec::new();
+    rows.push(0);
+    rows.push(51);
+    rows.push(0);
+    rows.push(4);
+    rows.push(52);
+    rows.push(0);
+    rows.push(8);
+    rows.push(27);
+    rows.push(0);
+    rows.push(20);
+    rows.push(53);
+    rows.push(0);
+    rows.push(30);
+    rows.push(27);
+    rows.push(0);
+    rows.push(34);
+    rows.push(54);
+    rows.push(0);
+    rows.push(64);
+    rows.push(0);
+    rows.push(1);
+    var vars: Vec<str> = Vec::new();
+    vars.push("P\ta\ti64\t8\t5\tf-24\nV\tb\ti64\t8\t5\tf-32\nV\tc\ti64\t8\t5\tf-40");
+    var types: Vec<str> = Vec::new();
+    var file: str = "tests/nattools/pe_dwarf_inl_unit.fd";
+    g_pe_dwarf_inl = Vec::new();
+    g_pe_dwarf_inl.push("I\tinner\t52\t26\t8\t20\nI\tinner\t53\t26\t30\t34");
+    var img0: Vec<i64> = pe_build_file(text, rdata, 0x1000, 0x2040, 0x2000, 24, 0x2000);
+    var img: Vec<i64> = pe_add_dwarf(img0, text, names, starts, ends, rows, file, vars, types);
+    pe_append_coff_symbols_pre(& mut img, pe_dwarf_section_names(), names, starts);
+    var pe: i64 = le32(& img, 0x3C);
+    println("sections " + int_to_str(le16(& img, pe + 6)));
+    println("abbrev 21 22 " + bool_to_str(has_abbrev(& img, 21, 0x2E) && has_abbrev(& img, 22, 0x1D)));
+    println("globals restored " + bool_to_str(g_nat_dbg_inl.len() == 0 && !g_nat_dbg_ext));
+    // no inlined calls: the sections as before (no abbreviation 21)
+    g_pe_dwarf_inl = Vec::new();
+    var img1: Vec<i64> = pe_add_dwarf(pe_build_file(text, rdata, 0x1000, 0x2040, 0x2000, 24, 0x2000), text, names, starts, ends, rows, file, vars, types);
+    println("without calls: abbrev 21 " + bool_to_str(has_abbrev(& img1, 21, 0x2E)));
+    match env_var("PE_DWARF_OUT") {
+        Option::Some(out) => {
+            if file_write_bytes(out, img) != 0 {
+                println("could not write " + out);
+            }
+        }
+        Option::None => {
+        }
+    }
+}

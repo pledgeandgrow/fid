@@ -1,0 +1,42 @@
+// BG245 (docs/roadmap/bugs-roadmap.md): in an optimized native build a
+// value held in a register stays visible to a debugger after its last
+// use, until something writes that register (compiler/nat_ir.fd
+// ng_dbg_live_ranges, ng_dbg_clobbers). The machine layer's DWARF location
+// lists used to cover only where a value is live, its last use one byte
+// of it, so at @spread below every parameter and p, q, r, s (all read for
+// the last time on the lines before) showed as `<optimized out>`.
+// Check: python3 tests/nattools/dbg_hold_check.py --fid <fid>, which reads the
+// location lists of x86_64/aarch64/riscv64 Linux builds at the marker
+// (more variables there than with FID_NAT_OFF=dbghold) and, on Windows
+// with gdb installed, stops a `--nat` build (FID_NAT_DWARF=1) there: every
+// value gdb shows is the one below, and it shows more than before.
+// `// @name` marks a line to stop on; `// dbg name#hit var=value` is what
+// a variable holds at that hit when it is shown (dbg_run_check.py's
+// syntax: none is required, `<optimized out>` stays allowed).
+// Expected output:
+// 70
+// 85
+
+fn spread(a: i64, b: i64, c: i64) -> i64 {
+    if a == -123456789 {
+        panic("spread: out-of-line fixture guard");
+    }
+    var p: i64 = a + 1;
+    var q: i64 = b + 2;
+    var r: i64 = c + 3;
+    var s: i64 = p * q;
+    var t: i64 = s + r;
+    var u: i64 = t * 5; // @spread
+    if u > 1000000000 {
+        println(u);
+    }
+    return u;
+}
+
+fn main() {
+    println(spread(1, 2, 3));
+    println(spread(3, 1, 2));
+}
+
+// dbg spread#1 a=1 b=2 c=3 p=2 q=4 r=6 s=8 t=14
+// dbg spread#2 a=3 b=1 c=2 p=4 q=3 r=5 s=12 t=17

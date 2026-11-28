@@ -1,0 +1,77 @@
+// Bugs roadmap BG235: what the closure lock-order check must not reject.
+// Closures are now walked in their function's lock names; these take
+// their locks in the order main does, name no lock by their own
+// parameters, run spawned with nothing held, or run under with_lock in
+// the same order as elsewhere (test_bg235_closure_lock_order_fail.fd and
+// test_bg235_closure_call_held_fail.fd are the rejected forms).
+//
+// Expected output:
+// ok
+var A: i64 = 0;
+var B: i64 = 0;
+fn with_lock(m: i64, f: fn() -> i64) -> i64 {
+    p_mutex_lock(m);
+    val r = f();
+    p_mutex_unlock(m);
+    return r;
+}
+fn main() -> i64 {
+    A = p_mutex_init();
+    B = p_mutex_init();
+    val a = p_mutex_init();
+    val b = p_mutex_init();
+    p_mutex_lock(a);
+    p_mutex_lock(b);
+    p_mutex_unlock(b);
+    p_mutex_unlock(a);
+    // same order in the closure
+    val f = fn() -> i64 {
+        p_mutex_lock(a);
+        p_mutex_lock(b);
+        p_mutex_unlock(b);
+        p_mutex_unlock(a);
+        return 0;
+    };
+    f();
+    // a closure parameter named like a lock is no lock
+    val g = fn(a: i64) -> i64 {
+        p_mutex_lock(b);
+        p_mutex_lock(a);
+        p_mutex_unlock(a);
+        p_mutex_unlock(b);
+        return 0;
+    };
+    g(p_mutex_init());
+    // a closure that takes b, called with nothing held, and one under a
+    val h = fn() -> i64 {
+        p_mutex_lock(b);
+        p_mutex_unlock(b);
+        return 0;
+    };
+    h();
+    p_mutex_lock(a);
+    h();
+    p_mutex_unlock(a);
+    // with_lock and a closure literal, the same order
+    with_lock(A, fn() -> i64 {
+        p_mutex_lock(B);
+        p_mutex_unlock(B);
+        return 0;
+    });
+    p_mutex_lock(A);
+    p_mutex_lock(B);
+    p_mutex_unlock(B);
+    p_mutex_unlock(A);
+    // a spawned closure call starts with nothing held
+    val k = fn() -> i64 {
+        p_mutex_lock(a);
+        p_mutex_unlock(a);
+        return 0;
+    };
+    p_mutex_lock(b);
+    val t = spawn k();
+    p_mutex_unlock(b);
+    await t;
+    println("ok");
+    return 0;
+}

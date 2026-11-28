@@ -1,0 +1,40 @@
+// BG319 (docs/roadmap/bugs-roadmap.md): yaml_load bounds what aliases copy.
+// A document may copy at most YAML_ALIAS_FLOOR (1000) entries through
+// aliases plus YAML_ALIAS_RATIO (10) per entry it writes itself; past that
+// it is an error ("billion laughs": each line `x: &x [*w, *w, *w, *w, *w,
+// *w]` multiplied the entries by 6, so 180 bytes gave 67,182 entries and
+// 300 bytes would give about 87 million). Ordinary aliases still copy.
+//
+// Expected output:
+// false
+// aliases expand too far...
+// true
+// false
+// true 16
+// x
+// 5
+use yaml;
+
+fn main() -> i64 {
+    // the entry's trigger, cut to four lines (1,864 entries before the fix)
+    val bomb = "a: &a [x,x,x,x,x,x]\nb: &b [*a,*a,*a,*a,*a,*a]\nc: &c [*b,*b,*b,*b,*b,*b]\nd: &d [*c,*c,*c,*c,*c,*c]\n";
+    val d = yaml_load(bomb);
+    println(bool_text(d.ok));
+    println(str_slice(d.error, str_find(d.error, "aliases"), str_len(d.error)));
+    println(bool_text(d.entries.len() < 1200));
+    // the lenient reader stops copying too
+    println(bool_text(yaml_parse(bomb).len() > 1200));
+    // ordinary aliases and a merge key still work
+    val ok = yaml_load("base: &b\n  name: x\n  port: 5\nuse: *b\nother:\n  <<: *b\n  port: 6\nlist: [*b, *b]\n");
+    println(f"{bool_text(ok.ok)} {ok.entries.len()}");
+    println(yaml_get_str(ok.entries, "use.name"));
+    println(yaml_get_str(ok.entries, "list.1.port"));
+    return 0;
+}
+
+fn bool_text(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}

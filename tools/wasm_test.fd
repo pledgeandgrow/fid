@@ -1,7 +1,9 @@
 // tools/wasm_test.fd — run tests through the native WebAssembly backend:
 // the Fides port of scripts/wasm-test.sh (roadmap AD4). Same arguments,
-// the same environment (FID, JOBS, OUT, ALL, REUSE), the same files in
-// $OUT and the same output and exit status:
+// the same environment (FID, JOBS, OUT, ALL, REUSE, LANE_SKIPS,
+// WASM_LANE), the same files in $OUT and the same output and exit status
+// (XT28: the lane's skips and `//@ backends:` lines, the Expected output
+// block when the interpreter gives no reference: see the script):
 //
 //   fid ccompile tools/wasm_test.fd -o wasm_test.exe
 //   wasm_test.exe [test.fd ...]
@@ -18,7 +20,9 @@
 // build, then the validations, then the runs under Node), JOBS commands
 // at a time, where the script runs each test's steps in turn, JOBS tests
 // at a time: the same files, other timing; every child's stdin is at its
-// end.
+// end. A test's `//@ env: NAME=value` lines, which the script sets for its
+// three commands, are not set here (tt_pool gives every command one
+// environment): run such a test with the script.
 
 use core;
 use fs;
@@ -40,18 +44,86 @@ fn wt_skip_re(base: str) -> bool {
 }
 
 /// The first line of `text` holding (any case) error, not available,
-/// panic or INVALID, cut to `max` bytes ("" when none).
+/// panic or INVALID, cut to 160 bytes ("" when none); the compiler's
+/// [build] / [prof] lines left out.
 fn wt_grep_build(text: str) -> str {
     val lines: Vec<str> = tt_lines(text);
     var i: i64 = 0;
     while i < lines.len() {
         val l: str = lines.get(i);
         i = i + 1;
+        // the compiler's progress lines ("[build] ... Checking errors...")
+        if str_starts_with(l, "[build]") || str_starts_with(l, "[prof]") { continue; }
         val low: str = str_to_lower(l);
         if str_contains(low, "error") || str_contains(low, "not available") || str_contains(low, "panic") || str_contains(low, "invalid") {
             if str_len(l) > 160 { return str_slice(l, 0, 160); }
             return l;
         }
+    }
+    return "";
+}
+
+/// A lane-skips line's three fields: the pattern, the test, the reason
+/// (`read -r spat stest swhy`)
+fn wt_read3(line: str) -> Vec<str> {
+    var out: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    val n: i64 = str_len(line);
+    var w: i64 = 0;
+    while w < 2 {
+        while i < n && (str_byte_at(line, i) == 32 || str_byte_at(line, i) == 9) { i = i + 1; }
+        var j: i64 = i;
+        while j < n && str_byte_at(line, j) != 32 && str_byte_at(line, j) != 9 { j = j + 1; }
+        out.push(str_slice(line, i, j));
+        i = j;
+        w = w + 1;
+    }
+    while i < n && (str_byte_at(line, i) == 32 || str_byte_at(line, i) == 9) { i = i + 1; }
+    out.push(tt_trim_blanks(str_slice(line, i, n)));
+    return out;
+}
+
+/// XT28: the test's `//@ backends:` list without blanks ("" when none)
+fn wt_backends(path: str) -> str {
+    val lines: Vec<str> = tt_lines(tt_read(path));
+    var i: i64 = 0;
+    while i < lines.len() {
+        val l: str = tt_drop_cr(lines.get(i));
+        i = i + 1;
+        if str_starts_with(l, "//@ backends:") {
+            var v: str = str_slice(l, 13, str_len(l));
+            v = str_replace(v, " ", "");
+            return str_replace(v, "\t", "");
+        }
+    }
+    return "";
+}
+
+/// XT28: what the interpreter cannot do, so that its run is no reference
+/// (wasm-test.sh interp_no_ref): call C, a builtin it lacks, its memory
+/// limit, its recursion limit, the fid process itself out of memory
+fn wt_interp_no_ref(err: str) -> bool {
+    if str_contains(err, "is not available in the interpreter") || str_contains(err, "the interpreter holds at most") { return true; }
+    val lines: Vec<str> = tt_lines(err);
+    var i: i64 = 0;
+    while i < lines.len() {
+        val l: str = lines.get(i);
+        i = i + 1;
+        if str_starts_with(l, "Panic: a C function pointer ") && str_contains(l, " can only be called in a C build") { return true; }
+        if str_starts_with(l, "Panic: Unknown runtime function") { return true; }
+        if str_starts_with(l, "Panic: Recursion depth limit (") && str_contains(l, ") exceeded") { return true; }
+        if str_starts_with(l, "Panic: out of memory (allocating ") && str_contains(l, " bytes)") { return true; }
+    }
+    return false;
+}
+
+/// The first "Panic:" line of `text` ("" when none)
+fn wt_first_panic(text: str) -> str {
+    val lines: Vec<str> = tt_lines(text);
+    var i: i64 = 0;
+    while i < lines.len() {
+        if str_starts_with(lines.get(i), "Panic:") { return tt_no_cr(lines.get(i)); }
+        i = i + 1;
     }
     return "";
 }
@@ -109,7 +181,74 @@ fn main() -> i64 {
             i2 = i2 + 1;
         }
     }
-    println("fid wasm: " + int_to_str(tests.len()) + " tests, " + jobs_s + " at a time, output in " + out);
+    // XT28: the tests left out on this lane (scripts/lane-skips.txt, whose
+    // patterns are matched against WASM_LANE, and a `//@ backends:` line
+    // that does not name wasm), "SKIP  <test> (<reason>)" in the results
+    val lane_skips: str = tt_env_or("LANE_SKIPS", "scripts/lane-skips.txt");
+    val lane: str = tt_env_or("WASM_LANE", "wasm32-wasi-native");
+    var ls_names: Vec<str> = Vec::new();
+    var ls_why: Vec<str> = Vec::new();
+    if lane_skips != "/dev/null" && fs_exists(lane_skips) && !fs_is_dir(lane_skips) {
+        val parts: Vec<str> = str_split(tt_read(lane_skips), "\n");
+        var li: i64 = 0;
+        while li + 1 < parts.len() {
+            val lw: Vec<str> = wt_read3(parts.get(li));
+            li = li + 1;
+            var spat: str = lw.get(0);
+            if str_len(spat) == 0 || str_starts_with(spat, "#") { continue; }
+            var neg: bool = false;
+            if str_starts_with(spat, "!") {
+                neg = true;
+                spat = str_slice(spat, 1, str_len(spat));
+            }
+            if tt_case_match(lane, spat) != neg {
+                ls_names.push(tt_drop_cr(lw.get(1)));
+                val swhy: str = tt_drop_cr(lw.get(2));
+                if str_len(swhy) > 0 { ls_why.push(swhy); } else { ls_why.push("skipped on " + lane); }
+            }
+        }
+    }
+    var bi: i64 = 0;
+    while bi < tests.len() {
+        val bl: str = wt_backends(tests.get(bi));
+        if str_len(bl) > 0 && !str_contains("," + bl + ",", ",wasm,") {
+            ls_names.push(tt_base(tests.get(bi)));
+            ls_why.push("its //@ backends: line is " + bl);
+        }
+        bi = bi + 1;
+    }
+    val all_tests: Vec<str> = tests;
+    tests = Vec::new();
+    var lskip: i64 = 0;
+    bi = 0;
+    while bi < all_tests.len() {
+        val tb: str = tt_base(all_tests.get(bi));
+        var listed: bool = false;
+        var k0: i64 = 0;
+        while k0 < ls_names.len() && !listed {
+            if ls_names.get(k0) == tb { listed = true; }
+            k0 = k0 + 1;
+        }
+        if listed { lskip = lskip + 1; } else { tests.push(all_tests.get(bi)); }
+        bi = bi + 1;
+    }
+    // in the list's order, as the script prints them
+    var skipped_lines: Vec<str> = Vec::new();
+    var k1: i64 = 0;
+    while k1 < ls_names.len() {
+        var t1: i64 = 0;
+        while t1 < all_tests.len() {
+            if tt_base(all_tests.get(t1)) == ls_names.get(k1) {
+                skipped_lines.push("SKIP  " + ls_names.get(k1) + " (" + ls_why.get(k1) + ")");
+                break;
+            }
+            t1 = t1 + 1;
+        }
+        k1 = k1 + 1;
+    }
+    var head_line: str = "fid wasm: " + int_to_str(tests.len()) + " tests, " + jobs_s + " at a time, output in " + out;
+    if lskip > 0 { head_line = head_line + " (" + int_to_str(lskip) + " skipped on " + lane + ")"; }
+    println(head_line);
 
     var env: Vec<str> = Vec::new();
     env.push("FID=" + fid);
@@ -200,21 +339,50 @@ fn main() -> i64 {
     val res: str = out + "/results.txt";
     fs_write_text(res, "");
     i = 0;
+    while i < skipped_lines.len() {
+        tt_append_line(res, skipped_lines.get(i));
+        i = i + 1;
+    }
+    i = 0;
     while i < tests.len() {
         val f: str = tests.get(i);
         i = i + 1;
         val b: str = tt_base(f);
         val pre: str = out + "/" + b;
         val erc: str = tt_cat(pre + ".expected_rc");
-        if erc == "124" || tt_has_line_prefix(pre + ".expected", "Compilation error") || tt_has_line_prefix(pre + ".expected", "error: ") {
-            tt_append_line(res, "SKIP  " + b + " (fid run gives no reference: rc " + erc + ")");
+        var compile_err: bool = false;
+        var ci: i64 = 0;
+        val refs: Vec<str> = wt_v3(pre + ".expected", pre + ".expected_err", "");
+        while ci < 2 {
+            if tt_has_line_prefix(refs.get(ci), "Compilation error") || tt_has_line_prefix(refs.get(ci), "error: ") { compile_err = true; }
+            ci = ci + 1;
+        }
+        if compile_err {
+            tt_append_line(res, "SKIP  " + b + " (fid run gives no reference: a compile error)");
             skip = skip + 1;
             continue;
         }
-        if str_contains(tt_read(pre + ".expected_err"), "is not available in the interpreter") {
-            tt_append_line(res, "SKIP  " + b + " (fid run cannot run its FFI)");
-            skip = skip + 1;
-            continue;
+        // XT28: no reference from the interpreter: the test's own
+        // `// Expected output:` block is (as in cross-test.sh)
+        var whyblock: str = "";
+        val eerr: str = tt_read(pre + ".expected_err");
+        if erc == "124" {
+            whyblock = "fid run timed out";
+        } else if wt_interp_no_ref(eerr) {
+            var pl: str = wt_first_panic(eerr);
+            var pe: i64 = str_len(pl);
+            if pe > 80 { pe = 80; }
+            if pe > 7 { pl = str_slice(pl, 7, pe); } else { pl = ""; }
+            whyblock = "fid run: " + pl;
+        }
+        var byblock: bool = false;
+        if str_len(whyblock) > 0 {
+            if !str_contains(tt_read(f), "\n// Expected output:") && !str_starts_with(tt_read(f), "// Expected output:") {
+                tt_append_line(res, "SKIP  " + b + " (no reference: " + whyblock + ", and the test has no Expected output)");
+                skip = skip + 1;
+                continue;
+            }
+            byblock = true;
         }
         if tt_cat(pre + ".build_rc") != "0" {
             tt_append_line(res, "BUILD " + b + ": " + wt_grep_build(tt_read(pre + ".build.log")));
@@ -239,7 +407,20 @@ fn main() -> i64 {
             continue;
         }
         val arc: str = tt_cat(pre + ".actual_rc");
-        if arc == erc && tt_panic_key(pre + ".expected_err", false) == tt_panic_key(pre + ".stderr", false) && tt_no_cr(tt_read(pre + ".expected")) == tt_no_cr(tt_read(pre + ".actual")) {
+        if byblock {
+            val blk: str = tt_block_of(f, true);
+            fs_write_text(pre + ".expected_block", blk);
+            val xrc: str = tt_block_exit_of(f);
+            if arc == xrc && tt_same_lines(tt_no_cr(tt_read(pre + ".actual")), blk, true) {
+                tt_append_line(res, "PASS  " + b);
+                pass = pass + 1;
+            } else {
+                tt_append_line(res, "FAIL  " + b + " (rc " + arc + ", its Expected output: rc " + xrc + "; " + whyblock + ")");
+                fail = fail + 1;
+            }
+            continue;
+        }
+        if arc == erc && tt_panic_key(pre + ".expected_err", true) == tt_panic_key(pre + ".stderr", true) && tt_no_cr(tt_read(pre + ".expected")) == tt_no_cr(tt_read(pre + ".actual")) {
             tt_append_line(res, "PASS  " + b);
             pass = pass + 1;
         } else {
@@ -257,7 +438,8 @@ fn main() -> i64 {
         println(l);
         shown = shown + 1;
     }
-    println("fid wasm: " + int_to_str(pass) + " passed, " + int_to_str(fail) + " failed, " + int_to_str(berr) + " did not build, " + int_to_str(skip) + " skipped (of " + int_to_str(tests.len()) + ")");
+    skip = skip + lskip;
+    println("fid wasm: " + int_to_str(pass) + " passed, " + int_to_str(fail) + " failed, " + int_to_str(berr) + " did not build, " + int_to_str(skip) + " skipped (of " + int_to_str(all_tests.len()) + ")");
     if fail == 0 && berr == 0 { return 0; }
     return 1;
 }

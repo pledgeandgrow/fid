@@ -1001,8 +1001,82 @@ pub fn cbor_float_diag(x: f64) -> str {
         if (i as f64) == x {
             return int_to_str(i) + ".0";
         }
+        return float_to_str(x);
     }
-    return float_to_str(x);
+    // BG478: from 2^53 a double is a whole number and float_to_str gives
+    // its integer digits, which diagnostic notation reads as an integer
+    // (RFC 8949 §8): from 10^16 on written with an exponent instead, in the
+    // fewest significant digits that read back as the same double
+    // (3.4028234663852886e+38, 1.0e+300)
+    var sign: str = "";
+    if x < 0.0 {
+        sign = "-";
+    }
+    val dg: str = float_to_str(a);
+    var k: i64 = 0;
+    while k < str_len(dg) {
+        val c: i64 = str_byte_at(dg, k);
+        if c < 48 || c > 57 {
+            return float_to_str(x);
+        }
+        k = k + 1;
+    }
+    // below 10^16 the digits with ".0", as below 2^53 (and as JSON tools
+    // and Python write them)
+    if str_len(dg) <= 16 {
+        return sign + dg + ".0";
+    }
+    var nd: i64 = 1;
+    while nd <= 17 && nd <= str_len(dg) {
+        val cand: str = cbor_sci_digits(dg, nd);
+        if str_parse_float(cand) == a {
+            return sign + cand;
+        }
+        nd = nd + 1;
+    }
+    return sign + dg + ".0";
+}
+
+// The whole number with decimal digits `dg` (no sign, no leading zero) in
+// `nd` significant digits, rounded half up, as "D.DDDe+E" (at least one
+// digit after the point).
+fn cbor_sci_digits(dg: str, nd: i64) -> str {
+    var e: i64 = str_len(dg) - 1;
+    var ds: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < nd {
+        ds.push(str_byte_at(dg, i) - 48);
+        i = i + 1;
+    }
+    if nd < str_len(dg) && str_byte_at(dg, nd) >= 53 {
+        var j: i64 = nd - 1;
+        var carry: bool = true;
+        while carry && j >= 0 {
+            val v: i64 = ds.get(j) + 1;
+            if v == 10 {
+                ds.set(j, 0);
+                j = j - 1;
+            } else {
+                ds.set(j, v);
+                carry = false;
+            }
+        }
+        if carry {
+            // 9.99.. rounded up to 10: one more power of ten
+            ds.set(0, 1);
+            e = e + 1;
+        }
+    }
+    var out: str = int_to_str(ds.get(0)) + ".";
+    if nd == 1 {
+        out = out + "0";
+    }
+    i = 1;
+    while i < nd {
+        out = out + int_to_str(ds.get(i));
+        i = i + 1;
+    }
+    return out + "e+" + int_to_str(e);
 }
 
 /// Diagnostic notation of node `node`.

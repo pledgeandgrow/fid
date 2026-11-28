@@ -1,0 +1,84 @@
+// XT32 files: path_open (create, truncate, append, read-only), fd_write,
+// fd_read, fd_seek (sizes, reads at an offset), fd_close,
+// path_filestat_get (exists, is a file, size, mtime), path_rename,
+// path_unlink_file, a file's pages (p_fs_map: mmap of a descriptor, read
+// with fd_read under WASI), and paths relative to "." and absolute ones
+// under "/" and "/tmp" (the preopened directories, scripts/wasm-run.mjs).
+// tests/wasm/wasi-check.sh runs it in an empty folder under Node and
+// compares the output with wasi_files.expected (as `fid run` prints it).
+use fs;
+
+fn b(x: bool) -> str {
+    if x { return "t"; }
+    return "f";
+}
+
+/// The sum of the n bytes at p
+@unsafe
+fn byte_sum(p: i64, n: i64) -> i64 {
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while i < n {
+        var at: *mut u8 = p + i;
+        var x: i64 = 0;
+        // SAFETY: p is a mapping of at least n bytes (p_fs_map)
+        unsafe { x = (*at) as i64; }
+        sum = sum + x;
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn main() -> i64 {
+    val f: str = "xt32_a.txt";
+    println("w1 " + b(fs_write_text(f, "hello")));
+    println("e1 " + b(fs_exists(f)) + " " + b(fs_is_file(f)) + " " + b(fs_is_dir(f)));
+    println("s1 " + int_to_str(fs_file_size(f)));
+    println("r1 " + fs_read_text(f));
+    println("a1 " + b(fs_append_text(f, ", world")));
+    println("r2 " + fs_read_text(f) + " " + int_to_str(fs_file_size(f)));
+    // truncated by a second write
+    println("w2 " + b(fs_write_text(f, "abc")));
+    println("r3 " + fs_read_text(f));
+    // bytes, a read at an offset
+    var bytes: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 300 {
+        bytes.push((i * 7) % 256);
+        i = i + 1;
+    }
+    println("wb " + b(fs_write_bytes("xt32_b.bin", bytes)));
+    val back: Vec<i64> = fs_read_bytes("xt32_b.bin");
+    println("rb " + int_to_str(back.len()) + " " + int_to_str(back.get(0)) + " " + int_to_str(back.get(299)));
+    val part: Vec<i64> = p_file_read_at("xt32_b.bin", 250, 10);
+    println("ra " + int_to_str(part.len()) + " " + int_to_str(part.get(0)) + " " + int_to_str(part.get(9)));
+    val past: Vec<i64> = p_file_read_at("xt32_b.bin", 295, 10);
+    println("rp " + int_to_str(past.len()));
+    // mtime: a time after 2020
+    println("mt " + b(fs_modified_ms(f) > 1577836800000));
+    // copy (copy_file_range and sendfile are ENOSYS: read/write)
+    println("cp " + int_to_str(fs_copy_file("xt32_b.bin", "xt32_c.bin")) + " " + int_to_str(fs_file_size("xt32_c.bin")));
+    // a file's pages
+    val m: i64 = p_fs_map("xt32_b.bin", 300);
+    var sum: i64 = 0;
+    if m != 0 {
+        // SAFETY: the 300 bytes p_fs_map mapped
+        unsafe {
+            sum = byte_sum(m, 300);
+        }
+        p_fs_unmap(m, 300);
+    }
+    println("mm " + b(m != 0) + " " + int_to_str(sum));
+    // rename, delete
+    println("mv " + b(fs_rename(f, "xt32_d.txt")) + " " + b(fs_exists(f)) + " " + fs_read_text("xt32_d.txt"));
+    println("rm " + b(fs_delete("xt32_d.txt")) + " " + b(fs_exists("xt32_d.txt")));
+    fs_delete("xt32_b.bin");
+    fs_delete("xt32_c.bin");
+    // a file that is not there
+    println("no " + b(fs_exists("xt32_none.txt")) + " " + int_to_str(fs_file_size("xt32_none.txt")) + " [" + fs_read_text("xt32_none.txt") + "]");
+    println("nd " + b(fs_delete("xt32_none.txt")));
+    // in /tmp (the host's temporary folder)
+    val t: str = "/tmp/xt32_tmp_" + int_to_str(p_clock_now_us() % 1000000) + ".txt";
+    println("tm " + b(fs_write_text(t, "tmp")) + " " + fs_read_text(t) + " " + b(fs_delete(t)));
+    return 0;
+}

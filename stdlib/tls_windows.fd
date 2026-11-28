@@ -187,7 +187,7 @@ fn ts_copy(dst: i64, src: i64, n: i64) {
     // that and the caller's address/length pair of tls_session_send/recv
     // (the caller's contract: n bytes valid at addr).
     unsafe {
-        ts_memmove(dst as * u8, src as * u8, n);
+        ts_memmove(dst as *u8, src as *u8, n);
     }
 }
 
@@ -769,7 +769,7 @@ pub fn tls_connect_alpn_unchecked(host: str, port: i64, protos: str) -> i64 {
 // (the first word is the one-element paCred array) and the store it came
 // from (ts_free_slot frees both). 0 on failure.
 fn ts_server_slot(pfx_path: str, password: str) -> i64 {
-    var file: *u8 = 0 as * u8;
+    var file: *u8 = 0 as *u8;
     // SAFETY: fopen reads two NUL-terminated strs (the path and "rb");
     // the FILE it returns is closed below, a null one is checked next.
     unsafe {
@@ -787,7 +787,7 @@ fn ts_server_slot(pfx_path: str, password: str) -> i64 {
     // (not used afterwards).
     unsafe {
         data = p_malloc(cap);
-        size = ts_fread(data as * u8, 1, cap, file);
+        size = ts_fread(data as *u8, 1, cap, file);
         ts_fclose(file);
     }
     // The password as UTF-16
@@ -809,13 +809,13 @@ fn ts_server_slot(pfx_path: str, password: str) -> i64 {
     // The key goes to the user's key store: Schannel cannot use one held only
     // in memory (PKCS12_NO_PERSIST_KEY gives SEC_E_NO_CREDENTIALS). It goes
     // to a CNG provider (TS_PFX_CNG), and tls_server_close deletes it.
-    var store: *u8 = 0 as * u8;
+    var store: *u8 = 0 as *u8;
     // SAFETY: blob is a CRYPT_DATA_BLOB (cbData = the size bytes fread
     // wrote, pbData = data) and wide the NUL-terminated UTF-16 password
     // (n + 1 zeroed words hold n u16 and the NUL); PFXImportCertStore only
     // reads them and copies what it keeps into the store it returns.
     unsafe {
-        store = sc_pfx_import(blob as * u8, wide as * u8, TS_PFX_CNG);
+        store = sc_pfx_import(blob as *u8, wide as *u8, TS_PFX_CNG);
     }
     // SAFETY: the three blocks allocated above (ts_zeroed, ts_zeroed,
     // p_malloc), not used after the import.
@@ -833,7 +833,7 @@ fn ts_server_slot(pfx_path: str, password: str) -> i64 {
     // search parameter and no previous certificate (both null), as
     // CERT_FIND_ANY allows.
     unsafe {
-        cert = sc_find_cert(store, 65537, 0, 0, 0 as * u8, 0 as * u8) as i64;
+        cert = sc_find_cert(store, 65537, 0, 0, 0 as *u8, 0 as *u8) as i64;
     }
     if cert == 0 {
         // SAFETY: the store opened by the import above, closed once and
@@ -862,7 +862,7 @@ fn ts_delete_key(cert: i64) -> bool {
     // CertGetCertificateContextProperty only writes the needed size into
     // the DWORD at size (a one-word block).
     unsafe {
-        have_info = sc_cert_prop(cert as * u8, TS_KEY_PROV_INFO, 0 as * u8, size as * u8);
+        have_info = sc_cert_prop(cert as *u8, TS_KEY_PROV_INFO, 0 as *u8, size as *u8);
     }
     if have_info == 0 {
         // SAFETY: the ts_zeroed block above, not used again.
@@ -880,7 +880,7 @@ fn ts_delete_key(cert: i64) -> bool {
         // call asked for and the one passed in the DWORD at size; the
         // property is copied into it.
         unsafe {
-            got_info = sc_cert_prop(cert as * u8, TS_KEY_PROV_INFO, info as * u8, size as * u8) != 0;
+            got_info = sc_cert_prop(cert as *u8, TS_KEY_PROV_INFO, info as *u8, size as *u8) != 0;
         }
     }
     if got_info && ts_get32(info + 16) == 0 {
@@ -891,7 +891,7 @@ fn ts_delete_key(cert: i64) -> bool {
         // name is the NUL-terminated UTF-16 pwszProvName inside info (alive
         // until info is freed below).
         unsafe {
-            opened = nc_open_provider(prov as * u8, ts_get(info + 8) as * u8, 0);
+            opened = nc_open_provider(prov as *u8, ts_get(info + 8) as *u8, 0);
         }
         if opened == 0 {
             val flags: i64 = ts_get32(info + 20) & TS_MACHINE_KEY;
@@ -900,7 +900,7 @@ fn ts_delete_key(cert: i64) -> bool {
             // out-slot; the container name is the NUL-terminated UTF-16
             // pwszContainerName inside info.
             unsafe {
-                key_rc = nc_open_key(ts_get(prov), key as * u8, ts_get(info) as * u8, 0, flags);
+                key_rc = nc_open_key(ts_get(prov), key as *u8, ts_get(info) as *u8, 0, flags);
             }
             if key_rc == 0 {
                 // NCryptDeleteKey frees the key handle when it succeeds
@@ -948,7 +948,7 @@ fn ts_free_slot(slot: i64) {
         // it were freed first (tls_server_close) or never made (tls_server
         // failing).
         unsafe {
-            sc_free_cert(cert as * u8);
+            sc_free_cert(cert as *u8);
         }
     }
     val store: i64 = ts_get(slot + 8);
@@ -956,7 +956,7 @@ fn ts_free_slot(slot: i64) {
         // SAFETY: the store PFXImportCertStore opened for this slot, closed
         // once, after its certificate was freed above.
         unsafe {
-            sc_close_store(store as * u8, 0);
+            sc_close_store(store as *u8, 0);
         }
     }
     // SAFETY: the slot's ts_zeroed block; its owner (the server block or

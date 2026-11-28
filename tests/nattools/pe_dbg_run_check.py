@@ -27,6 +27,14 @@ DWARF readers and test-file syntax it reuses):
                                          the first must be at its first
                                          byte, on its `fn` line) stops with
                                          these values
+    // dbg-inlined scale                 BG243: when scale has no code of
+                                         its own (-g inlined it), its
+                                         calls are described: an abstract
+                                         DW_TAG_subprogram (DW_AT_inline,
+                                         its `fn` line) and a
+                                         DW_TAG_inlined_subroutine per call
+                                         (DW_AT_call_line a line calling
+                                         it) holding its markers' rows
 
 It also checks, without running: every function of the test file has a
 DW_TAG_subprogram whose DW_AT_decl_line is its `fn` line and whose
@@ -322,6 +330,35 @@ def fn_decl_lines(src):
     return out
 
 
+def fn_of_line(decls, line):
+    """The function of the test file whose body holds `line`: the last one
+    declared at or above it."""
+    best = None
+    for fname, dline in decls.items():
+        if dline <= line and (best is None or dline > decls[best]):
+            best = fname
+    return best
+
+
+def inlined_calls(dbg):
+    """BG243: name -> (its abstract DW_TAG_subprogram (DW_AT_inline, no
+    code), [(low, high, call_line, die) of each DW_TAG_inlined_subroutine
+    whose DW_AT_abstract_origin it is])."""
+    abstract = {}
+    for d in dbg.dies:
+        if d[1] == dv.DW_TAG_subprogram and 0x20 in d[2] and 0x11 not in d[2]:
+            abstract[d[0]] = d
+    out = {}
+    for d in abstract.values():
+        out.setdefault(d[2].get(0x03), (d, []))
+    for d in dbg.dies:
+        if d[1] == 0x1D and d[2].get(0x31) in abstract:
+            ab = abstract[d[2][0x31]]
+            lo = d[2].get(0x11, 0)
+            out[ab[2].get(0x03)][1].append((lo, lo + d[2].get(0x12, 0), d[2].get(0x59, 0), d))
+    return out
+
+
 # --- reading values at a stop -------------------------------------------------
 
 def check_values(dbg, tgt, delta, pc_dwarf, fname, where0, vals, strict, fails, notes, tally):
@@ -413,6 +450,45 @@ def main():
             fails.append("%s: CFA after the prologue is %r, not rbp + 16" % (fname, dr.cfa_rule(dbg.fdes, lo + 4)))
         if row_line(dbg, lo) != dline:
             fails.append("%s: no line row at its first byte on its fn line %d (%r)" % (fname, dline, row_line(dbg, lo)))
+    # BG243: a function -g inlined everywhere (no code of its own) is
+    # described where it was inlined: an abstract DW_TAG_subprogram with
+    # DW_AT_inline and its `fn` line, and a DW_TAG_inlined_subroutine at
+    # each call that kept code, whose DW_AT_call_line is a line calling it;
+    # each marker on one of its lines has a line row inside such a range
+    # (the rows of a body folded away are one-byte nops: pe_ir.fd
+    # peir_inl_setup). FID_PE_OFF=dbginl: none of this, as before BG243.
+    inl = inlined_calls(dbg)
+    src_lines = open(src, encoding="utf-8").read().split("\n")
+    # `// dbg-inlined f`: f must be described so when it has no code of
+    # its own (iropt.fd's inliner records its calls; iropt_me.fd's inline2
+    # does not yet, so a function only inline2 inlines is a note)
+    want_inl = set()
+    for ln in src_lines:
+        m = re.match(r"\s*//\s*dbg-inlined\s+(\w+)\s*$", ln)
+        if m:
+            want_inl.add(m.group(1))
+    for fname, dline in decls.items():
+        if dbg.sub_named(fname) is not None:
+            continue
+        ab, calls = inl.get(fname, (None, []))
+        if ab is None:
+            (fails if fname in want_inl else notes).append("%s: no code of its own and no abstract DW_TAG_subprogram (DW_AT_inline) for it (BG243)" % fname)
+            continue
+        if ab[2].get(0x3B) != dline:
+            fails.append("%s: the abstract entry's DW_AT_decl_line %r, want %d" % (fname, ab[2].get(0x3B), dline))
+        if not calls:
+            fails.append("%s: no DW_TAG_inlined_subroutine refers to its abstract entry (BG243)" % fname)
+        for lo_i, hi_i, cline, _d in calls:
+            if not (1 <= cline <= len(src_lines)) or (fname + "(") not in src_lines[cline - 1]:
+                fails.append("%s: inlined at DW_AT_call_line %r, a line that does not call it" % (fname, cline))
+        for mname, mline in markers.items():
+            if fn_of_line(decls, mline) != fname:
+                continue
+            a, _d = dbg.any_line_addr(mline)
+            if a is None:
+                continue  # reported below with the breakpoints
+            if not any(lo_i <= a < hi_i for lo_i, hi_i, _c, _x in calls):
+                fails.append("@%s (line %d of %s): its row at 0x%x is in none of %s's inlined ranges" % (mname, mline, fname, a, fname))
     if os.name != "nt":
         for f in fails:
             print("FAIL: " + f)

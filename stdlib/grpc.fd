@@ -548,14 +548,118 @@ fn gr_collect(frames: Vec<H2Frame>) -> GrStream {
     return s;
 }
 
-fn gr_unpack(d: &GrpcDeframer, encoding: str, out: &mut Vec<Vec<i64>>) -> str {
+fn gr_u32_le(b: &Vec<i64>, p: i64) -> i64 {
+    return b.get(p) | (b.get(p + 1) << 8) | (b.get(p + 2) << 16) | (b.get(p + 3) << 24);
+}
+
+/// A gunzipped message: ok, or `status` RESOURCE_EXHAUSTED (it inflates
+/// to more than the limit) / INTERNAL (not valid gzip) with `error`.
+struct GrGunzip {
+    ok: bool,
+    status: i64,
+    error: str,
+    out: Vec<i64>,
+}
+
+fn gr_gunzip_fail(status: i64, error: str) -> GrGunzip {
+    return GrGunzip {
+        ok: false, status: status, error: error, out: Vec::new()
+    };
+}
+
+/// Gunzip one message (one gzip member, RFC 1952, what gRPC peers send)
+/// to at most `limit` bytes: the message size limit is about the
+/// decompressed message, and the output is never allowed to grow past it
+/// (a decompression bomb costs at most `limit` bytes). An ISIZE above the
+/// limit is refused before inflating; the inflated data must then match
+/// the CRC-32 and ISIZE of the trailer. A corrupt stream is an error, not
+/// an empty message. The DEFLATE data gets a one-byte stored block in
+/// front (RFC 1951 §3.2.4) so that an empty result always means failure.
+fn gr_gunzip(data: &Vec<i64>, limit: i64) -> GrGunzip {
+    val n: i64 = data.len();
+    if n < 18 || data.get(0) != 31 || data.get(1) != 139 || data.get(2) != 8 || (data.get(3) & 224) != 0 {
+        return gr_gunzip_fail(GRPC_INTERNAL, "compressed message is not gzip data");
+    }
+    val flg: i64 = data.get(3);
+    var pos: i64 = 10;
+    if (flg & 4) != 0 {
+        // FEXTRA
+        pos = pos + 2 + (data.get(pos) | (data.get(pos + 1) << 8));
+    }
+    if (flg & 8) != 0 {
+        // FNAME, NUL-terminated
+        while pos < n - 8 && data.get(pos) != 0 {
+            pos = pos + 1;
+        }
+        pos = pos + 1;
+    }
+    if (flg & 16) != 0 {
+        // FCOMMENT, NUL-terminated
+        while pos < n - 8 && data.get(pos) != 0 {
+            pos = pos + 1;
+        }
+        pos = pos + 1;
+    }
+    if (flg & 2) != 0 {
+        // FHCRC
+        pos = pos + 2;
+    }
+    if pos >= n - 8 {
+        return gr_gunzip_fail(GRPC_INTERNAL, "compressed message is not gzip data");
+    }
+    val crc: i64 = gr_u32_le(data, n - 8);
+    val isize: i64 = gr_u32_le(data, n - 4);
+    if isize > limit {
+        return gr_gunzip_fail(GRPC_RESOURCE_EXHAUSTED, "decompressed message larger than the limit of " + int_to_str(limit) + " bytes");
+    }
+    var body: Vec<i64> = Vec::new();
+    body.push(0);
+    body.push(1);
+    body.push(0);
+    body.push(254);
+    body.push(255);
+    body.push(0);
+    var i: i64 = pos;
+    while i < n - 8 {
+        body.push(data.get(i));
+        i = i + 1;
+    }
+    val raw: Vec<i64> = inflate_from(body, 0, limit + 1);
+    if raw.len() == 0 {
+        // corrupt, or more output than the trailer's ISIZE (at most the
+        // limit) admits
+        return gr_gunzip_fail(GRPC_INTERNAL, "compressed message is corrupt");
+    }
+    var out: Vec<i64> = Vec::new();
+    i = 1;
+    while i < raw.len() {
+        out.push(raw.get(i));
+        i = i + 1;
+    }
+    if out.len() != isize || crc32_bytes(out) != crc {
+        return gr_gunzip_fail(GRPC_INTERNAL, "compressed message is corrupt (CRC-32 or size mismatch)");
+    }
+    return GrGunzip {
+        ok: true, status: GRPC_OK, error: "", out: out
+    };
+}
+
+/// The messages of `d`, gunzipped with at most `limit` bytes each when
+/// compressed; "" or the error, with the gRPC status in `status`.
+fn gr_unpack(d: &GrpcDeframer, encoding: str, limit: i64, out: &mut Vec<Vec<i64>>, status: &mut i64) -> str {
     var i: i64 = 0;
     while i < d.messages.len() {
         if d.compressed.get(i) {
             if encoding != "gzip" {
+                *status = GRPC_INTERNAL;
                 return "compressed message without a known grpc-encoding";
             }
-            out.push(gzip_decompress(d.messages.get(i)));
+            val g: GrGunzip = gr_gunzip(&d.messages.get(i), limit);
+            if !g.ok {
+                *status = g.status;
+                return g.error;
+            }
+            out.push(g.out);
         } else {
             out.push(d.messages.get(i));
         }
@@ -638,10 +742,11 @@ pub fn grpc_client_read(dec: &mut Hpack, frames: Vec<H2Frame>) -> GrpcResponse {
         return r;
     }
     var msgs: Vec<Vec<i64>> = Vec::new();
-    val err: str = gr_unpack(&d, gr_header(h.names, h.vals, "grpc-encoding"), &mut msgs);
+    var ust: i64 = GRPC_INTERNAL;
+    val err: str = gr_unpack(&d, gr_header(h.names, h.vals, "grpc-encoding"), GRPC_MAX_MESSAGE, &mut msgs, &mut ust);
     if str_len(err) > 0 {
         r.ok = false;
-        r.status = GRPC_INTERNAL;
+        r.status = ust;
         r.error = err;
         return r;
     }
@@ -846,9 +951,10 @@ pub fn grpc_server_handle(s: &mut GrpcServer, names: Vec<str>, vals: Vec<str>, d
         return gr_error_response(GRPC_INTERNAL, "a unary call takes exactly one whole message, got " + int_to_str(d.messages.len()));
     }
     var msgs: Vec<Vec<i64>> = Vec::new();
-    val err: str = gr_unpack(&d, enc, &mut msgs);
+    var ust: i64 = GRPC_INTERNAL;
+    val err: str = gr_unpack(&d, enc, s.max_message, &mut msgs, &mut ust);
     if str_len(err) > 0 {
-        return gr_error_response(GRPC_INTERNAL, err);
+        return gr_error_response(ust, err);
     }
     var deadline: i64 = 0 - 1;
     val tmo: str = gr_header(names, vals, "grpc-timeout");

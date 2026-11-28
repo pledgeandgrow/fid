@@ -285,7 +285,7 @@ pub fn read_bytes(self: &mut ByteCursor, n: i64) -> Vec<i64> {
 Read a length-prefixed string (u32 LE length + bytes).
 
 ```fides
-pub fn read_string_lp(self: ByteCursor) -> str {
+pub fn read_string_lp(self: &mut ByteCursor) -> str {
 ```
 
 ### read_string_null
@@ -301,7 +301,7 @@ pub fn read_string_null(self: &mut ByteCursor) -> str {
 Read the remaining bytes as a string.
 
 ```fides
-pub fn read_remaining_string(self: ByteCursor) -> str {
+pub fn read_remaining_string(self: &mut ByteCursor) -> str {
 ```
 
 ### seek

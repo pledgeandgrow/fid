@@ -1,0 +1,23 @@
+// Bugs roadmap BG205: the C runtime's p_socket_poll waited with select()
+// on POSIX, so an fd of FD_SETSIZE (1024 on Linux) or more was FD_SET past
+// the stack fd_set (a server with more than 1024 descriptors corrupted its
+// stack on every poll), and a negative fd wrote before it. Now
+// (compiler/codegen_c.fd p_socket_poll) POSIX waits with poll(), as the
+// WASI branch did: any fd is fine, a negative or closed one gives -1 (an
+// error), as Windows' select gives for something that is no socket.
+// Windows keeps select (its fd_set is a list of sockets, no fd range).
+// What fails today is the POSIX build (line 1 printed 0, and fd 1500 wrote
+// past the set): scripts/cross-test.sh x86_64-linux runs it there.
+//@ backends: ccompile
+//
+// Expected output:
+// -1
+// -1
+// -1
+
+fn main() -> i64 {
+    println(p_socket_poll(0 - 1, 0, 0));
+    println(p_socket_poll(1500, 0, 1));
+    println(p_socket_poll(1500, 0, 0));
+    return 0;
+}

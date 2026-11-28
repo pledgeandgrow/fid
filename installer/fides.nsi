@@ -178,7 +178,12 @@ SectionEnd
 
 ; ─── Section: Standard Library ───────────────────────────────────────────
 
-Section "Standard Library" SecStdlib
+; Required (BG366): every fid command reads stdlib\core.fd. The old tree
+; goes first, so an update does not keep modules this release removed or
+; moved (kernel.fd and uefi.fd went to fides-os) for `use` to find.
+Section "Standard Library (required)" SecStdlib
+  SectionIn RO
+  RMDir /r "$INSTDIR\stdlib"
   SetOutPath "$INSTDIR\stdlib"
   File /r "..\stdlib\*.fd"
   DetailPrint "Installed standard library"
@@ -228,7 +233,8 @@ Section "Associate .fd files" SecAssoc
   ; Register .fd extension
   WriteRegStr HKCR ".fd" "" "Fid.SourceFile"
   WriteRegStr HKCR "Fid.SourceFile" "" "Fid Source File"
-  WriteRegStr HKCR "Fid.SourceFile\shell\open\command" "" '"$INSTDIR\fid.exe" "%1"'
+  ; BG323: `fid <file>` is "Unknown command": the file is run with `run`
+  WriteRegStr HKCR "Fid.SourceFile\shell\open\command" "" '"$INSTDIR\fid.exe" run "%1"'
   WriteRegStr HKCR "Fid.SourceFile\DefaultIcon" "" '"$INSTDIR\fid.exe",0'
   DeleteRegKey HKCR "Fides.SourceFile"
   DetailPrint "Associated .fd files with Fid"
@@ -248,7 +254,7 @@ SectionEnd
 ; ─── Section Descriptions ────────────────────────────────────────────────
 
 LangString DESC_Core ${LANG_ENGLISH} "The Fides compiler (fid.exe / fidesc.exe) and the companion tools ark, scribe, and veil. Required."
-LangString DESC_Stdlib ${LANG_ENGLISH} "Standard library modules (core, vec, string, math, etc.)."
+LangString DESC_Stdlib ${LANG_ENGLISH} "Standard library modules (core, vec, string, math, etc.). Required: every fid command reads core.fd."
 LangString DESC_Runtime ${LANG_ENGLISH} "C runtime files for SDL, audio, networking."
 LangString DESC_Docs ${LANG_ENGLISH} "Language reference, guides, and roadmap documentation."
 LangString DESC_Examples ${LANG_ENGLISH} "Example Fid programs to get started."

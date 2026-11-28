@@ -1,0 +1,45 @@
+// Bugs roadmap BG355: stdlib/asn1.fd asn1_get_time checked the day only
+// against 1..31, so Feb 31 / Apr 31 were accepted and normalised into the
+// next month, and a GeneralizedTime without seconds was read as :00.
+// RFC 5280 §4.1.2.5: a real date, and GeneralizedTime is YYYYMMDDHHMMSSZ.
+// Unix times: 2025-03-03 = 1740960000, 2024-02-29 = 1709164800.
+//
+// Expected output:
+// feb31 none
+// mar03 1740960000
+// apr31 none
+// no seconds none
+// leap 1709164800
+// feb29 2025 none
+// utc apr30 1745971200
+
+use asn1;
+
+fn time_of(tag: i64, text: str) -> str {
+    var content: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < str_len(text) {
+        content.push(str_byte_at(text, i));
+        i = i + 1;
+    }
+    val der: Vec<i64> = asn1_enc_tlv(tag, content);
+    val t: Asn1Tlv = asn1_read_der(&der, 0, der.len());
+    match asn1_get_time(&der, t) {
+        Option::Some(v) => {
+            return int_to_str(v);
+        }
+        Option::None => {
+            return "none";
+        }
+    }
+}
+
+fn main() {
+    println("feb31 " + time_of(ASN1_GENERALIZED_TIME, "20250231000000Z"));
+    println("mar03 " + time_of(ASN1_GENERALIZED_TIME, "20250303000000Z"));
+    println("apr31 " + time_of(ASN1_UTC_TIME, "250431000000Z"));
+    println("no seconds " + time_of(ASN1_GENERALIZED_TIME, "202503030000Z"));
+    println("leap " + time_of(ASN1_GENERALIZED_TIME, "20240229000000Z"));
+    println("feb29 2025 " + time_of(ASN1_GENERALIZED_TIME, "20250229000000Z"));
+    println("utc apr30 " + time_of(ASN1_UTC_TIME, "250430000000Z"));
+}

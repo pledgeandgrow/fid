@@ -910,11 +910,91 @@ pub fn jwt_options(now: i64, iss: str, aud: str) -> JwtOptions {
     };
 }
 
+/// Bound of a NumericDate as read (about 3e10 years in seconds): larger
+/// values saturate, so `exp + leeway` cannot overflow.
+const JWT_NUM_MAX: i64 = 1000000000000000000;
+
+/// A JSON number as whole seconds (RFC 7519 §2: a NumericDate is any JSON
+/// number, so `2e9`, `1.9e9` and `1700000000.5` are dates): the fraction
+/// is dropped (toward zero) and the magnitude saturates at JWT_NUM_MAX.
+fn jwt_num_value(v: str) -> i64 {
+    val n: i64 = str_len(v);
+    var i: i64 = 0;
+    var neg: bool = false;
+    if i < n && str_byte_at(v, i) == 45 {
+        neg = true;
+        i = i + 1;
+    }
+    var mant: i64 = 0;
+    var big: bool = false;
+    var scale: i64 = 0;
+    while i < n && str_byte_at(v, i) >= 48 && str_byte_at(v, i) <= 57 {
+        if mant > JWT_NUM_MAX / 10 {
+            big = true;
+        } else {
+            mant = mant * 10 + (str_byte_at(v, i) - 48);
+        }
+        i = i + 1;
+    }
+    if i < n && str_byte_at(v, i) == 46 {
+        i = i + 1;
+        while i < n && str_byte_at(v, i) >= 48 && str_byte_at(v, i) <= 57 {
+            if mant <= JWT_NUM_MAX / 10 && !big {
+                mant = mant * 10 + (str_byte_at(v, i) - 48);
+                scale = scale - 1;
+            }
+            i = i + 1;
+        }
+    }
+    if i < n && (str_byte_at(v, i) == 101 || str_byte_at(v, i) == 69) {
+        i = i + 1;
+        var eneg: bool = false;
+        if i < n && (str_byte_at(v, i) == 43 || str_byte_at(v, i) == 45) {
+            eneg = str_byte_at(v, i) == 45;
+            i = i + 1;
+        }
+        var e: i64 = 0;
+        while i < n && str_byte_at(v, i) >= 48 && str_byte_at(v, i) <= 57 {
+            if e < 100000 {
+                e = e * 10 + (str_byte_at(v, i) - 48);
+            }
+            i = i + 1;
+        }
+        if eneg {
+            scale = scale - e;
+        } else {
+            scale = scale + e;
+        }
+    }
+    if mant == 0 {
+        return 0;
+    }
+    while scale > 0 && !big {
+        if mant > JWT_NUM_MAX / 10 {
+            big = true;
+        } else {
+            mant = mant * 10;
+        }
+        scale = scale - 1;
+    }
+    while scale < 0 && mant > 0 && !big {
+        mant = mant / 10;
+        scale = scale + 1;
+    }
+    if big || mant > JWT_NUM_MAX {
+        mant = JWT_NUM_MAX;
+    }
+    if neg {
+        return 0 - mant;
+    }
+    return mant;
+}
+
 fn jwt_num(claims: str, name: str, present: &mut bool) -> i64 {
     val v: str = json_get_safe(claims, name);
     if str_equal(json_type_safe(v), "number") {
         *present = true;
-        return str_parse_int(v);
+        return jwt_num_value(v);
     }
     * present = false;
     return 0;

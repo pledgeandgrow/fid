@@ -20,9 +20,13 @@
 //     2015-01-01), and the first 6 bytes of SHA-256(secret key (32) +
 //     header + payload + CRC + link id + timestamp) (stdlib/crypto);
 //   - a byte-at-a-time parser state machine that resynchronises after
-//     garbage or a bad CRC, zero-extends truncated v2 payloads, checks
-//     signatures when given a key, and counts lost packets from sequence
-//     numbers per (sysid, compid).
+//     garbage or a bad CRC, zero-extends truncated v2 payloads, and counts
+//     lost packets from sequence numbers per (sysid, compid). Given a key
+//     it enforces signing as the MAVLink 2 signing spec says: a frame with
+//     a bad signature, an unsigned frame (v1 or v2; unless
+//     mav_parser_accept_unsigned allows them) and a signed frame whose
+//     timestamp is not newer than the last one of its (sysid, compid,
+//     link id) stream (a replay) are dropped.
 // Bytes are Vec<i64>, 0..255 each. Pure computation; the seam is the
 // transport: the caller writes frames to a UART (stdlib/uart) or a UDP
 // socket (stdlib/net) and feeds received bytes to the parser.
@@ -733,6 +737,14 @@ pub struct MavParser {
     pub lost: i64,
     pub key: Vec<i64>,
     pub check_sig: bool,
+    // with a key: accept unsigned frames too (mav_parser_accept_unsigned)
+    pub accept_unsigned: bool,
+    // with a key: unsigned frames dropped, replayed/old signed frames dropped
+    pub unsigned_dropped: i64,
+    pub replays: i64,
+    // last accepted signing timestamp per (sysid << 16 | compid << 8 | link id)
+    pub sig_streams: Vec<i64>,
+    pub sig_last_ts: Vec<i64>,
     // last sequence number per (sysid << 8 | compid)
     pub seq_keys: Vec<i64>,
     pub seq_last: Vec<i64>,
@@ -740,14 +752,45 @@ pub struct MavParser {
 
 pub fn mav_parser_new(defs: Vec<MavDef>) -> MavParser {
     return MavParser {
-        defs: defs, buf: Vec::new(), frames: Vec::new(), crc_errors: 0, sig_errors: 0, unknown: 0, dropped_bytes: 0, lost: 0, key: Vec::new(), check_sig: false, seq_keys: Vec::new(), seq_last: Vec::new()
+        defs: defs, buf: Vec::new(), frames: Vec::new(), crc_errors: 0, sig_errors: 0, unknown: 0, dropped_bytes: 0, lost: 0, key: Vec::new(), check_sig: false, accept_unsigned: false, unsigned_dropped: 0, replays: 0, sig_streams: Vec::new(), sig_last_ts: Vec::new(), seq_keys: Vec::new(), seq_last: Vec::new()
     };
 }
 
-/// Check signatures of signed frames with this 32-byte key.
+/// Check signatures of signed frames with this 32-byte key. From then on
+/// unsigned frames are dropped (counted in unsigned_dropped) unless
+/// mav_parser_accept_unsigned allows them, and a signed frame whose
+/// timestamp is not newer than the last one of its (sysid, compid, link
+/// id) stream is dropped as a replay (counted in replays).
 pub fn mav_parser_set_key(p: &mut MavParser, key: Vec<i64>) {
     p.key = key;
     p.check_sig = true;
+}
+
+/// With a key set, also accept unsigned frames (the application's
+/// explicit choice the signing spec allows; signed frames are still
+/// checked).
+pub fn mav_parser_accept_unsigned(p: &mut MavParser, yes: bool) {
+    p.accept_unsigned = yes;
+}
+
+// A signed frame's timestamp against its stream: false for a replay (not
+// newer than the last accepted one); true records it.
+fn mav_sig_fresh(p: &mut MavParser, sysid: i64, compid: i64, link_id: i64, ts: i64) -> bool {
+    val key: i64 = (sysid << 16) | (compid << 8) | link_id;
+    var i: i64 = 0;
+    while i < p.sig_streams.len() {
+        if p.sig_streams.get(i) == key {
+            if ts <= p.sig_last_ts.get(i) {
+                return false;
+            }
+            p.sig_last_ts.set(i, ts);
+            return true;
+        }
+        i = i + 1;
+    }
+    p.sig_streams.push(key);
+    p.sig_last_ts.push(ts);
+    return true;
 }
 
 fn mav_drop_front(p: &mut MavParser, n: i64) {
@@ -870,8 +913,18 @@ fn mav_try_frame(p: &mut MavParser) -> i64 {
                     mav_drop_front(p, total);
                     return 2;
                 }
+                if !mav_sig_fresh(p, fr.sysid, fr.compid, fr.link_id, fr.timestamp) {
+                    p.replays = p.replays + 1;
+                    mav_drop_front(p, total);
+                    return 2;
+                }
             }
         }
+    }
+    if p.check_sig && !fr.signed && !p.accept_unsigned {
+        p.unsigned_dropped = p.unsigned_dropped + 1;
+        mav_drop_front(p, total);
+        return 2;
     }
     mav_track_seq(p, fr.sysid, fr.compid, fr.seq);
     p.frames.push(fr);

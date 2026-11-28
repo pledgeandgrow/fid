@@ -140,6 +140,51 @@ fn hs_line_end(s: str, from: i64, n: i64) -> i64 {
     return n;
 }
 
+/// Whether a field line of `head` (after its first line) is not one RFC
+/// 9112 §5 allows: no colon, an empty name, whitespace or a control byte
+/// in the name or between the name and the colon (§5.1), or a line that
+/// starts with SP/HTAB (obs-fold, §5.2). http_parse_head skips such lines
+/// or keeps "Content-Length " as an unknown name, so a request with one
+/// could carry a framing header that a proxy in front reads differently.
+fn hs_head_bad_fields(head: str) -> bool {
+    val n: i64 = str_len(head);
+    var at: i64 = hs_line_end(head, 0, n) + 2;
+    while at < n {
+        val end: i64 = hs_line_end(head, at, n);
+        if end == at {
+            return false;
+        }
+        val first: i64 = str_byte_at(head, at);
+        if first == 32 || first == 9 {
+            return true;
+        }
+        val colon: i64 = hs_find(head, 58, at, end);
+        if colon == at || colon >= end {
+            return true;
+        }
+        var i: i64 = at;
+        while i < colon {
+            val b: i64 = str_byte_at(head, i);
+            if b <= 32 || b == 127 {
+                return true;
+            }
+            i = i + 1;
+        }
+        at = end + 2;
+    }
+    return false;
+}
+
+/// A header name without trailing SP/HTAB (a response's "Content-Length "
+/// is read as Content-Length, as RFC 9112 §5.1 has a proxy do).
+fn hs_name_trim(name: str) -> str {
+    var e: i64 = str_len(name);
+    while e > 0 && (str_byte_at(name, e - 1) == 32 || str_byte_at(name, e - 1) == 9) {
+        e = e - 1;
+    }
+    return str_slice(name, 0, e);
+}
+
 /// Parse a head: the first line and the headers.
 pub fn http_parse_head(head: str) -> HttpRequest {
     var req: HttpRequest = HttpRequest {
@@ -787,6 +832,13 @@ pub fn http_read_message(c: i64, timeout_ms: i64, to_end: bool) -> HttpRequest {
     // only, so a second Content-Length went unseen and the rest of the body
     // was read as the next request)
     val request: bool = !str_starts_with(msg.method, "HTTP/");
+    // BG408: "Content-Length : 27" (whitespace before the colon), a line
+    // without a colon or a folded line could hide a framing header: RFC
+    // 9112 §5.1 has a server reject such a request with 400
+    if request && hs_head_bad_fields(head) {
+        http_fail(&mut msg, 400);
+        return msg;
+    }
     var len: str = "";
     var lens: i64 = 0;
     var tes: i64 = 0;
@@ -794,13 +846,14 @@ pub fn http_read_message(c: i64, timeout_ms: i64, to_end: bool) -> HttpRequest {
     var bad: bool = false;
     var hi: i64 = 0;
     while hi < msg.names.len() {
-        if hs_same(msg.names.get(hi), "content-length") {
+        val hname: str = hs_name_trim(msg.names.get(hi));
+        if hs_same(hname, "content-length") {
             if lens > 0 && msg.vals.get(hi) != len {
                 bad = true;
             }
             len = msg.vals.get(hi);
             lens = lens + 1;
-        } else if hs_same(msg.names.get(hi), "transfer-encoding") {
+        } else if hs_same(hname, "transfer-encoding") {
             chunked = hs_same(msg.vals.get(hi), "chunked");
             tes = tes + 1;
         }

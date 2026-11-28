@@ -373,11 +373,11 @@ fn pe_name_cmp(a: i64, b: i64) -> i64 {
 /// ".."); "" on failure.
 pub fn pert_dir_list(path: str) -> str {
     if (path as i64) == 0 {
-        return pe_new_str(0);
+        return p_str_give(pe_new_str(0));
     }
     var fd: i64 = pe_open(path as i64, 0);
     if fd < 0 {
-        return pe_new_str(0);
+        return p_str_give(pe_new_str(0));
     }
     var names: Vec<i64> = Vec::new();
     var buf: i64 = pert_malloc(8192);
@@ -437,7 +437,7 @@ pub fn pert_dir_list(path: str) -> str {
         p_str_free(nm);
         k = k + 1;
     }
-    return out;
+    return p_str_give(out);
 }
 
 // ─── Wildcard matching ('?' one byte, '*' any run) ──────────────────────
@@ -1527,11 +1527,11 @@ pub fn pert_socket_recv_str(fd: i64) -> str {
     var n: i64 = pert_socket_read(fd, buf, 4095);
     if n <= 0 {
         pert_free(buf);
-        return pe_new_str(0);
+        return p_str_give(pe_new_str(0));
     }
     var r: i64 = pe_dup_range(buf, 0, n);
     pert_free(buf);
-    return r;
+    return p_str_give(r);
 }
 
 // ─── stdlib/net.fd's pledge_net_* (UDP) ─────────────────────────────────
@@ -2224,14 +2224,14 @@ fn pe_capture_dir() -> str {
 
 pub fn pert_process_stdout(h: i64) -> str {
     if h == 0 {
-        return pe_new_str(0);
+        return p_str_give(pe_new_str(0));
     }
     return pe_ld(h);
 }
 
 pub fn pert_process_stderr(h: i64) -> str {
     if h == 0 {
-        return pe_new_str(0);
+        return p_str_give(pe_new_str(0));
     }
     return pe_ld(h + 8);
 }
@@ -2913,6 +2913,70 @@ pub fn pert_signal_raise(sig: i64) -> i64 {
 
 pub fn pert_c_raise(sig: i64) -> i64 {
     return pert_signal_raise(sig);
+}
+
+// ─── stdlib/asset's C helpers (BG251) ───────────────────────────────────
+// runtime/pledge_asset.c loads textures, sounds and fonts through SDL2,
+// which a machine-layer executable does not link: each load fails as the C
+// helper does when SDL cannot load the file (a line on stderr; 0, -1 for a
+// sound). Meshes have no loader there either; unload has nothing to free;
+// the time a file was written is the runtime's own.
+
+fn pe_asset_fail(what: str, path: str) {
+    pert_eprint_str(what as i64);
+    pert_eprint_str(": no SDL2 in a native executable ('" as i64);
+    if (path as i64) != 0 {
+        pert_eprint_str(path as i64);
+    }
+    pert_eprint_str("' not loaded)\n" as i64);
+}
+
+pub fn pert_c_pledge_asset_load_texture(path: str) -> i64 {
+    if (path as i64) == 0 {
+        return 0;
+    }
+    pe_asset_fail("pledge_asset_load_texture", path);
+    return 0;
+}
+
+pub fn pert_c_pledge_asset_load_sound(path: str) -> i64 {
+    if (path as i64) == 0 {
+        return 0 - 1;
+    }
+    pe_asset_fail("pledge_asset_load_sound", path);
+    return 0 - 1;
+}
+
+pub fn pert_c_pledge_asset_load_font(path: str, size: f64) -> i64 {
+    if (path as i64) == 0 {
+        return 0;
+    }
+    pe_asset_fail("pledge_asset_load_font", path);
+    return 0;
+}
+
+pub fn pert_c_pledge_asset_load_mesh(path: str) -> i64 {
+    pert_eprint_str("pledge_asset_load_mesh: no mesh loader in the runtime ('" as i64);
+    if (path as i64) != 0 {
+        pert_eprint_str(path as i64);
+    } else {
+        pert_eprint_str("(null)" as i64);
+    }
+    pert_eprint_str("' not loaded)\n" as i64);
+    return 0;
+}
+
+pub fn pert_c_pledge_asset_unload(handle: i64, asset_type: i64) {
+}
+
+/// The time the file was last written, in seconds since 1970; 0 when it
+/// cannot be read (pledge_asset.c: stat's st_mtime).
+pub fn pert_c_pledge_asset_mtime(path: str) -> i64 {
+    var ms: i64 = pert_file_mtime_ms(path);
+    if ms < 0 {
+        return 0;
+    }
+    return ms / 1000;
 }
 
 // ─── C callbacks: qsort, bsearch ────────────────────────────────────────

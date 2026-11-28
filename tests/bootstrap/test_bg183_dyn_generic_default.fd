@@ -1,0 +1,105 @@
+// Bugs roadmap BG183 (the part left on Nov 27): `dyn` of a generic impl's
+// instance whose trait has default methods the impl does not override.
+// Each default method is filled into the impl before monomorphization
+// (compiler.fd fill_default_trait_methods, with self: Slot<T>), so a cast
+// to `dyn Show` instantiates it with the impl's own methods
+// (mono.fd mono_dyn_methods) and the dyn value's forwarders reach it
+// (lower.fd Lowerer_dyn_generic_name). Here every default method is called
+// only through `dyn`: one returns a struct (BG184's wrapper), one calls a
+// method the impl defines, one takes an argument; the cast is also made in
+// a generic function, and an impl that defines no method at all.
+//
+// Expected output:
+// 5
+// 7
+// 105
+// 2
+// 5|5
+// hi
+// 7
+// hi|hi
+// 7
+// 107
+// 9
+// 3
+// 0
+
+struct V2 {
+    x: i64,
+    y: i64,
+}
+
+cap Show {
+    fn tag(self) -> i64 {
+        return 7;
+    }
+    fn show(self) -> str;
+    fn plus(self, k: i64) -> i64 {
+        return k + 100;
+    }
+    fn corner(self) -> V2 {
+        return V2 { x: 1, y: 2 };
+    }
+    fn twice(self) -> str {
+        return self.show() + "|" + self.show();
+    }
+}
+
+struct Slot<T> {
+    v: T,
+}
+
+impl<T> Show for Slot<T> {
+    fn show(self) -> str {
+        return f"{self.v}";
+    }
+}
+
+cap Count {
+    fn count(self) -> i64 {
+        return 9;
+    }
+    fn none(self) -> i64 {
+        return 0;
+    }
+}
+
+struct Bag<T> {
+    items: Vec<T>,
+}
+
+impl<T> Count for Bag<T> {
+}
+
+fn as_show<T>(s: Slot<T>) -> dyn Show {
+    return s as dyn Show;
+}
+
+fn main() -> i64 {
+    val a: Slot<i64> = Slot { v: 5 };
+    val da = a as dyn Show;
+    println(da.show());
+    println(da.tag());
+    println(da.plus(5));
+    val c: V2 = da.corner();
+    println(c.y);
+    println(da.twice());
+    val b: Slot<str> = Slot { v: "hi" };
+    val db = as_show(b);
+    println(db.show());
+    println(db.tag());
+    println(db.twice());
+    val e: Slot<bool> = Slot { v: true };
+    println((e as dyn Show).tag());
+    println(as_show(Slot { v: 2.5 }).plus(7));
+    var v: Vec<i64> = Vec::new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    val g: Bag<i64> = Bag { items: v };
+    val dg = g as dyn Count;
+    println(dg.count());
+    println(g.items.len());
+    println(dg.none());
+    return 0;
+}

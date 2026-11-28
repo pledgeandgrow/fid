@@ -1,0 +1,59 @@
+// BG313 (docs/roadmap/bugs-roadmap.md): a JWT NumericDate is any JSON
+// number (RFC 7519 §2), so jwt_check_claims reads `2e9`, `1.9e9`,
+// `2E+9` and `1699999900.9` by value, not up to the first non-digit.
+// A not-yet-valid token written in exponent form is rejected, and an
+// exponent-form exp in the future is not "expired". now = 1700000000,
+// leeway 60 s.
+//
+// Expected output:
+// nbf 2e9: token not yet valid
+// iat 3e9: token issued in the future
+// exp 1.9e9: ok
+// exp 1.6e9: token expired
+// nbf 1.6e9: ok
+// exp 2E+9: ok
+// exp 1699999900.9: token expired
+// exp 1700000000.5: ok
+// nbf 17000000e2: ok
+// nbf 1.7000001e9: token not yet valid
+// exp 1e400: ok
+// nbf 1e400: token not yet valid
+// nbf 1.7e-5: ok
+// exp -1e3: token expired
+// exp 0.0: token expired
+// iat 1700000000: ok
+use jose;
+
+fn check(label: str, claims: str) -> void {
+    val o: JwtOptions = jwt_options(1700000000, "", "");
+    val r: str = jwt_check_claims(claims, &o);
+    if str_len(r) == 0 {
+        println(label + ": ok");
+    } else {
+        println(label + ": " + r);
+    }
+}
+
+fn main() -> i64 {
+    // the entry's triggers
+    check("nbf 2e9", "{\"exp\": 1800000000, \"nbf\": 2e9}");
+    check("iat 3e9", "{\"exp\": 1800000000, \"iat\": 3e9}");
+    check("exp 1.9e9", "{\"exp\": 1.9e9}");
+    // other number forms
+    check("exp 1.6e9", "{\"exp\": 1.6e9}");
+    check("nbf 1.6e9", "{\"exp\": 1800000000, \"nbf\": 1.6e9}");
+    check("exp 2E+9", "{\"exp\": 2E+9}");
+    check("exp 1699999900.9", "{\"exp\": 1699999900.9}");
+    check("exp 1700000000.5", "{\"exp\": 1700000000.5}");
+    check("nbf 17000000e2", "{\"exp\": 1800000000, \"nbf\": 17000000e2}");
+    check("nbf 1.7000001e9", "{\"exp\": 1800000000, \"nbf\": 1.7000001e9}");
+    // huge and tiny exponents
+    check("exp 1e400", "{\"exp\": 1e400}");
+    check("nbf 1e400", "{\"exp\": 1800000000, \"nbf\": 1e400}");
+    check("nbf 1.7e-5", "{\"exp\": 1800000000, \"nbf\": 1.7e-5}");
+    check("exp -1e3", "{\"exp\": -1e3}");
+    check("exp 0.0", "{\"exp\": 0.0}");
+    // plain integers are unchanged
+    check("iat 1700000000", "{\"exp\": 1800000000, \"iat\": 1700000000}");
+    return 0;
+}

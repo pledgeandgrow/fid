@@ -1,0 +1,87 @@
+// BG408 (docs/roadmap/bugs-roadmap.md): http_read_message answers 400 to
+// a request with whitespace between a header name and the colon (RFC 9112
+// §5.1: "Content-Length : 27" must not be ignored while a proxy in front
+// strips the space and frames the body differently), and likewise to a
+// field line without a colon, with an empty name or whitespace inside the
+// name, or folded onto the line before (obs-fold, §5.2). Whitespace after
+// the colon (OWS) stays fine. Harness of test_std_http_framing.fd: a fake
+// TLS hook feeds a fixed string; `[ 400]` is a failed message.
+// Not on run: the interpreter has no memmove FFI, which http.fd uses.
+//@ backends: ccompile,emit
+//
+// Expected output:
+// -- space before colon
+// [ 400] body=<>
+// -- tab before colon, TE
+// [ 400] body=<>
+// -- folded line
+// [ 400] body=<>
+// -- no colon
+// [ 400] body=<>
+// -- empty name
+// [ 400] body=<>
+// -- space inside the name
+// [ 400] body=<>
+// -- OWS after the colon
+// [POST /a] body=<hello>
+// [GET /b] body=<>
+// [ ] body=<>
+use http;
+
+var feed: str = "";
+var fpos: i64 = 0;
+
+fn frecv(tls: i64, buf: i64, n: i64, t: i64) -> i64 {
+    var k: i64 = 0;
+    while k < n && fpos < str_len(feed) {
+        var p: *mut u8 = (buf + k) as *mut u8;
+        // SAFETY: k < n, the room hc_fill offers at buf.
+        unsafe {
+            *p = str_byte_at(feed, fpos) as u8;
+        }
+        k = k + 1;
+        fpos = fpos + 1;
+    }
+    return k;
+}
+
+fn fsend(tls: i64, buf: i64, n: i64) -> i64 {
+    return n;
+}
+
+fn fclose(tls: i64) -> i64 {
+    return 0;
+}
+
+fn facc(fd: i64) -> i64 {
+    return 1;
+}
+
+fn show(name: str, raw: str) {
+    println("-- " + name);
+    feed = raw;
+    fpos = 0;
+    val c: i64 = http_conn_new(-1, 1);
+    var i: i64 = 0;
+    while i < 3 {
+        val m: HttpRequest = http_read_message(c, 100, false);
+        println("[" + m.method + " " + m.target + "] body=<" + m.body + ">");
+        if m.method == "" {
+            i = 9;
+        }
+        i = i + 1;
+    }
+    http_conn_close(c);
+}
+
+fn main() {
+    http_set_tls(frecv, fsend, fclose, facc);
+    // the entry's trigger
+    show("space before colon", "POST /a HTTP/1.1\r\nContent-Length : 27\r\n\r\nGET /smuggled HTTP/1.1\r\n\r\n");
+    show("tab before colon, TE", "POST /a HTTP/1.1\r\nTransfer-Encoding\t: chunked\r\n\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\n\r\n");
+    show("folded line", "POST /a HTTP/1.1\r\nX-A: 1\r\n Content-Length: 5\r\n\r\nhello");
+    show("no colon", "POST /a HTTP/1.1\r\nContent-Length 5\r\n\r\nhello");
+    show("empty name", "POST /a HTTP/1.1\r\n: x\r\nContent-Length: 0\r\n\r\n");
+    show("space inside the name", "POST /a HTTP/1.1\r\nContent Length: 5\r\n\r\nhello");
+    show("OWS after the colon", "POST /a HTTP/1.1\r\nContent-Length: \t 5 \t\r\nHost: h\r\n\r\nhelloGET /b HTTP/1.1\r\n\r\n");
+}

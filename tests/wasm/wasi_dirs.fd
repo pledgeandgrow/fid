@@ -1,0 +1,71 @@
+// XT32 directories: path_create_directory (mkdir, mkdir -p),
+// path_filestat_get (is a directory), fd_readdir (the listing; Node on
+// Windows has none: scripts/wasm-run.mjs lists the folder itself),
+// path_remove_directory, a directory that is not empty, nested walks.
+// tests/wasm/wasi-check.sh runs it in an empty folder under Node and
+// compares the output with wasi_dirs.expected (as `fid run` prints it).
+use fs;
+
+fn b(x: bool) -> str {
+    if x { return "t"; }
+    return "f";
+}
+
+/// The names of a listing in order (its own order is the file system's)
+fn sorted(v: Vec<str>) -> str {
+    var a: Vec<str> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() {
+        a.push(fs_basename(v.get(i)));
+        i = i + 1;
+    }
+    var j: i64 = 1;
+    while j < a.len() {
+        var k: i64 = j;
+        while k > 0 && str_compare(a.get(k - 1), a.get(k)) > 0 {
+            val t: str = a.get(k - 1);
+            a.set(k - 1, a.get(k));
+            a.set(k, t);
+            k = k - 1;
+        }
+        j = j + 1;
+    }
+    var out: str = "";
+    i = 0;
+    while i < a.len() {
+        out = out + a.get(i) + ",";
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main() -> i64 {
+    val d: str = "xt32_dir";
+    println("m1 " + b(fs_mkdir(d)) + " " + b(fs_is_dir(d)) + " " + b(fs_is_file(d)));
+    println("m2 " + b(fs_mkdir(d)));
+    println("m3 " + b(fs_mkdir_all(fs_join(d, "x/y/z"))) + " " + b(fs_is_dir(fs_join(d, "x/y/z"))));
+    fs_write_text(fs_join(d, "one.txt"), "1");
+    fs_write_text(fs_join(d, "two.txt"), "22");
+    fs_write_text(fs_join(d, "x/three.fd"), "333");
+    println("l1 " + sorted(fs_list_dir(d)));
+    println("l2 " + sorted(fs_list_dir(fs_join(d, "x"))));
+    println("w1 " + int_to_str(fs_walk(d).len()) + " " + int_to_str(fs_walk_files(d).len()));
+    println("g1 " + int_to_str(fs_glob(d, "**/*.fd").len()) + " " + int_to_str(fs_glob(d, "*.txt").len()));
+    // a directory that is not empty stays
+    println("r1 " + b(fs_rmdir(d)) + " " + b(fs_is_dir(d)));
+    println("r2 " + b(fs_rmdir(fs_join(d, "x/y/z"))) + " " + b(fs_is_dir(fs_join(d, "x/y/z"))));
+    println("r3 " + b(fs_rmdir_all(d)) + " " + b(fs_exists(d)));
+    println("l3 " + int_to_str(fs_list_dir("xt32_none_dir").len()));
+    // "." is the folder it runs in: nothing of this test is left there
+    var left: i64 = 0;
+    val here: Vec<str> = fs_list_dir(".");
+    var i: i64 = 0;
+    while i < here.len() {
+        if str_starts_with(fs_basename(here.get(i)), "xt32") {
+            left = left + 1;
+        }
+        i = i + 1;
+    }
+    println("l4 " + int_to_str(left));
+    return 0;
+}

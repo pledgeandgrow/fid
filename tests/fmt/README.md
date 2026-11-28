@@ -46,6 +46,11 @@ under `fid run`.
   the next line as a new statement). A line that ends in an operator or
   a next line that starts with one is still joined (`w = w` / `- 1`,
   `x == 1` / `&& z == 4`). Both files print `1both` and `4 4 5`.
+- `fstring_braces` (BG211): a `}` or `{` inside a string or char literal
+  in an f-string's braces (`f"{str_len("a}c")}"`, `f"{d == '}'}"`) does
+  not end the interpolation: fmt.fd reads it with the lexer's own
+  `lex_fstr_expr_end`. It used to stop at the quoted `}` and break the
+  line inside the f-string. Both files print `3 and 3`, `true`, `3`.
 - `cast`: after `as` and `is` a `*` starts the type (`a as *mut u8`,
   `(a + 1) as *const u8`), as it does in a declaration: it is no product
   and keeps no space. The printer took it for a binary `*` and wrote

@@ -222,6 +222,17 @@ impl Lexer {
         if until_brace {
             if self.peek() == 125 {
                 self.advance();
+                // BG333: \u{...} names a Unicode scalar value (reference
+                // §1.7/§1.8): at least one digit, at most 0x10FFFF, no
+                // surrogate (0xD800-0xDFFF)
+                if n == 0 {
+                    self.errors.push(lex_error(line, col, "empty \\u{} escape: no hex digit\n    Fix: write the code point's hex digits between the braces, as in \"\\u{e9}\"; for a zero byte write \"\\0\""));
+                    return 0;
+                }
+                if v > 1114111 || (v >= 55296 && v <= 57343) {
+                    self.errors.push(lex_error(line, col, "\\u{...} escape is not a Unicode scalar value\n    Fix: a \\u{...} escape is a code point of at most 10FFFF that is not a surrogate (D800-DFFF), as in \"\\u{1F600}\"; for raw bytes use \\xHH"));
+                    return 0;
+                }
             } else {
                 self.errors.push(lex_error(line, col, "expected '}' to close \\u{...}\n    Fix: close the code point with `}` after at most 6 hex digits, as in \"\\u{1F600}\""));
             }
@@ -382,6 +393,7 @@ impl Lexer {
                     self.advance();
                 }
                 var s: str = str_slice_len(self.source, self.src_len, start_pos, self.pos);
+                self.check_radix_end(self.pos - start_pos - 2, "hexadecimal", "0x", "0-9 and a-f", line, col);
                 var val: i64 = str_parse_hex(str_slice(s, 2, str_len(s)));
                 self.check_int_fits(str_slice(s, 2, str_len(s)), 16, s, line, col);
                 return token_new(TokenKind::IntLit(val), line, col);
@@ -396,6 +408,7 @@ impl Lexer {
                     self.advance();
                 }
                 var s: str = str_slice_len(self.source, self.src_len, start_pos, self.pos);
+                self.check_radix_end(self.pos - start_pos - 2, "binary", "0b", "0 and 1", line, col);
                 var val: i64 = parse_radix(str_slice(s, 2, str_len(s)), 2);
                 self.check_int_fits(str_slice(s, 2, str_len(s)), 2, s, line, col);
                 return token_new(TokenKind::IntLit(val), line, col);
@@ -410,6 +423,7 @@ impl Lexer {
                     self.advance();
                 }
                 var s: str = str_slice_len(self.source, self.src_len, start_pos, self.pos);
+                self.check_radix_end(self.pos - start_pos - 2, "octal", "0o", "0-7", line, col);
                 var val: i64 = parse_radix(str_slice(s, 2, str_len(s)), 8);
                 self.check_int_fits(str_slice(s, 2, str_len(s)), 8, s, line, col);
                 return token_new(TokenKind::IntLit(val), line, col);
@@ -434,6 +448,12 @@ impl Lexer {
                 if self.peek() == 43 || self.peek() == 45 {
                     // '+' / '-'
                     self.advance();
+                }
+                // BG332: the exponent needs digits (reference §1.6), as
+                // `1e` already does: `1.5e`, `2.0e+` are errors
+                if !(self.pos < self.src_len && lex_is_digit(self.peek())) {
+                    var bad: str = str_slice_len(self.source, self.src_len, start_pos, self.pos);
+                    self.errors.push(lex_error(line, col, "float literal " + bad + " has no digits in its exponent\n    Fix: write the exponent's digits after the e (and its sign), as in 1.5e3 or 2.0e-4, or leave the e out"));
                 }
                 while self.pos < self.src_len && lex_is_digit(self.peek()) {
                     self.advance();
@@ -486,6 +506,25 @@ impl Lexer {
         }
     }
 
+    /// BG296: a 0x / 0b / 0o literal needs at least one digit, and a letter
+    /// or digit right after its digits is not a separate token (`0b2`,
+    /// `0o18`, `0xFG` were 0 / 1 / 15 followed by another expression,
+    /// since `;` is optional). `_` still ends the literal (reference §1.5:
+    /// `0xFF_FF` is `0xFF` then `_FF`). The bad rest is skipped.
+    fn check_radix_end(self: &mut Lexer, ndigits: i64, kind: str, prefix: str, digits: str, line: i64, col: i64) {
+        var c: i64 = self.peek();
+        if self.pos < self.src_len && lex_is_alphanumeric(c) {
+            self.errors.push(lex_error(line, col, "invalid digit '" + byte_to_str(c) + "' in " + kind + " literal\n    Fix: a " + kind + " literal (" + prefix + "...) takes only the digits " + digits + "; write the number in decimal, or put a space or an operator between the literal and a name"));
+            while self.pos < self.src_len && lex_is_alphanumeric(self.peek()) {
+                self.advance();
+            }
+            return;
+        }
+        if ndigits == 0 {
+            self.errors.push(lex_error(line, col, kind + " literal " + prefix + " needs a digit\n    Fix: write at least one digit (" + digits + ") after " + prefix + ", as in " + prefix + "1, or write 0"));
+        }
+    }
+
     /// Remove underscore separators from a numeric string (e.g. "1_000" -> "1000")
 
     fn read_fstring(self: &mut Lexer) -> Token {
@@ -513,8 +552,8 @@ impl Lexer {
                     s = str_concat(s, "\r");
                 }  // r
                 else if esc == 92 {
-                    s = str_concat(s, "\\");
-                }  // backslash
+                    s = str_concat(s, "\\\\");
+                }  // backslash, kept escaped for parse_fstring_parts (BG209)
                 else if esc == 34 {
                     s = str_concat(s, "\"");
                 }  // '"'
@@ -533,37 +572,35 @@ impl Lexer {
                     if hv == 0 {
                         s = str_concat(s, char_to_str(0));
                     }  // NUL: a byte of the string (RT2)
-                    else {
+                    else if hv == 92 || hv == 123 || hv == 125 {
+                        // BG209: an escaped `\`, `{` or `}` is text: the
+                        // token marks it with a `\` so that
+                        // parse_fstring_parts does not take it for a brace
+                        s = str_concat(s, "\\" + byte_to_str(hv));
+                    } else {
                         s = str_concat(s, lex_utf8_encode(hv));
                     }
                 } else {
-                    self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc) + "\n    Fix: the escapes are \\n \\t \\r \\0 \\\\ \\' \\\" \\xHH and \\u{...}; write \\\\ for a backslash itself, or a raw string r\"...\""));
+                    self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc) + "\n    Fix: the escapes are \\n \\t \\r \\0 \\\\ \\\" \\xHH and \\u{...} (\\' only in a char literal); write \\\\ for a backslash itself, or a raw string r\"...\""));
                     s = str_concat(s, byte_to_str(esc));
                 }
             } else if c == 123 {
-                // '{' -- expression interpolation {expr}
+                // '{' -- expression interpolation {expr}, kept as written
+                // up to its matching '}'. A string, f-string or char
+                // literal inside it is skipped whole: a brace or quote in
+                // it is not the f-string's (BG210, BG211)
                 self.advance();
                 // consume '{'
-                s = str_concat(s, "{");
-                var depth: i64 = 1;
-                while self.pos < self.src_len && depth > 0 {
-                    var c2: i64 = self.peek();
-                    if c2 == 123 {
-                        depth = depth + 1;
-                        s = str_concat(s, byte_to_str(self.advance()));
-                    } else if c2 == 125 {
-                        // '}'
-                        depth = depth - 1;
-                        if depth == 0 {
-                            self.advance();
-                            // consume '}'
-                            s = str_concat(s, "}");
-                            break;
-                        }
-                        s = str_concat(s, self.read_utf8());
-                    } else {
-                        s = str_concat(s, self.read_utf8());
-                    }
+                var e_start: i64 = self.pos;
+                var e_end: i64 = lex_fstr_expr_end(self.source, self.src_len, e_start);
+                while self.pos < e_end {
+                    self.advance();
+                }
+                s = str_concat(s, "{" + str_slice_len(self.source, self.src_len, e_start, e_end));
+                if self.pos < self.src_len {
+                    self.advance();
+                    // consume '}'
+                    s = str_concat(s, "}");
                 }
             } else {
                 s = str_concat(s, self.read_utf8());
@@ -627,7 +664,7 @@ impl Lexer {
                         s = str_concat(s, lex_utf8_encode(hv));
                     }
                 } else {
-                    self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc) + "\n    Fix: the escapes are \\n \\t \\r \\0 \\\\ \\' \\\" \\xHH and \\u{...}; write \\\\ for a backslash itself, or a raw string r\"...\""));
+                    self.errors.push(lex_error(line, col, "unknown escape sequence \\" + byte_to_str(esc) + "\n    Fix: the escapes are \\n \\t \\r \\0 \\\\ \\\" \\xHH and \\u{...} (\\' only in a char literal); write \\\\ for a backslash itself, or a raw string r\"...\""));
                     s = str_concat(s, byte_to_str(esc));
                 }
             } else {
@@ -1378,6 +1415,157 @@ pub fn lex_is_digit(c: i64) -> bool {
 
 pub fn lex_is_alphanumeric(c: i64) -> bool {
     return lex_is_alpha(c) || lex_is_digit(c);
+}
+
+// --- F-string expressions (BG210, BG211) ----------------------------------
+// The lexer (read_fstring) and the parser (parse_fstring_parts) find the
+// end of a `{...}` of an f-string, and its format `:`, with these: a
+// string, f-string, raw string or char literal inside the braces is
+// skipped whole, so a brace, quote or `:` in it is the literal's.
+
+/// Whether byte `i` of `src` starts a literal rather than continuing a
+/// name: `f"`/`r"` after a letter, digit or `_` are not literals.
+fn lex_fstr_name_before(src: str, i: i64) -> bool {
+    if i == 0 {
+        return false;
+    }
+    var p: i64 = str_byte_at(src, i - 1);
+    return lex_is_alphanumeric(p) || p == 95;
+}
+
+/// The index of the `}` that closes the f-string expression starting at
+/// `i` (just after its `{`) in `src` of length `n`; `n` if none does.
+pub fn lex_fstr_expr_end(src: str, n: i64, i: i64) -> i64 {
+    var depth: i64 = 1;
+    var pb: i64 = 0;
+    var j: i64 = i;
+    while j < n {
+        var c: i64 = str_byte_at(src, j);
+        if c == 123 {
+            depth = depth + 1;
+            j = j + 1;
+        } else if c == 125 {
+            depth = depth - 1;
+            if depth == 0 {
+                return j;
+            }
+            j = j + 1;
+        } else if c == 40 || c == 91 {
+            pb = pb + 1;
+            j = j + 1;
+        } else if c == 41 || c == 93 {
+            pb = pb - 1;
+            j = j + 1;
+        } else if c == 58 && depth == 1 && pb == 0 && !(j > i && str_byte_at(src, j - 1) == 58) && !(j + 1 < n && str_byte_at(src, j + 1) == 58) {
+            // the format spec (`:*>5`, parse_fstring_parts' rule): plain
+            // text up to the `}`, a quote in it a fill character
+            j = j + 1;
+            while j < n && str_byte_at(src, j) != 125 {
+                j = j + 1;
+            }
+            return j;
+        } else {
+            j = lex_fstr_lit_end(src, n, j);
+        }
+    }
+    return n;
+}
+
+/// Just past the literal that starts at `i` in `src` (length `n`): a
+/// string `"..."`, an f-string `f"..."` (its braces too), a raw string
+/// `r"..."`/`r#"..."#`, or a whole char literal `'c'`, `'\n'`, `'\u{..}'`.
+/// Any other byte (a lone `'`, a lifetime's quote) is one byte: `i + 1`.
+pub fn lex_fstr_lit_end(src: str, n: i64, i: i64) -> i64 {
+    var c: i64 = str_byte_at(src, i);
+    if c == 34 {
+        return lex_fstr_quoted_end(src, n, i + 1, false);
+    }
+    if (c == 102 || c == 114) && i + 1 < n && !lex_fstr_name_before(src, i) {
+        var c1: i64 = str_byte_at(src, i + 1);
+        if c == 102 && c1 == 34 {
+            return lex_fstr_quoted_end(src, n, i + 2, true);
+        }
+        if c == 114 && (c1 == 34 || c1 == 35) {
+            var h: i64 = 0;
+            var j: i64 = i + 1;
+            while j < n && str_byte_at(src, j) == 35 {
+                h = h + 1;
+                j = j + 1;
+            }
+            if j >= n || str_byte_at(src, j) != 34 {
+                return i + 1;
+            }
+            j = j + 1;
+            while j < n {
+                if str_byte_at(src, j) == 34 {
+                    var k: i64 = 0;
+                    while k < h && j + 1 + k < n && str_byte_at(src, j + 1 + k) == 35 {
+                        k = k + 1;
+                    }
+                    if k == h {
+                        return j + 1 + h;
+                    }
+                }
+                j = j + 1;
+            }
+            return n;
+        }
+        return i + 1;
+    }
+    if c == 39 && i + 1 < n {
+        var j: i64 = i + 1;
+        var d: i64 = str_byte_at(src, j);
+        if d == 39 || d == 10 {
+            return i + 1;
+        }
+        if d == 92 {
+            j = j + 2;
+            if j < n && str_byte_at(src, j - 1) == 117 && str_byte_at(src, j) == 123 {
+                // '\u{...}'
+                while j < n && str_byte_at(src, j) != 125 && str_byte_at(src, j) != 39 {
+                    j = j + 1;
+                }
+                if j < n && str_byte_at(src, j) == 125 {
+                    j = j + 1;
+                }
+            } else if j - 1 < n && str_byte_at(src, j - 1) == 120 {
+                // '\xHH'
+                j = j + 2;
+            }
+        } else if d >= 240 {
+            j = j + 4;
+        } else if d >= 224 {
+            j = j + 3;
+        } else if d >= 192 {
+            j = j + 2;
+        } else {
+            j = j + 1;
+        }
+        if j < n && str_byte_at(src, j) == 39 {
+            return j + 1;
+        }
+        return i + 1;
+    }
+    return i + 1;
+}
+
+/// Just past the closing `"` of a string whose text starts at `j`; an
+/// f-string's `{...}` are skipped as expressions. `n` if it never closes.
+fn lex_fstr_quoted_end(src: str, n: i64, j0: i64, is_f: bool) -> i64 {
+    var j: i64 = j0;
+    while j < n {
+        var c: i64 = str_byte_at(src, j);
+        if c == 92 {
+            j = j + 2;
+        } else if c == 34 {
+            return j + 1;
+        } else if is_f && c == 123 {
+            j = lex_fstr_expr_end(src, n, j + 1) + 1;
+        } else {
+            j = j + 1;
+        }
+    }
+    return n;
 }
 
 /// UTF-8 encoding of the scalar `cp` (escape sequences in strings: Rust's

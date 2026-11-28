@@ -328,6 +328,30 @@ fn huff_build(lengths: Vec, n: i64) -> Huff {
     };
 }
 
+// BG479: whether the code lengths of `h` describe a prefix code RFC 1951
+// allows, as zlib's inflate_table and puff check: never over-subscribed
+// (more codes of a length than the shorter ones leave room for), and
+// complete, except a single code of length 1 when `allow_single` (an
+// all-zero set passes: nothing decodes from it). Over-subscribed lengths
+// made some symbols unreachable and decoding went on.
+fn huff_valid(h: Huff, allow_single: bool) -> bool {
+    var left: i64 = 1;
+    var total: i64 = 0;
+    var len: i64 = 1;
+    while len <= 15 {
+        left = left * 2 - h.lens.get(len);
+        total = total + h.lens.get(len);
+        if left < 0 {
+            return false;
+        }
+        len = len + 1;
+    }
+    if left == 0 || total == 0 {
+        return true;
+    }
+    return allow_single && total == 1 && h.lens.get(1) == 1;
+}
+
 // Decode next symbol; -1 on error/end.
 fn huff_decode(r: &mut BitR, h: Huff) -> i64 {
     var code: i64 = 0;
@@ -614,6 +638,10 @@ fn z_dynamic(r: &mut BitR) -> TwoLens {
         i = i + 1;
     }
     var clh: Huff = huff_build(cl_lens, 19);
+    // BG479: the code-length code must be a complete prefix code
+    if !huff_valid(clh, false) {
+        return res;
+    }
     var total: i64 = hlit + hdist;
     var lens: Vec = Vec::new();
     while lens.len() < total {
@@ -665,6 +693,14 @@ fn z_dynamic(r: &mut BitR) -> TwoLens {
             res.dist.push(0);
         }
         j = j + 1;
+    }
+    // BG479 (as zlib and puff): a block with no code for end-of-block (256)
+    // cannot end
+    if res.lit.len() <= 256 || res.lit.get(256) == 0 {
+        var bad: TwoLens = TwoLens {
+            lit: Vec::new(), dist: Vec::new()
+        };
+        return bad;
     }
     return res;
 }
@@ -725,6 +761,12 @@ fn z_inflate(data: Vec, start: i64, max_out: i64) -> ZInf {
             }
             var lh2: Huff = huff_build(dyn2.lit, dyn2.lit.len());
             var dh2: Huff = huff_build(dyn2.dist, dyn2.dist.len());
+            // BG479: over-subscribed or incomplete literal/length or
+            // distance codes are an error ("invalid literal/lengths set")
+            if !huff_valid(lh2, true) || !huff_valid(dh2, true) {
+                ok = false;
+                break;
+            }
             ok = z_block(&mut r, &mut out, lh2, dh2, lb, le, db, de, max_out);
         } else {
             ok = false;
@@ -767,6 +809,14 @@ fn z_u32_le(data: Vec, p: i64) -> i64 {
 /// Decompress a zlib stream (validates header, skips optional dict id,
 /// checks the Adler-32). Empty on any error.
 pub fn zlib_decompress(data: Vec) -> Vec {
+    return zlib_decompress_max(data, 268435456);
+}
+
+/// zlib_decompress with the output capped at `max_out` bytes: a stream
+/// that inflates to more is an error (empty), found as soon as the output
+/// passes the cap, so a caller that knows the size it needs (a PNG's
+/// scanlines) does not inflate a bomb first.
+pub fn zlib_decompress_max(data: Vec, max_out: i64) -> Vec {
     if data.len() < 6 {
         return Vec::new();
     }
@@ -783,7 +833,7 @@ pub fn zlib_decompress(data: Vec) -> Vec {
         start = 6;
     }
     // FDICT: skip 4-byte dict id
-    var z: ZInf = z_inflate(data, start, 268435456);
+    var z: ZInf = z_inflate(data, start, max_out);
     // the Adler-32 of the output follows, big-endian: a mismatch is an
     // error (BG222)
     if !z.ok || z.end + 4 > data.len() {
@@ -796,21 +846,60 @@ pub fn zlib_decompress(data: Vec) -> Vec {
     return z.out;
 }
 
-/// Decompress a gzip member (parses header incl. FNAME/FCOMMENT/FEXTRA,
-/// checks the CRC-32 and ISIZE trailer). Empty on any error.
+/// Decompress a gzip file: its members (RFC 1952 §2.2: a file is a series
+/// of members, concatenated as gzip -d does; BG442), each with its header
+/// parsed (FNAME/FCOMMENT/FEXTRA) and its CRC-32 and ISIZE trailer checked.
+/// NUL padding after the last member is skipped; any other trailing data
+/// is an error. Empty on any error.
 pub fn gzip_decompress(data: Vec) -> Vec {
-    if data.len() < 18 {
-        return Vec::new();
+    var out: Vec = Vec::new();
+    var pos: i64 = 0;
+    var first: bool = true;
+    while first || pos < data.len() {
+        if !first && data.get(pos) == 0 {
+            // padding: only NULs may follow
+            while pos < data.len() {
+                if data.get(pos) != 0 {
+                    return Vec::new();
+                }
+                pos = pos + 1;
+            }
+            break;
+        }
+        var z: ZInf = gz_member(data, pos, 268435456 - out.len());
+        if !z.ok {
+            return Vec::new();
+        }
+        if first {
+            out = z.out;
+        } else {
+            out.extend(z.out);
+        }
+        pos = z.end;
+        first = false;
     }
-    if data.get(0) != 0x1F || data.get(1) != 0x8B {
-        return Vec::new();
+    return out;
+}
+
+// One gzip member starting at data[at]: `out` its data, `end` the byte
+// after its trailer; `ok` false on any error (header, stream, CRC-32 or
+// ISIZE, or more than `max_out` bytes).
+fn gz_member(data: Vec, at: i64, max_out: i64) -> ZInf {
+    var bad: ZInf = ZInf {
+        out: Vec::new(), ok: false, end: at
+    };
+    if data.len() - at < 18 {
+        return bad;
     }
-    var flg: i64 = data.get(3);
-    var pos: i64 = 10;
+    if data.get(at) != 0x1F || data.get(at + 1) != 0x8B {
+        return bad;
+    }
+    var flg: i64 = data.get(at + 3);
+    var pos: i64 = at + 10;
     if (flg & 4) != 0 {
         // FEXTRA
         if pos + 2 > data.len() {
-            return Vec::new();
+            return bad;
         }
         var xlen: i64 = data.get(pos) | (data.get(pos + 1) << 8);
         pos = pos + 2 + xlen;
@@ -834,18 +923,19 @@ pub fn gzip_decompress(data: Vec) -> Vec {
     }
     // FHCRC
     if pos >= data.len() {
-        return Vec::new();
+        return bad;
     }
-    var z: ZInf = z_inflate(data, pos, 268435456);
+    var z: ZInf = z_inflate(data, pos, max_out);
     // the trailer: CRC-32 of the output, then its size mod 2^32, both
     // little-endian; a mismatch is an error (BG222)
     if !z.ok || z.end + 8 > data.len() {
-        return Vec::new();
+        return bad;
     }
     if crc32_bytes(z.out) != z_u32_le(data, z.end) || (z.out.len() & 0xFFFFFFFF) != z_u32_le(data, z.end + 4) {
-        return Vec::new();
+        return bad;
     }
-    return z.out;
+    z.end = z.end + 8;
+    return z;
 }
 
 // ─── String conveniences ────────────────────────────────────────────────

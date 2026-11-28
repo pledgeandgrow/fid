@@ -1,0 +1,83 @@
+// BG442 (docs/roadmap/bugs-roadmap.md): gzip_decompress returned only the
+// first member of a multi-member gzip file and dropped the rest without an
+// error. RFC 1952 §2.2: a gzip file is a series of members; gzip -d and
+// Python's gzip.decompress concatenate them. Now so does gzip_decompress
+// (and gzip_decompress_str); NUL padding after the last member is skipped,
+// other trailing data, or a bad later member, is an error (empty).
+//
+// Expected output:
+// 11 [hello world]
+// [hello world]
+// 6 [hello ]
+// 3 [abc]
+// [abc]
+// [abc]
+// 0
+// 0
+// 0
+// 0
+// 13 [one two three]
+use compress;
+
+fn cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < a.len() {
+        v.push(a.get(i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < b.len() {
+        v.push(b.get(i));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn main() {
+    // the entry's trigger: Python gzip.compress(b'hello ') + gzip.compress(b'world')
+    val two: Vec<i64> = cat(gzip_compress("hello "), gzip_compress("world"));
+    val out: Vec<i64> = gzip_decompress(two.clone());
+    println(f"{out.len()} [{str_from_bytes(out)}]");
+    println(f"[{gzip_decompress_str(two.clone())}]");
+    // one member, as before
+    val one: Vec<i64> = gzip_decompress(gzip_compress("hello "));
+    println(f"{one.len()} [{str_from_bytes(one)}]");
+    // a member made by the compressing writer (fixed/dynamic Huffman blocks)
+    val lv: Vec<i64> = gzip_decompress(gzip_compress_level(str_bytes("abc"), 6));
+    println(f"{lv.len()} [{str_from_bytes(lv)}]");
+    // NUL padding after the last member is skipped
+    var pad: Vec<i64> = gzip_compress("abc");
+    pad.push(0);
+    pad.push(0);
+    pad.push(0);
+    println(f"[{gzip_decompress_str(pad.clone())}]");
+    // an empty member in the middle
+    println(f"[{gzip_decompress_str(cat(cat(gzip_compress("a"), gzip_compress("")), gzip_compress("bc")))}]");
+    // trailing data that is not a member: an error
+    var junk: Vec<i64> = gzip_compress("abc");
+    junk.push(120);
+    junk.push(121);
+    println(gzip_decompress(junk).len());
+    // padding followed by more data: an error
+    pad.push(31);
+    println(gzip_decompress(pad).len());
+    // a second member with a bad CRC-32: an error, not the first member
+    var bad2: Vec<i64> = gzip_compress("world");
+    val at: i64 = bad2.len() - 8;
+    bad2.set(at, (bad2.get(at) + 1) & 255);
+    println(gzip_decompress(cat(gzip_compress("hello "), bad2)).len());
+    // a second member cut short
+    val whole: Vec<i64> = cat(gzip_compress("hello "), gzip_compress("world"));
+    var cut: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < whole.len() - 3 {
+        cut.push(whole.get(i));
+        i = i + 1;
+    }
+    println(gzip_decompress(cut).len());
+    // three members
+    val three: Vec<i64> = cat(cat(gzip_compress("one "), gzip_compress("two ")), gzip_compress("three"));
+    val t: Vec<i64> = gzip_decompress(three);
+    println(f"{t.len()} [{str_from_bytes(t)}]");
+}

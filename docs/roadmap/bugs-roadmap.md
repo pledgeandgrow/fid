@@ -54,6 +54,26 @@ triage; BG489 was added after the count).
 Nov 27 second run: 122 new entries, BG367-BG488 (4 critical, 41 high,
 51 medium, 26 low), all open; see "Found by the Nov 27 whole-repo
 review, second run" below.
+Status Nov 27 (night): every open entry has a fix written; the whole file
+is 321 done `[x]`, 169 partly `[~]`, 0 open. Of BG258-BG490, 89 are `[x]`: the
+fixed code is stdlib, a runtime, a script or a tool, and its test passes
+when run with the fid of Nov 27 01:25. 142 are `[~]`: the fix and its test
+are written, but the fix is compiler code (or has a C-runtime half), so it
+waits for a rebuilt compiler. `fid check compiler/main.fd` with the old fid
+finds no errors in the tree with all of them. Each entry's note names the
+files, the test and what to watch. BG489 is BG393 filed again.
+Status Nov 28 (verified): a compiler built from that tree, in three stages
+from the Nov 27 01:25 fid (so its own C runtime is new too), passes all
+302 bug tests of BG258-BG490 on run, ccompile, emit and --nat, plus the new
+tool and LSP checks. It also passes `check compiler/main.fd` with no errors,
+conformance on run (1,618 of 1,618; 8 failed only under memory pressure and
+pass rerun alone) and the leak gate (11 of 11). The whole file is 453 done
+`[x]`, 37 partly `[~]`, 0 open. The 37 partly done are another session's
+BG183-BG256 batch (27) and ten of these: BG369, BG384 and BG431 (partial
+fixes), BG323 and BG366 (the installer), BG359 (stage-0 pin), BG485
+(release.yml), BG435 (a race), BG438 (a failure path) and BG475 (a 512 MiB
+input), each with what is left. Not run: the whole bootstrap suite on the
+new compiler, and the Linux targets.
 
 Status markers as in the other roadmaps: `[ ]` open, `[~]` partly done,
 `[x]` done.
@@ -2929,7 +2949,7 @@ the repo. Function names are the reference; line numbers move.
 
 ### Critical
 
-- [ ] BG258. **An assignment to a match-pattern binding is silently dropped:
+- [x] BG258. **An assignment to a match-pattern binding is silently dropped:
       `Some(x) => { x = x * 2; println(x); }` prints the old value.**
       compiler/lower.fd Lowerer_lower_match (EnumVariant arm:
       `Lowerer_insert_alloca(self, binding.name, - 1);
@@ -2943,7 +2963,19 @@ the repo. Function names are the reference; line numbers move.
       prints 3, 3 on fid run (and 3 on ccompile for the Option form); should
       print 6, 7 (or reject the assignment). Confirmed Nov 27 (fid run: 3 / 3;
       ccompile with `Option::Some(x)`: 3). Confidence: high.
-- [ ] BG259. **Machine layer: narrow-integer arithmetic in an inlined function
+      Fix written Nov 27 (night), not run yet: A binding that owns nothing (a
+      number, a bool or a plain struct) and that the arm assigns (`x = ..`, `x
+      += ..`, found with collect_assign_targets) now joins mb_names/vmb_names.
+      The arm then starts with `var x = x;` (Lowerer_lower_let_stmt), so the
+      binding has a slot. The let block also runs with ownership off. Files:
+      compiler/lower.fd. Test: test_bg258_match_binding_assign.fd. To verify:
+      build the compiler and run the test. Watch: Pattern::Ident bindings (`x
+      => { x = 1 }`) and tuple patterns are not covered. They get the same -1
+      alloca.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG259. **Machine layer: narrow-integer arithmetic in an inlined function
       with a literal argument is folded at 64 bits, so `u8 200 + 100` gives
       300 with no overflow panic.** compiler/egraph.fd eg_function (BinOp node
       built with `ots = eg_int_ty(eg_value_ty(f, a))`, the operand type, not
@@ -2964,7 +2996,23 @@ the repo. Function names are the reference; line numbers move.
       (u8 200 -> 400), i16 `x + 1000` of 32000 -> 33000, i32 `x * 16` of 2^28
       -> 4294967296. Confirmed Nov 27 (emit --nat prints
       300/400/33000/4294967296; run, ccompile, emit panic). Confidence: high.
-- [ ] BG260. **pe_ir negates an f32 by flipping bit 63, so `-x` of an f32
+      Fix written Nov 27 (night), not run yet: the e-graph models an integer
+      arithmetic BinOp only when its result type equals its operand type
+      (comparisons keep the operand type); both inliners narrow a wider
+      integer argument to a narrower integer parameter with an IntTrunc (as
+      BG43 bit-casts same-width ones), so the inlined body's u8/i16/i32 ops
+      see their own type. Files: compiler/egraph.fd, compiler/iropt.fd,
+      compiler/iropt_me.fd. Test: test_bg259_i16_inline_overflow_fail.fd,
+      test_bg259_i32_inline_overflow_fail.fd, test_bg259_narrow_inline_ok.fd,
+      test_bg259_u8_inline_overflow_fail.fd. To verify: build the compiler and
+      run the tests. Watch: the e-graph no longer folds BinOps whose operands
+      share a type different from the result (lost folding only); iropt_me.fd
+      is outside my file list (6 lines added in ime_inline_site's parameter
+      loop).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG260. **pe_ir negates an f32 by flipping bit 63, so `-x` of an f32
       keeps its sign (`-2.0` gives 2, `1.0 / -0.0` gives +inf).**
       compiler/pe_ir.fd PeirGen (instruction lowering), `Inst::UnaryOp(op,
       operand, ty)` -> `UnaryOp::Neg` float branch: the float branch loads the
@@ -2976,10 +3024,17 @@ the repo. Function names are the reference; line numbers move.
       f32 = -idf(0.0); println(f"{idf(1.0) / nz}"); }` -- emit prints `neg 2`
       and `inf`; run/ccompile/--nat print `neg -2` and `-inf`. Confirmed Nov
       27 (emit wrong; run, ccompile, emit --nat right). Confidence: high.
+      Fix written Nov 27 (night), not run yet: for an F32 the XOR mask is 1 <<
+      31 (the f32 sign bit in the low word) instead of 1 << 63. Files:
+      compiler/pe_ir.fd. Test: test_bg260_f32_neg.fd. To verify: build the
+      compiler and run the test. Watch: none beyond f32 negation on pe_ir.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
 
 ### High
 
-- [ ] BG261. **A const's initializer is never type-checked: `const C: i64 =
+- [x] BG261. **A const's initializer is never type-checked: `const C: i64 =
       "abc"` compiles and `C` is a str.** compiler/typechecker.fd
       TypeChecker_check_program (the BG117 loop after "Check function bodies"
       calls only TypeChecker_check_value_fits on cdef.expr): the only check on
@@ -2990,7 +3045,19 @@ the repo. Function names are the reference; line numbers move.
       println(C); println(B); return 0; }` -> `fid run` prints `abc` and `5`;
       should be a type error (cannot assign str to i64 / i8 to bool).
       Confirmed Nov 27 (fid run: abc / 5, exit 0). Confidence: high.
-- [ ] BG262. **A global's initializer is neither type-checked nor fit-checked:
+      Fix written Nov 27 (night), not run yet: each const's initializer is now
+      typed with the declared type as hint, fit-checked, and compared with the
+      declared type ("cannot assign str to const 'C' of type i64."). The check
+      runs as the module that declares the const, and errors of an imported
+      module are tagged with that module. Files: compiler/typechecker.fd.
+      Test: test_bg261_const_bool_fail.fd, test_bg261_const_str_fail.fd,
+      test_bg262_decl_init_ok.fd. To verify: build the compiler and run the
+      tests. Watch: this now runs on every const of the merged program (core,
+      stdlib, compiler).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG262. **A global's initializer is neither type-checked nor fit-checked:
       `var G: i64 = "str"` prints a pointer.** compiler/typechecker.fd
       TypeChecker_check_program (no loop over program.globals checks .init
       against .ty; globals are only scanned for called functions, N5 ~27074,
@@ -3002,7 +3069,19 @@ the repo. Function names are the reference; line numbers move.
       println(U); return 0; }` -> fid run prints `5384` (the string's
       address), `true`, `188`; each should be a type error. Confirmed Nov 27
       (fid run: 5384 / true / 188). Confidence: high.
-- [ ] BG263. **Default parameter values are never type-checked: `fn h(x: i64 =
+      Fix written Nov 27 (night), not run yet: each global's initializer gets
+      the same type and fit check ("cannot assign str to global 'G' of type
+      i64.", "the literal does not fit in u8"). Test:
+      test_bg262_decl_init_ok.fd, test_bg262_global_bool_fail.fd,
+      test_bg262_global_fit_fail.fd, test_bg262_global_str_fail.fd. To verify:
+      build the compiler and run the tests. Watch: global initializers were
+      never type-checked before, so stdlib and compiler globals are now
+      checked (my survey of initializer shapes found nothing that should
+      fail).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG263. **Default parameter values are never type-checked: `fn h(x: i64 =
       "hello")` passes a pointer, `x: u8 = 500` holds 500.**
       compiler/typechecker.fd (defaults are only recorded, fn_pdefaults /
       TypeChecker_register_program counts required params; no check of the
@@ -3016,7 +3095,19 @@ the repo. Function names are the reference; line numbers move.
       }` -> fid run prints `4112`, `3.5`, `500`; each default should be
       rejected. Confirmed Nov 27 (fid run: 4112 / 3.5 / 500). Confidence:
       high.
-- [ ] BG264. **A nested constructor pattern defeats the exhaustiveness check:
+      Fix written Nov 27 (night), not run yet: each default value is
+      type-checked and fit-checked against its parameter's type, in a scope
+      holding the parameters before it. This keeps BG424's `b: i64 = a * 2`
+      valid. Files: compiler/typechecker.fd. Test:
+      test_bg263_default_fit_fail.fd, test_bg263_default_float_bool_fail.fd,
+      test_bg263_default_ok.fd, test_bg263_default_str_fail.fd. To verify:
+      build the compiler and run the tests. Watch: a parameter whose type
+      mentions a type parameter is not compared. Watch test_bg422/test_bg424
+      (defaults that name earlier parameters and globals).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG264. **A nested constructor pattern defeats the exhaustiveness check:
       `Some(Ok(x))` + `None` compiles and panics at run time on
       `Some(Err(..))`.** compiler/parser.fd Parser_pd_desugar_arms (LG8
       nested-pattern desugaring): an arm `Some(Ok(x))` is rewritten to
@@ -3032,7 +3123,22 @@ the repo. Function names are the reference; line numbers move.
       passes; fid run panics "nested match: no arm matched"; should be
       "non-exhaustive match ... missing Result::Err". Confirmed Nov 27 (fid
       run: Panic: nested match: no arm matched). Confidence: high.
-- [ ] BG265. **A `-> !` function may return normally, and its callers then
+      Fix written Nov 27 (night), not run yet: before desugaring, the original
+      arms (unguarded) are compiled into a tree of one-level matches with
+      empty bodies (rows specialized per constructor, nested `__np` positions
+      looked up in the PatNest list), emitted as `if false { probe }` before
+      the real match (statement form) or at the start of the first arm
+      (expression form, unless that arm binds the scrutine ... Files:
+      compiler/parser.fd. Test: test_bg264_nested_bare_fail.fd,
+      test_bg264_nested_exhaustive_ok.fd,
+      test_bg264_nested_nonexhaustive_fail.fd. To verify: build the compiler
+      and run the tests. Watch: the dead probe is type-checked and lowered
+      (dead code); it re-reads `__ms`/the scrutinee, which a linear-type check
+      could see as a second use;
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG265. **A `-> !` function may return normally, and its callers then
       fall off their end with no value.** compiler/typechecker.fd
       TypeChecker_check_func_body (Type::Never sets returns_value = false:
       nothing checks that a `-> !` body never reaches its end or a `return`);
@@ -3046,7 +3152,21 @@ the repo. Function names are the reference; line numbers move.
       `after`; ccompile prints `not dying`, `0`, `after`. Should be an error:
       'die' is declared `-> !` but can return. Confirmed Nov 27 (fid run and
       ccompile). Confidence: high.
-- [ ] BG266. **Comptime arithmetic on `i8`/`i16`/`i32` is done at 64 bits:
+      Fix written Nov 27 (night), not run yet: a `-> !` body must not be able
+      to reach its end. Some statement in it must be a call to
+      panic/exit/unreachable/abort/todo or to a `-> !` function, an endless
+      loop/while true without break, or an if/else or match whose branches all
+      never end. Otherwise: "'die' is declared `-> !` (it never returns) but
+      can return: ...". Files: compiler/typechecker.fd. Test:
+      test_bg265_never_if_fail.fd, test_bg265_never_ok.fd,
+      test_bg265_never_returns_fail.fd. To verify: build the compiler and run
+      the tests. Watch: only 5 `-> !` functions exist in the tree
+      (tests/bootstrap/test_never_type*.fd, 3 conformance files), and all end
+      in panic/p_panic.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG266. **Comptime arithmetic on `i8`/`i16`/`i32` is done at 64 bits:
       `comptime f(50000)` with `fn f(x: i32) -> i32 { x * x }` gives
       2500000000.** compiler/comptime_eval.fd: only unsigned operands get
       width-aware arithmetic (ct_eval_uint_binop, BG62); signed values go
@@ -3063,7 +3183,22 @@ the repo. Function names are the reference; line numbers move.
       run-time call panics "Integer overflow on multiplication: 50000 *
       50000". The comptime call should be a comptime overflow error. Confirmed
       Nov 27 (fid run). Confidence: high.
-- [ ] BG267. **An f64 literal given to an f32 enum payload is stored
+      Fix written Nov 27 (night), not run yet: the names of the running
+      comptime fn declared i8/i16/i32 (params, typed `val`s, untyped `val`s
+      whose value has such operands) are kept in a scoped side table. Files:
+      compiler/comptime_eval.fd. Test:
+      test_bg266_comptime_i32_overflow_fail.fd,
+      test_bg266_comptime_i8_overflow_fail.fd,
+      test_bg266_comptime_narrow_ok.fd,
+      test_bg266_comptime_u8_overflow_fail.fd. To verify: build the compiler
+      and run the tests. Watch: the width is inferred syntactically
+      (Ident/Cast/operators), so a value through a call or field is unchecked
+      (misses, no false errors expected); a typed name in an inner block is
+      dropped at the block's end.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG267. **An f64 literal given to an f32 enum payload is stored
       unconverted, so `E::F(2.5)` and `Option::Some(1.5)` of an `Option<f32>`
       read back as 0 on every backend.** compiler/lower.fd Lowerer_lower_expr,
       `Expr::EnumLit` (the non-struct payload branch:
@@ -3079,7 +3214,19 @@ the repo. Function names are the reference; line numbers move.
       Option<f32> = Option::Some(1.5); println(f"{o2.unwrap()}"); }` prints `F
       0` and `0` (want `F 2.5`, `1.5`). Confirmed Nov 27 (run, ccompile, emit,
       emit --nat; found by two passes). Confidence: high.
-- [ ] BG268. **`HashMap<K, f32>` `get`/`get_or` return the raw stored word, so
+      Fix written Nov 27 (night), not run yet: A payload that is not a type
+      parameter is converted to its declared float type (an f64 literal
+      becomes an f32). A type-parameter payload takes its type from the let's
+      hint (`val o: Option<f32> = Option::Some(1.5)`). A returned tuple or
+      enum literal gets the function's result type as let_hint, but only when
+      one of its elements is a float literal. Files: compiler/lower.fd. Test:
+      test_bg267_f32_enum_payload.fd. To verify: build the compiler and run
+      the test. Watch: A nested EnumLit reads the let hint too, so `val o:
+      Option<f32> = wrap(Option::Some(2.5))` would narrow the inner literal.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG268. **`HashMap<K, f32>` `get`/`get_or` return the raw stored word, so
       an f32 map value reads as an integer bit pattern on every backend.**
       compiler/lower.fd Lowerer_map_values_f64 (only `IrType::F64` /
       `Type::F64` values are bit-cast back with p_f64_from_bits after
@@ -3096,7 +3243,19 @@ the repo. Function names are the reference; line numbers move.
       `4612811918334230528`. A `HashMap<i64, f64>` is right. Confirmed Nov 27
       (run, ccompile, emit, emit --nat; found by two passes). Confidence:
       high.
-- [ ] BG269. **A float literal in a tuple literal stays f64 where the tuple
+      Fix written Nov 27 (night), not run yet: On a map of f32 values, every
+      f32 argument of a HashMap_* call is widened to f64. All backends then
+      store an f64's bits, as they already do for f64 maps. Results of get and
+      get_or go through p_f64_from_bits and are narrowed to f32. Files:
+      compiler/lower.fd. Test: test_bg268_map_f32_get.fd. To verify: build the
+      compiler and run the test. Watch: --nat stored f32 bits for f32 map
+      values; it now stores f64 bits like the other backends. So on --nat,
+      m.values() and iteration of an f32 map now hold f64-bit words. Check
+      values() on --nat.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG269. **A float literal in a tuple literal stays f64 where the tuple
       type says f32: `return (a, 2.5)` for `(f32, f32)` reads 0 on every
       backend.** compiler/lower.fd Lowerer_lower_expr
       `Expr::TupleLit(elements)` (element IR types taken from the lowered
@@ -3109,7 +3268,20 @@ the repo. Function names are the reference; line numbers move.
       2.5); } fn main() { val (c, d) = mk2(); println(f"{c} {d}"); }` -- all
       four backends print `1.5 0` (want `1.5 2.5`). Confirmed Nov 27 (run,
       ccompile, emit, emit --nat). Confidence: high.
-- [ ] BG270. **A field of type parameter `T = f32` in a generic struct is read
+      Fix written Nov 27 (night), not run yet: A tuple literal reads the
+      element types from let_hint when the hint is a Tuple of the same length,
+      and converts float elements with Lowerer_float_as. While the elements
+      are lowered the hint is cleared (it belongs to the tuple, not to them),
+      and it is restored afterwards. Files: compiler/lower.fd. Test:
+      test_bg269_f32_tuple_literal.fd. To verify: build the compiler and run
+      the test. Watch: Clearing let_hint during element lowering changes
+      ownership typing for an if or match nested in an element:
+      Lowerer_rc_result_type no longer sees the tuple type. That typing was
+      wrong before anyway.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG270. **A field of type parameter `T = f32` in a generic struct is read
       as an integer word: `G { v: idf(3.5) }.v` prints a bit pattern, and
       every backend prints a different one.** compiler/lower.fd
       Lowerer_lower_field_access_expr (type-parameter field: `match want {
@@ -3126,7 +3298,18 @@ the repo. Function names are the reference; line numbers move.
       4615063718147915776`, ccompile `3 4`, emit/--nat `1080033280 1080033280`
       (want `3.5 4.5`). Confirmed Nov 27 (all four backends wrong, and they
       disagree). Confidence: high.
-- [ ] BG271. **`Option<f32>.unwrap_or(1.5)` is instantiated as
+      Fix written Nov 27 (night), not run yet: An f32 in a type-parameter
+      field is now kept as the bits of its f64, whether it comes from a
+      literal, `g.v = y` or `g.v += y`. Reads decode it with p_f64_from_bits
+      and narrow it back to f32. Files: compiler/lower.fd. Test:
+      test_bg270_generic_f32_field.fd. To verify: build the compiler and run
+      the test. Watch: Other code that reads a type-parameter word still uses
+      its own convention: println of G<f32>, __eq_ of generic structs, copies
+      into enum payloads.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG271. **`Option<f32>.unwrap_or(1.5)` is instantiated as
       `Option__unwrap_or__f64`, so a `Some` payload's f32 bits are read as an
       f64 (7.5 prints 5.38e-315).** compiler/mono.fd (generic method
       instantiation of core `Option::unwrap_or(self: Option<T>, default: T)`:
@@ -3146,7 +3329,21 @@ the repo. Function names are the reference; line numbers move.
       4294967287 on run/C/--nat and 140728898420727 (junk upper bits) on emit.
       Confirmed Nov 27 (all four backends; dump-ir shows the f64 instance).
       Confidence: high.
-- [ ] BG272. **`spawn` of a function returning f32 gives 0 after `await` on
+      Fix written Nov 27 (night), not run yet: when the arguments bind a type
+      parameter to a literal's default type (i64 / f64) and the receiver
+      (self's type against the receiver's) binds it to a narrower number of
+      the same kind (i8..u64 / f32), the receiver's binding wins, so
+      `Option<f32>.unwrap_or(1.5)` instantiates `Option__unwrap_or__f32` (and
+      Option<i32> / Result<i32, str> the i32 instance). Files:
+      compiler/mono.fd. Test: test_bg271_unwrap_or_narrow.fd. To verify: build
+      the compiler and run the test. Watch: only that number-kind pair is
+      overridden (a typed i64 argument with an i32 receiver cannot
+      type-check), so other generic method calls keep the argument-first
+      order.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG272. **`spawn` of a function returning f32 gives 0 after `await` on
       every compiled backend (pe_ir also loses an f32 parameter).**
       compiler/lower.fd Lowerer_emit_task_adapter (parameters: `match lty {
       IrType::F64 => p_f64_from_bits ... }`; result: `match ret_ty {
@@ -3164,7 +3361,21 @@ the repo. Function names are the reference; line numbers move.
       ccompile and --nat `param 125 / ret 0`; emit `param 0 / ret 0`.
       Confirmed Nov 27 (tree diff of Lowerer_emit_task_adapter: only BG228
       ownership lines added; no float change). Confidence: high.
-- [ ] BG273. **`opt ?? d` on an `Option<i8/i16/i32>` or `Option<bool>` used
+      Fix written Nov 27 (night), not run yet: This applies to a thread
+      function started with p_thread_spawn (entry == callee) whose parameters
+      and result are numbers, bools or floats, with at least one f32. It now
+      starts through an IR wrapper `__spawnw_N(env, words..) -> i64`. The
+      caller passes each float as f64 bits: an f32 is widened, and an f64
+      literal for an f32 parameter is narrowed first. Files:
+      compiler/lower.fd. Test: test_bg272_spawn_f32.fd. To verify: build the
+      compiler and run the test. Watch: Expression branches of `parallel {
+      f(a) | g(b) }` with f32 arguments also go through the wrapper (their
+      results are discarded there). Async (green) tasks are unchanged, because
+      an async task with an f32 is not adaptable.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG273. **`opt ?? d` on an `Option<i8/i16/i32>` or `Option<bool>` used
       directly (not bound to a typed variable) gives the payload's
       zero-extended word: `Some(-1i8) ?? 0` is 255, `Some(-42i32) ?? 5` is
       4294967254.** compiler/lower.fd Lowerer_coalesce_ir_type (an Option
@@ -3187,7 +3398,17 @@ the repo. Function names are the reference; line numbers move.
       `5368810753`, --nat `4295425`: the upper bytes of the payload word are
       not defined for a bool), want `true`. Confirmed Nov 27 (run, ccompile,
       emit, --nat; function identical in the tree). Confidence: high.
-- [ ] BG274. **`Rc::new(x)` / `Arc::new(x)` of a float keeps only its integer
+      Fix written Nov 27 (night), not run yet: When the Option payload is a
+      narrow integer or a bool, the result of `??` gets that type. The payload
+      is loaded as that type (its low bytes), and the default is cast to it.
+      Files: compiler/lower.fd. Test: test_bg273_coalesce_narrow.fd. To
+      verify: build the compiler and run the test. Watch:
+      Lowerer_infer_expr_type of `??` now gives the narrow type, so callers
+      that expected i64 now see i8, i32 or bool.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG274. **`Rc::new(x)` / `Arc::new(x)` of a float keeps only its integer
       part: `Rc::new(4.25).get()` is 4.0 on every backend.** compiler/lower.fd
       Lowerer_lower_rc_new (`as_word = ir_type_is_float(val_ty)` then
       `Lowerer_lower_cast(self, v_lw, val_ty, IrType::I64)`) and
@@ -3202,7 +3423,16 @@ the repo. Function names are the reference; line numbers move.
       -- all four backends print `4 4.5` (want `4.25 4.75`). Confirmed Nov 27
       (run, ccompile, emit, --nat; both functions identical in the tree).
       Confidence: high.
-- [ ] BG275. **Rc/Arc methods on a local whose type is inferred (`val r =
+      Fix written Nov 27 (night), not run yet: A float payload is stored as
+      its f64 bits through Lowerer_f64_word_bits. `get` decodes it with
+      p_f64_from_bits and narrows it for an f32. Pointers still go through
+      lower_cast. Files: compiler/lower.fd. Test: test_bg274_rc_float.fd. To
+      verify: build the compiler and run the test. Watch: lw-b also edits Rc
+      functions. Check that these two edits merged cleanly.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG275. **Rc/Arc methods on a local whose type is inferred (`val r =
       Rc::new(5); val r2 = r.clone();`) are lowered as plain calls: `r2.get()`
       becomes `Vec_get`, `a.count()` an unknown function `count`.**
       compiler/lower.fd Lowerer_lower_method_call (the Rc/Arc branch needs
@@ -3224,7 +3454,17 @@ the repo. Function names are the reference; line numbers move.
       the right values. Confirmed Nov 27 (run, ccompile, emit, emit --nat;
       found by two passes). Confidence: high (behaviour), medium (the exact
       inference function).
-- [ ] BG276. **A typed `const` is lowered as its bare literal (i64): `const
+      Fix written Nov 27 (night), not run yet: `r.clone()` of Rc<T>/Arc<T>
+      infers Rc<T>, `r.get()` infers T, `r.count()` i64. `Rc::new(x)` infers
+      Rc<type of x> (was Rc<i64>). Unannotated locals keep the Rc type and
+      take the Rc method branch. Files: compiler/lower.fd. Test:
+      test_bg275_rc_inferred.fd. To verify: build the compiler and run the
+      test. Watch: an unannotated Rc::new of a float/struct now gets the
+      payload's type for get (consistent with lw-a's BG274 bits handling).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG276. **A typed `const` is lowered as its bare literal (i64): `const
       CU: u8 = 200; CU + CU` wraps to 144 with no overflow panic, and `const
       CB: u64 = u64::MAX` prints -1 and compares `CB > 1` false.**
       compiler/lower.fd Lowerer_lower_expr, `Expr::Ident` "Check if constant
@@ -3242,7 +3482,19 @@ the repo. Function names are the reference; line numbers move.
       overflow panic; with the add removed `18446744073709551615 true`).
       Confirmed Nov 27 (run, ccompile, emit, --nat; the lowering lines are the
       same in the tree). Confidence: high.
-- [ ] BG277. **`x?` on an `Option<i8>` (by the code, any narrow integer
+      Fix written Nov 27 (night), not run yet: A const declared as
+      i8/i16/i32/u8/u16/u32/u64/f32/f64 is registered as `Cast(expr, declared
+      type)`. Its uses then have the declared type: a u8 add panics on
+      overflow, and a u64 prints and compares unsigned. Files:
+      compiler/lower.fd. Test: test_bg276_typed_const.fd,
+      test_bg276_typed_const_overflow_fail.fd. To verify: build the compiler
+      and run the tests. Watch: Code that relied on a typed const being an i64
+      now gets the declared type (e.g. a u32 const used as an index is now
+      u32).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG277. **`x?` on an `Option<i8>` (by the code, any narrow integer
       payload of Option/Result) yields the zero-extended word: `Some(-3i8)?`
       is 253 on run/C and junk on the native backends.** compiler/lower.fd
       Lowerer_lower_try_expr (the unwrapped value's `ok_ty` is the payload's
@@ -3260,7 +3512,15 @@ the repo. Function names are the reference; line numbers move.
       96638681570, --nat 43732450 (want -30). Confirmed Nov 27 (all four
       wrong, the native two with junk; function identical in the tree).
       Confidence: high.
-- [ ] BG278. **Every `v.clone()` (and `v.map(f)`) of a Vec leaks the new Vec,
+      Fix written Nov 27 (night), not run yet: An Ok or Some payload that is a
+      narrow integer or a bool is loaded as its own type (lw_narrow_word), not
+      as an i64 word. Files: compiler/lower.fd. Test:
+      test_bg277_try_narrow.fd. To verify: build the compiler and run the
+      test.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG278. **Every `v.clone()` (and `v.map(f)`) of a Vec leaks the new Vec,
       bound to a variable or not.** compiler/lower.fd Lowerer_rc_note_call /
       lw_rc_fresh_handle_call, and the method lowering of Vec `clone`/`map`
       (Lowerer_rc_own_value takes a share of it): lw_rc_fresh_handle_call
@@ -3283,7 +3543,17 @@ the repo. Function names are the reference; line numbers move.
       Vec<P> = v.clone();` also leaks every element's string. Confirmed Nov 27
       (`fid run --leaks`, which builds through C); `m.clone().len()`,
       `m.keys().len()`, `str_split(..).len()` are freed. Confidence: high.
-- [ ] BG279. **Printing a `Vec` or `HashMap` of f64, f32, bool, u64 or enums
+      Fix written Nov 27 (night), not run yet: `a.clone()` on a Vec-typed
+      receiver gets the receiver's IR type, so Lowerer_rc_note_call makes it a
+      statement temporary: a let claims it, otherwise it is dropped. A raw-i64
+      receiver (core code) keeps the unowned i64 result. map and filter of
+      core's `impl Vec` are now found under `Vec_map` (BG392 registration).
+      Files: compiler/lower.fd. Test: test_bg278_vec_clone_leak.fd. To verify:
+      build the compiler and run the test. Watch: low.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG279. **Printing a `Vec` or `HashMap` of f64, f32, bool, u64 or enums
       shows the raw words: `[1.5, -2.25]` prints as `[4609434218613702656,
       -4611123068473966592]`.** stdlib/core.fd Vec_to_str and HashMap_to_str
       (used by `println(v)` and `f"{v}"`): Vec_to_str formats every element
@@ -3303,7 +3573,17 @@ the repo. Function names are the reference; line numbers move.
       `[18446744073709551615]`, `{a: 2.5}`. Confirmed Nov 27 (run, ccompile,
       emit, emit --nat print the same wrong text; found by two passes).
       Confidence: high.
-- [ ] BG280. **A `HashMap<f64, V>` (or f32 key) is accepted, then treated as a
+      Fix written Nov 27 (night), not run yet: The lowering reads the element,
+      key and value types (from the AST type, else from the IR generic
+      arguments) and passes kinds to core: 1 f64, 2 f32 (either word form), 3
+      bool, 4 u64. When no kind applies, the old path is kept. Files:
+      stdlib/core.fd, compiler/lower.fd. Test: test_bg279_print_float_vec.fd.
+      To verify: build the compiler and run the test. Watch: Vec<enum>, nested
+      Vec<Vec<f64>> elements and eprint/eprintln are unchanged.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG280. **A `HashMap<f64, V>` (or f32 key) is accepted, then treated as a
       string-keyed map: every compiled backend crashes in hm_hash, `fid run`
       merges the keys.** compiler/lower.fd Lowerer_map_has_int_keys /
       lw_is_int_type (only integer and bool keys select the integer-key map;
@@ -3322,7 +3602,17 @@ the repo. Function names are the reference; line numbers move.
       0xFFFFFFFFFFFFFFFF` in hm_hash <- hm_put <- HashMap_insert. Confirmed
       Nov 27 (run, ccompile, emit, emit --nat; found by two passes).
       Confidence: high.
-- [ ] BG281. **`regex_split` drops the input text when the pattern can match
+      Fix written Nov 27 (night), not run yet: when `HashMap::new()` is typed
+      HashMap<f64|f32, V>, the error is "a HashMap key cannot be f64: float
+      keys are not supported ...". Files: compiler/typechecker.fd. Test:
+      test_bg280_f32_key_fail.fd, test_bg280_f64_key_fail.fd. To verify: build
+      the compiler and run the tests. Watch: only the creation is checked. A
+      HashMap<f64,..> parameter or field type with no HashMap::new() of that
+      type is not reported. No float-keyed map exists in the tree.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG281. **`regex_split` drops the input text when the pattern can match
       the empty string.** stdlib/regex.fd regex_split: on a zero-width match
       the loop pushes `str_slice(s, i, found)` and then sets `i = found + 1`,
       so the byte at `found` is skipped and never becomes part of the next
@@ -3333,7 +3623,17 @@ the repo. Function names are the reference; line numbers move.
       ['','ne','','wo'] (the 'o' and 't' are gone; Python: ['','one','
       ','two','']); `regex_split("ab1cd", "\d*")` -> six empty strings.
       Confirmed Nov 27 (fid run). Confidence: high.
-- [ ] BG282. **HPACK bomb: `hpack_decode` has no decoded-size limit, and
+      Fixed Nov 27 (night): regex_split keeps the start of the current piece
+      (`last`) apart from the search position, so the byte at a zero-width
+      match starts the next piece (Python re.split 3.7+); an empty match moves
+      the search on one byte. Files: stdlib/regex.fd. Test:
+      test_bg281_regex_split_empty.fd. Run with the fid of Nov 27 01:25 on the
+      tree's sources (the fixed code is stdlib, a runtime, a script or a tool
+      the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG282. **HPACK bomb: `hpack_decode` has no decoded-size limit, and
       HTTP/2 checks the header list only after decoding a 256 KiB block.**
       stdlib/hpack.fd hpack_decode; stdlib/http2.fd h2_on_header_block:
       hpack_decode appends every field to r.names/r.vals with no bound on the
@@ -3349,7 +3649,19 @@ the repo. Function names are the reference; line numbers move.
       8,070,033 bytes (1,343x amplification); the limit is never consulted
       inside the decoder. Confirmed Nov 27 (fid run, hpack_decode); the
       http2.fd order (decode, then size check) read only. Confidence: high.
-- [ ] BG283. **J1939 PDU1/PDU2 are swapped, so `j1939_pgn` gives the wrong PGN
+      Fixed Nov 27 (night): new hpack_decode_limit(h, block, max_list) counts
+      the header list size while decoding (RFC 9113 §6.5.2, name+value+32) and
+      stops copying fields once it passes the limit (too_large, new
+      HpackHeaders field, names/vals empty) but decodes the rest of the block
+      so the dynamic table stays in step (RFC 9113 §10.5.1). Files:
+      stdlib/hpack.fd, stdlib/http2.fd. Test: test_bg282_hpack_bomb.fd. Run
+      with the fid of Nov 27 01:25 on the tree's sources (the fixed code is
+      stdlib, a runtime, a script or a tool the old fid runs): the test
+      passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG283. **J1939 PDU1/PDU2 are swapped, so `j1939_pgn` gives the wrong PGN
       for every message.** stdlib/can.fd j1939_is_pdu1, j1939_is_pdu2,
       j1939_pgn (and the comment above j1939_id): SAE J1939-21 defines PDU1
       (destination-specific, PS = destination address, not part of the PGN) as
@@ -3361,6 +3673,15 @@ the repo. Function names are the reference; line numbers move.
       (0xF000), should be 61444 (0xF004), and `j1939_is_pdu1` says true;
       `j1939_pgn(0x18EA17F9)` (Request to address 0x17) -> 59927 (0xEA17),
       should be 59904 (0xEA00). Confirmed Nov 27 (fid run). Confidence: high.
+      Fixed Nov 27 (night): j1939_is_pdu1 is PF < 240, j1939_is_pdu2 PF >=
+      240, j1939_pgn drops PS for PDU1 and keeps it for PDU2; module comment
+      corrected. Files: stdlib/can.fd. Test: test_bg283_j1939_pdu_format.fd.
+      Run with the fid of Nov 27 01:25 on the tree's sources (the fixed code
+      is stdlib, a runtime, a script or a tool the old fid runs): the test
+      passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
 - [x] BG284. **Every `RELEASE=1 scripts/bootstrap.sh` build is reported stale
       by release-fresh.sh, so release.yml's check and build-installer.sh
       always refuse it.** scripts/bootstrap.sh (RELEASE block: `bash
@@ -3391,7 +3712,7 @@ the repo. Function names are the reference; line numbers move.
       `+changes` mark ignores it): the same sequence on a copy of the tree
       now says "is the release build of this source", exit 0, and an edit to
       stdlib/core.fd still makes it stale, exit 1.
-- [ ] BG285. **`ark install` runs shell commands written into an ark.toml (or
+- [x] BG285. **`ark install` runs shell commands written into an ark.toml (or
       ark.lock) field: git branch/tag, commit and URL go to p_system
       unescaped.** compiler/ark.fd ark_install_git_at (`cmd + " --branch " +
       gref`, `"checkout --quiet " + locked`), ark_q (just wraps in `"..."`),
@@ -3409,10 +3730,20 @@ the repo. Function names are the reference; line numbers move.
       clone fails, and inj.txt containing "INJECTED" is created in the project
       directory. Confirmed Nov 27 (fb4 fid.exe on Windows, harmless payload;
       ark.fd identical in the tree). Confidence: high.
+      Fixed Nov 27 (night): validation first (refs: letters digits / . _ - +
+      @, no leading -, no .. @{ //; commits: 4-64 hex; URLs: no leading -, no
+      ext::, none of " ' ` $ % ; | & < > ^ ! * ? or control chars); then ark_q
+      quotes for the shell in use: sh single quotes ('\'' for '), cmd.exe
+      double quotes with `"`/CR/LF dropped and `% ... Files: compiler/ark.fd.
+      Test: tests/ark/ark-paths.sh, tests/ark/ark-safety.sh. Run with the fid
+      of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      ark-safety.sh passes.
 
 ### Medium
 
-- [ ] BG286. **A literal or wider integer assigned to a field, an index or
+- [x] BG286. **A literal or wider integer assigned to a field, an index or
       through `*r` is not fit/narrowing-checked: `s.a = 1000` on a `u8` field
       stores 232.** compiler/typechecker.fd TypeChecker_check_stmt_inner,
       Stmt::FieldAssign / Stmt::IndexAssign / Stmt::DerefAssign
@@ -3430,7 +3761,20 @@ the repo. Function names are the reference; line numbers move.
       return 0; }` -> prints 232 / 1 / 4; should be three "literal does not
       fit in u8" errors. Confirmed Nov 27 (fid run: 232 / 1 / 4). Confidence:
       high.
-- [ ] BG287. **`Vec<u8>.push(999)` / `Vec<i8>.push(200)` is accepted and
+      Fix written Nov 27 (night), not run yet: field, element and `*r` stores
+      now call TypeChecker_check_value_fits when the types are compatible.
+      This covers the literal fit everywhere, and in module main a wider
+      integer needs `as`, as for `x = e`. Files: compiler/typechecker.fd.
+      Test: test_bg286_assign_fit_ok.fd, test_bg286_deref_fit_fail.fd,
+      test_bg286_field_fit_fail.fd, test_bg286_field_wider_fail.fd (+1 more).
+      To verify: build the compiler and run the tests. Watch: the
+      wider-integer check is new for fields, elements and `*r` in main-module
+      programs (a heuristic scan of tests/examples/tools found no `s.f =
+      <wider var>` cases).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG287. **`Vec<u8>.push(999)` / `Vec<i8>.push(200)` is accepted and
       truncated: Vec method arguments skip the literal fit check.**
       compiler/typechecker.fd TypeChecker_check_expr_inner, Expr::MethodCall
       on Vec (push/insert/set element argument; no
@@ -3443,7 +3787,17 @@ the repo. Function names are the reference; line numbers move.
       231 / 251 / -56; should be "the literal does not fit in u8/i8".
       Confirmed Nov 27 (fid run and ccompile: 231 / 251 / -56). Confidence:
       high.
-- [ ] BG288. **A closure with a declared result type may fall off its end:
+      Fix written Nov 27 (night), not run yet: a constant (literal) element
+      argument that is type-compatible is fit-checked against the element
+      type. Non-literal arguments are not narrowed-checked, which keeps
+      `bytes.push(i64_var)` valid. Files: compiler/typechecker.fd. Test:
+      test_bg287_vec_fit_ok.fd, test_bg287_vec_i8_fit_fail.fd,
+      test_bg287_vec_push_fit_fail.fd, test_bg287_vec_push_neg_fail.fd. To
+      verify: build the compiler and run the tests.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG288. **A closure with a declared result type may fall off its end:
       `fn(y: i64) -> str { if y > 0 { return "pos"; } }` compiles.**
       compiler/typechecker.fd TypeChecker_check_func_body (the E047 "can reach
       the end of its body without returning" check, ~13482) runs for named
@@ -3459,7 +3813,18 @@ the repo. Function names are the reference; line numbers move.
       empty line. Should be E047 for both closures (a named fn with the same
       body is rejected). Confirmed Nov 27 (fid run and ccompile). Confidence:
       high.
-- [ ] BG289. **`&mut` of a `val` is accepted, so a `val` can be changed
+      Fix written Nov 27 (night), not run yet: a closure with a declared
+      non-void result whose body can fall off its end (!stmts_always_leave) is
+      E047: "the closure is declared to return i64 but can reach the end of
+      its body without returning". Files: compiler/typechecker.fd. Test:
+      test_bg288_closure_return_fail.fd, test_bg288_closure_return_ok.fd,
+      test_bg288_closure_str_return_fail.fd. To verify: build the compiler and
+      run the tests. Watch: a scan of all `fn(..) -> T {` closures in the tree
+      found none that falls off its end.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG289. **`&mut` of a `val` is accepted, so a `val` can be changed
       through a reference or a `&mut` parameter.** compiler/typechecker.fd
       Expr::Ref / AddrOf with mut (no TypeChecker_is_val test; the only `val`
       check is in Stmt::Assign ~20593): reference §5.1: `val` binds a name
@@ -3469,7 +3834,19 @@ the repo. Function names are the reference; line numbers move.
       x; *r = 6; println(x); bump(&mut x); println(x); return 0; }` -> prints
       6, 106; `x = 6` on the same val is rejected with E044. Confirmed Nov 27
       (fid run). Confidence: high.
-- [ ] BG290. **The names bound by `val (a, b) = t` are assignable.**
+      Fix written Nov 27 (night), not run yet: `&mut x` of a `val x` whose
+      type is a number, bool or str is "cannot assign to 'x' through `&mut x`:
+      it is declared with `val`." (E044). A val Vec, map or struct may still
+      be passed `&mut`: reference §5.1 says a val's contents may change
+      through its methods. Files: compiler/typechecker.fd. Test:
+      test_bg289_mut_ref_ok.fd, test_bg289_mut_ref_val_fail.fd,
+      test_bg289_mut_ref_val_param_fail.fd. To verify: build the compiler and
+      run the tests. Watch: a scan for `&mut v` of a val found only
+      struct-valued vals (not rejected).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG290. **The names bound by `val (a, b) = t` are assignable.**
       compiler/typechecker.fd Stmt::LetTuple (does not record the names in
       val_vars_per_scope; Stmt::Let does, ~20296): a destructuring `val` is
       treated as `var`: `a = 10` and `b += 5` are accepted. Trigger: `fn
@@ -3477,7 +3854,18 @@ the repo. Function names are the reference; line numbers move.
       println(b); return 0; }` -> prints 10, 7; should be "cannot assign to
       'a': it is declared with `val`". Confirmed Nov 27 (fid run). Confidence:
       high.
-- [ ] BG291. **A `for` variable, closure parameter or match binding that
+      Fix written Nov 27 (night), not run yet: each name of `val (a, b) = t`
+      is recorded in val_vars_per_scope as Stmt::Let records a val, each of
+      `var (..)` as "!name" (so it shadows an outer val). Files:
+      compiler/ast.fd, compiler/parser.fd, compiler/ast_ser.fd,
+      compiler/typechecker.fd, test_parser_harness.fd, compiler/compiler.fd.
+      To verify: build the compiler and run the test. Watch: code assigning a
+      name of a `val (..)` tuple is now an error: a regex scan of
+      compiler/stdlib/tools/tests/examples found none.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG291. **A `for` variable, closure parameter or match binding that
       shadows an outer `val` is taken for the `val`: a valid assignment is
       rejected.** compiler/typechecker.fd TypeChecker_is_val (looks up
       val_vars_per_scope; only Stmt::Let with `var` records the shadowing
@@ -3490,7 +3878,15 @@ the repo. Function names are the reference; line numbers move.
       println(f(4)); return 0; }` -> two E044 "cannot assign to 'x': it is
       declared with `val`"; the same program without the outer `val x`
       compiles and runs. Confirmed Nov 27 (fid check). Confidence: high.
-- [ ] BG292. **Visibility covers only functions, consts and globals: a private
+      Fix written Nov 27 (night), not run yet: these bindings record "!name"
+      in their scope, as a `var` does, so TypeChecker_is_val stops at them
+      instead of finding the outer `val`. Files: compiler/typechecker.fd.
+      Test: test_bg291_shadow_val.fd. To verify: build the compiler and run
+      the test.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG292. **Visibility covers only functions, consts and globals: a private
       struct, enum, type alias or method of another module is usable.**
       compiler/typechecker.fd TypeChecker_check_visibility is called only from
       the const/global/function name lookups (~21680-21699) and the call path
@@ -3509,7 +3905,20 @@ the repo. Function names are the reference; line numbers move.
       PrivE::Two(4); val z: PrivAlias = 3; println(z); return 0; }` ->
       compiles and runs (prints 2, 3). Confirmed Nov 27 (fid run). Confidence:
       high.
-- [ ] BG293. **A private field of another module's struct can be written and
+      Fix written Nov 27 (night), not run yet: these are now "Visibility
+      error: struct|enum|type|method '...' is private to module 'm'": a
+      non-pub struct literal or enum constructor from another module, a
+      non-pub type named in a `val/var x: T` annotation, and a non-pub
+      inherent method or associated function called from another module.
+      Files: compiler/typechecker.fd. Test: test_bg292_private_struct_fail.fd,
+      test_bg292_public_items.fd. To verify: build the compiler and run the
+      tests. Watch: items of compiler::* and core are exempt, and so is code
+      in compiler::* modules, because the compiler's 26 non-pub structs and
+      141 non-pub methods were never held to this.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG293. **A private field of another module's struct can be written and
       initialised: only reads are checked.** compiler/typechecker.fd (the E078
       "field ... is private" check is in Expr::FieldAccess only;
       Stmt::FieldAssign and struct-literal field inits (~21557) skip it):
@@ -3521,7 +3930,19 @@ the repo. Function names are the reference; line numbers move.
       { x: 5, y: 6 }; println(q.hid()); return 0; }` -> prints 99, 6;
       `println(p.y)` in the same file is E078. Confirmed Nov 27 (fid run).
       Confidence: high.
-- [ ] BG294. **`!{}` is bypassed by a method call through `dyn Trait` or
+      Fix written Nov 27 (night), not run yet: writing, or giving in a struct
+      literal, a private field of another module's struct is a "Privacy error:
+      field 'y' of struct 'Pt' is private ... so it cannot be set here."
+      (E078). This is the same rule the read check already applies. Files:
+      compiler/typechecker.fd. Test: test_bg293_private_field_init_fail.fd,
+      test_bg293_private_field_write_fail.fd. To verify: build the compiler
+      and run the tests. Watch: fields of compiler::* structs are exempt. A
+      scan found no cross-module literal that sets a private field in stdlib,
+      tests, tools or examples.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG294. **`!{}` is bypassed by a method call through `dyn Trait` or
       through a generic bound `T: Trait`.** compiler/typechecker.fd
       TypeChecker_scan_expr_for_effects (Expr::MethodCall adds only
       tc_eff_method_allocs; the BG22 "through a method it calls" resolution
@@ -3540,7 +3961,20 @@ the repo. Function names are the reference; line numbers move.
       -> compiles, prints "side effect" twice; `fn direct(l: L) -> i64 !{} {
       return l.log(); }` is rejected. Confirmed Nov 27 (fid run). Confidence:
       high.
-- [ ] BG295. **`x |> f` (pipe into a bare function name) adds none of `f`'s
+      Fix written Nov 27 (night), not run yet: a method call through `dyn T`
+      or a `T: Trait` bound now records `Type.m` for every impl of T
+      (impl_pairs), through TypeChecker_record_method_call. BG22's
+      TypeChecker_verify_effects_through_methods then gives the caller those
+      effects (E110 "(through a method it calls)"). Files:
+      compiler/typechecker.fd. Test: test_bg294_dyn_effect_fail.fd,
+      test_bg294_dyn_pure_ok.fd, test_bg294_generic_effect_fail.fd. To verify:
+      build the compiler and run the tests. Watch: the recorded calls also
+      feed verify_method_recursion (BG59) and the
+      @deterministic/@realtime/@constant_time through-method rules.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG295. **`x |> f` (pipe into a bare function name) adds none of `f`'s
       effects: a `!{}` function can print.** compiler/typechecker.fd
       TypeChecker_scan_expr_for_effects, Expr::PipeForward (~27007) scans
       `right` as an expression; a bare Expr::Ident (~26730) adds nothing, so
@@ -3552,7 +3986,18 @@ the repo. Function names are the reference; line numbers move.
       return 5 |> loud; } fn main() -> i64 { println(via_pipe()); return 0; }`
       -> prints `loud`, `5`; should be E110 "inferred effect '!IO'". Confirmed
       Nov 27 (fid run). Confidence: high.
-- [ ] BG296. **`0x`, `0b`, `0o` with no valid digit lex as the literal 0; with
+      Fix written Nov 27 (night), not run yet: the effect scan now reads `x |>
+      f` as `f(x)`, `x |> f(a)` as `f(x, a)` and `x |> .m(a)` as `x.m(a)`, the
+      same desugaring check_expr uses. The call scan records a bare name on
+      the right of a pipe as a call. This also fixes the pipe part of BG382
+      and makes @no-recursion/@no-alloc see calls through pipes. Files:
+      compiler/typechecker.fd. Test: test_bg295_pipe_call_effect_fail.fd,
+      test_bg295_pipe_effect_fail.fd, test_bg295_pipe_pure_ok.fd. To verify:
+      build the compiler and run the tests. Watch: low.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG296. **`0x`, `0b`, `0o` with no valid digit lex as the literal 0; with
       optional `;` `val m = 0b2;` silently gives 0.** compiler/lexer.fd
       Lexer_read_number (radix branches: the digit loop may consume nothing,
       then str_parse_hex / parse_radix of "" gives 0 and a token is returned):
@@ -3564,7 +4009,20 @@ the repo. Function names are the reference; line numbers move.
       println(c); return 0; }` -> prints 0, 0, 0 (fid run, exit 0); should be
       a lex error ("binary literal needs a digit" / "invalid digit '2' in
       binary literal"). Confirmed Nov 27 (fid run). Confidence: high.
-- [ ] BG297. **`break` and `continue` outside any loop are accepted and
+      Fix written Nov 27 (night), not run yet: after the digits of 0x/0b/0o, a
+      letter or digit is "invalid digit 'c' in <kind> literal" (the rest of
+      the word is skipped), no digit at all is "<kind> literal 0x needs a
+      digit"; `_` still ends the literal (reference §1.5). Both classify as
+      E004 (lexer "Error:" prefix). Files: compiler/lexer.fd. Test:
+      test_bg296_binary_bad_digit_fail.fd, test_bg296_hex_no_digit_fail.fd,
+      test_bg296_octal_bad_digit_fail.fd, test_bg296_radix_ok.fd. To verify:
+      build the compiler and run the tests. Watch: any source with a letter
+      glued to a radix literal (`0xFFu8`) now fails to lex; grep of
+      compiler/stdlib/tests/tools found none outside strings/comments.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG297. **`break` and `continue` outside any loop are accepted and
       silently do nothing.** compiler/typechecker.fd
       TypeChecker_check_stmt_inner, Stmt::Break / Stmt::Continue
       (~20936-20946: the optional value is checked, `self.loop_depth` is never
@@ -3577,7 +4035,16 @@ the repo. Function names are the reference; line numbers move.
       ccompile print `after break`, `1`, `end`; should be "`break` outside a
       loop" / "`continue` outside a loop". Confirmed Nov 27 (fid run,
       ccompile). Confidence: high.
-- [ ] BG298. **`fid run`: a global `f32` with a float initializer reads as
+      Fix written Nov 27 (night), not run yet: with loop_depth == 0 the error
+      is "`break` outside a loop" / "`continue` outside a loop". Files:
+      compiler/typechecker.fd. Test: test_bg297_break_outside_fail.fd,
+      test_bg297_continue_outside_fail.fd, test_bg297_loop_jumps_ok.fd. To
+      verify: build the compiler and run the tests. Watch: a break inside a
+      closure that is inside a loop stays accepted, as before.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG298. **`fid run`: a global `f32` with a float initializer reads as
       0.** compiler/interp.fd Interpreter_init_globals (+ eval_global_init):
       `eval_global_init` gives `Value::Float(v)` for a FloatLit and
       Interpreter_init_globals stores it with `Memory_store_f64` whatever
@@ -3586,7 +4053,15 @@ the repo. Function names are the reference; line numbers move.
       f32 = 1.5; fn main() { println(f"{gf}"); gf = gf + 1.0;
       println(f"{gf}"); }` -- run prints `0` then `1`; ccompile/emit/--nat
       print `1.5` then `2.5`. Confirmed Nov 27. Confidence: high.
-- [ ] BG299. **--nat: an f64 literal passed to `Vec<f32>.contains` or
+      Fix written Nov 27 (night), not run yet: the Value::Float branch stores
+      with Memory_store_f32 when entry.ty is IrType::F32 (else f64 as before).
+      Files: compiler/interp.fd. Test: test_bg298_f32_global.fd. To verify:
+      build the compiler and run the test. Watch: none expected; only f32
+      globals with a float literal initializer change.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG299. **--nat: an f64 literal passed to `Vec<f32>.contains` or
       `Vec::filled` is not narrowed: `contains(1.5)` is false for an element
       that is there, `Vec::filled(3, 1.5)` is all zeros.** compiler/nat_ir.fd
       ng_f32_arg_mask (the BG165 fix narrows the literal for
@@ -3602,7 +4077,18 @@ the repo. Function names are the reference; line numbers move.
       `true true` / `1.5`; emit --nat: `false true` / `0`. Confirmed Nov 27
       (run, ccompile, emit, emit --nat; found by two passes). Confidence:
       high.
-- [ ] BG300. **`fid run`: a closure reading a captured `f32` gets 0.**
+      Fix written Nov 27 (night), not run yet: Vec_contains / p_vec_contains
+      join the push group (an f64 value for a Vec<f32> receiver is narrowed);
+      a Vec_filled_typed call whose IR result is Vec<f32> and whose element
+      word is p_f64_to_bits(f64) gets that word narrowed to f32 bits (bit 2 of
+      the mask). Files: compiler/nat_ir.fd. Test:
+      test_bg299_vec_f32_literal_args.fd. To verify: build the compiler and
+      run the test. Watch: relies on the Vec_filled_typed call's IR type being
+      Generic(Vec,[F32]) (as ng_vec_f32_typed already assumes for values).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG300. **`fid run`: a closure reading a captured `f32` gets 0.**
       compiler/interp.fd Interpreter exec, `Inst::Store(ptr, value, sty_opt)`
       (an explicit store type is honoured only when it is a Struct; a scalar
       `Some(F32)` is ignored and the slot's pointee type, i64 from
@@ -3619,7 +4105,19 @@ the repo. Function names are the reference; line numbers move.
       three compiled backends right; the Store code's struct-only branch is
       unchanged in the tree apart from memory-API renames). Confidence: high
       (behaviour), medium (exact line).
-- [ ] BG301. **`Vec<f32>.sort()` still sorts raw words (BG179 was fixed for
+      Fix written Nov 27 (night), not run yet: an explicit float store type
+      (Some(F32)/Some(F64)) now sets the width written, after the
+      pointee/value rules (before, only an explicit Struct type counted). The
+      opaque-slot path writes an f32 when the explicit type is F32. Files:
+      compiler/interp.fd. Test: test_bg300_f32_capture.fd. To verify: build
+      the compiler and run the test. Watch: every lowering Store with
+      Some(float type) (field_ty, vec_elem_ty, pointee_ty, the closure env)
+      now writes that width. That is what C and native already do, but watch
+      f32 fields and Vec<f32> stores under `run`.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG301. **`Vec<f32>.sort()` still sorts raw words (BG179 was fixed for
       `Vec<f64>` only): negatives come out backwards, and on --nat after every
       positive.** compiler/lower.fd method-call lowering, the `Vec_sort` ->
       `Vec_sort_f64` redirect (tests `IrType::F64` / `Type::F64` only);
@@ -3634,7 +4132,17 @@ the repo. Function names are the reference; line numbers move.
       -- run/ccompile/emit `-1.25 -7.5 0.5 9`, --nat `0.5 9 -1.25 -7.5` (want
       `-7.5 -1.25 0.5 9`). Confirmed Nov 27 (run, ccompile, emit, emit --nat;
       found by two passes). Confidence: high.
-- [ ] BG302. **An f32 with a format specifier (`f"{x:.3}"`, `{x:8.2}`) prints
+      Fix written Nov 27 (night), not run yet: `.sort()` on a Vec<f32> now
+      calls core Vec_sort_f32, which orders the elements by their f64 key. It
+      reads each word in either form: f64 bits on run, C and pe_ir, or
+      zero-extended f32 bits on --nat (a word whose upper half is zero).
+      Files: compiler/lower.fd, stdlib/core.fd. Test:
+      test_bg301_vec_f32_sort.fd. To verify: build the compiler and run the
+      test.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG302. **An f32 with a format specifier (`f"{x:.3}"`, `{x:8.2}`) prints
       the value's bit pattern as an integer on every backend (BG157 fixed only
       the plain `{x}`).** compiler/lower.fd Lowerer_lower_fstr_fmt (dispatches
       on `ir_type_eq(e_ty, IrType::F64)` to the float formatter; an F32 falls
@@ -3646,7 +4154,14 @@ the repo. Function names are the reference; line numbers move.
       [4609434218613702656]`, --nat `[1069547520] [1069547520]` (want `[1.500]
       [    1.50]`). Confirmed Nov 27 (all four; function identical in the
       tree). Confidence: high.
-- [ ] BG303. **`f"{m}"` with a HashMap prints the map's handle address as a
+      Fix written Nov 27 (night), not run yet: An f32 value is widened to f64
+      and formatted with fstr_fmt_f64. Files: compiler/lower.fd. Test:
+      test_bg302_f32_format_spec.fd. To verify: build the compiler and run the
+      test.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG303. **`f"{m}"` with a HashMap prints the map's handle address as a
       number (and an enum, Option or tuple prints nothing).**
       compiler/typechecker.fd TypeChecker_check_fstring_part (accepts
       "HashMap" explicitly; returns early for enums/tuples); the f-string
@@ -3665,7 +4180,21 @@ the repo. Function names are the reference; line numbers move.
       (--nat); `o ` (empty). Should print `x {5: 5}` or be rejected. Confirmed
       Nov 27 (run, ccompile, emit, emit --nat all print an address;
       Option/enum/tuple empty on run). Confidence: high.
-- [ ] BG304. **`str_parse_float` of "inf", "infinity", "nan" and hex text
+      Fix written Nov 27 (night), not run yet: A HashMap part goes through
+      core HashMap_to_str, with or without a format spec. An enum part (Option
+      and Result included) or a tuple part is now a type error. The two new
+      messages have Fix lines and use the same generic Type error code as the
+      struct message. Files: compiler/lower.fd, compiler/typechecker.fd. Test:
+      test_bg303_fstring_enum_fail.fd, test_bg303_fstring_map.fd,
+      test_bg303_fstring_option_fail.fd, test_bg303_fstring_tuple_fail.fd. To
+      verify: build the compiler and run the tests. Watch: Any f-string in the
+      compiler, stdlib or tests that interpolates an enum, Option or tuple now
+      fails to compile (before, it printed nothing). Watch the self-compile
+      and the suite.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG304. **`str_parse_float` of "inf", "infinity", "nan" and hex text
       ("0x10") is inf/NaN/16 on `fid run` and C but 0 on both native Windows
       backends.** stdlib/pe_runtime/base.fd pert_str_to_float (msvcrt `atof`);
       stdlib/linux_runtime/base.fd pert_str_to_float (own parser, used by
@@ -3681,7 +4210,17 @@ the repo. Function names are the reference; line numbers move.
       float_to_str(str_parse_float("infinity"))); }` -> run and ccompile: `inf
       NaN 16 inf`; emit and emit --nat: `0 0 0 0`. Confirmed Nov 27 (run,
       ccompile, emit, emit --nat). Confidence: high.
-- [ ] BG305. **`f"{x:.N}"` prints NaN as "0.00" and infinity as "inf.0" /
+      Fixed Nov 27 (night): both runtimes read "inf"/"infinity"/"nan" (any
+      case, signed) and hex floats ("0x10", "0x1.8p1") as strtod does; the
+      rest goes to atof / the BG206 parser as before. Files:
+      stdlib/pe_runtime/base.fd, stdlib/linux_runtime/base.fd. Test:
+      test_bg304_parse_float_special.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG305. **`f"{x:.N}"` prints NaN as "0.00" and infinity as "inf.0" /
       "-inf.000".** stdlib/core.fd fstr_fmt_f64: with a precision,
       fstr_fmt_f64 never tests for NaN or infinity: NaN fails `v < 0.0` and
       `av >= two53`, so `av as i64` gives 0 and the fraction 0 -> "0.00";
@@ -3693,7 +4232,16 @@ the repo. Function names are the reference; line numbers move.
       inf.00]`; should be `[NaN] [inf] [-inf] [     inf]` (or the NaN/inf text
       the unformatted path prints). Confirmed Nov 27 (identical on run,
       ccompile, emit, emit --nat). Confidence: high.
-- [ ] BG306. **`str_parse_int_opt` returns `Some(0)` for a number outside i64
+      Fixed Nov 27 (night): NaN (v != v) and +/-inf take the no-precision path
+      (float_to_str: "NaN"/"inf"/"-inf"), then the usual sign flag and width
+      padding. Files: stdlib/core.fd. Test: test_bg305_fstr_prec_nan_inf.fd.
+      Run with the fid of Nov 27 01:25 on the tree's sources (the fixed code
+      is stdlib, a runtime, a script or a tool the old fid runs): the test
+      passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG306. **`str_parse_int_opt` returns `Some(0)` for a number outside i64
       instead of None.** stdlib/string.fd str_parse_int_opt: it checks only
       that every byte after an optional sign is a digit, then returns
       `Some(str_parse_int(s))`; str_parse_int returns 0 for an out-of-range
@@ -3703,7 +4251,16 @@ the repo. Function names are the reference; line numbers move.
       `str_parse_int_opt("99999999999999999999")` -> `Some(0)` (want None);
       "-9223372036854775808" -> Some(i64::MIN) correctly. Confirmed Nov 27
       (run, ccompile, emit, emit --nat identical). Confidence: high.
-- [ ] BG307. **Any program that uses `rope_substring` (stdlib string) cannot
+      Fixed Nov 27 (night): str_parse_int_opt accumulates the value itself
+      (negatively, so i64::MIN fits) and returns None on overflow instead of
+      Some(str_parse_int(s)) = Some(0). Files: stdlib/string.fd. Test:
+      test_bg306_parse_int_opt_range.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG307. **Any program that uses `rope_substring` (stdlib string) cannot
       be built by the default Windows backend: pe_ir has no
       `p_string_substring`.** stdlib/string.fd rope_substring (the only stdlib
       caller of p_string_substring); pe_ir / stdlib/pe_runtime (no
@@ -3718,7 +4275,15 @@ the repo. Function names are the reference; line numbers move.
       executables: p_string_substring (build with `fidesc ccompile` instead)",
       exit 1. Confirmed Nov 27 (run, ccompile, --nat print `el`; emit fails).
       Confidence: high.
-- [ ] BG308. **`m.get(k)` for a missing key of a map whose values are Vecs or
+      Fixed Nov 27 (night): rope_substring uses core's str_slice instead of
+      p_string_substring (and the unsafe block around it goes). Files:
+      stdlib/string.fd. Test: test_bg307_rope_substring.fd. Run with the fid
+      of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG308. **`m.get(k)` for a missing key of a map whose values are Vecs or
       structs crashes every compiled backend, while `fid run` returns an empty
       value.** stdlib/core.fd HashMap_get (returns the word 0 for a missing
       key, also for a struct-valued map instead of a slot address); the
@@ -3734,7 +4299,20 @@ the repo. Function names are the reference; line numbers move.
       memory access (null or dangling pointer) at 0x0`. Same with
       `HashMap<str, Vec<i64>>`: `w.get("q").len()` is 0 on run, a fault at 0x8
       compiled. Confirmed Nov 27 (all four backends). Confidence: high.
-- [ ] BG309. **`pop()` on an empty `Vec<Vec<T>>` gives a null Vec: len 0 on
+      Fix written Nov 27 (night), not run yet: When the values are structs
+      (Ptr(Struct)), Vecs (5 words) or maps (7 words), a 0 result becomes the
+      address of a stack block, allocated in the function's prologue and
+      zeroed by hm_get_or_zero on each miss. The value is lent, like a hit,
+      and is never dropped; a let shares it (Vec_share of a zero header gives
+      a new empty Vec). Files: stdlib/core.fd, compiler/lower.fd. Test:
+      test_bg308_map_get_missing.fd. To verify: build the compiler and run the
+      test. Watch: Mutating the result of a miss (`m.get("q").push(1)`) writes
+      into the stack header. Also check HashMap_share of a zeroed 56-byte
+      header.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG309. **`pop()` on an empty `Vec<Vec<T>>` gives a null Vec: len 0 on
       `fid run`, a fault on every compiled backend.** stdlib/core.fd Vec_pop
       (returns 0 when empty); compiler/lower.fd Lowerer_rc_popped_mem (OW6
       substitutes a zeroed value only for struct elements): an empty pop
@@ -3746,7 +4324,19 @@ the repo. Function names are the reference; line numbers move.
       {x.len()}"); }` -> run: `len 0`; ccompile/emit --nat: `Panic: Invalid
       memory access (null or dangling pointer) at 0x8`; emit: same panic.
       Confirmed Nov 27 (all four backends). Confidence: high.
-- [ ] BG310. **`bigint_from_i64(i64::MIN)` panics with an integer overflow.**
+      Fix written Nov 27 (night), not run yet: an empty pop of a Vec whose tid
+      is P_TID_VEC / P_TID_MAP returns Vec_new() / HashMap_new() (pop's result
+      is the caller's temporary, so ownership is right); else 0 as before. The
+      C fast body returned 0 directly: it now calls vec_pop_empty when the tid
+      word (__h[4]) is nonzero. Files: stdlib/core.fd, compiler/codegen_c.fd.
+      Test: test_bg309_pop_empty_vec_of_vecs.fd. The stdlib part runs and
+      passes; its C runtime half (codegen_c.fd) needs the rebuilt compiler.
+      Watch: vec_pop_empty must stay reachable in the C build (called from
+      core Vec_pop's IR, like vec_sz_pop).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG310. **`bigint_from_i64(i64::MIN)` panics with an integer overflow.**
       stdlib/bigint.fd bigint_from_i64: negates the argument with `v = 0 - v`
       (checked arithmetic, not @wrapping) before splitting into limbs, so the
       one value whose negation does not fit panics instead of giving
@@ -3755,7 +4345,17 @@ the repo. Function names are the reference; line numbers move.
       "Panic: Integer overflow on subtraction: 0 - -9223372036854775808"
       (should print -9223372036854775808). Confirmed Nov 27 (fid run).
       Confidence: high.
-- [ ] BG311. **`bigint_from_str` silently drops non-digit characters instead
+      Fixed Nov 27 (night): bigint_from_i64 splits a negative value into limbs
+      without negating it (abs of each truncated remainder); bigint_to_i64
+      builds a negative value negatively so i64::MIN round-trips (it
+      overflowed too). Files: stdlib/bigint.fd. Test:
+      test_bg310_bigint_from_i64_min.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG311. **`bigint_from_str` silently drops non-digit characters instead
       of returning 0 for invalid input.** stdlib/bigint.fd bigint_from_str:
       the doc says "Invalid input -> 0", but the loop only adds characters 0-9
       and skips everything else, so "12a34" parses as 1234, "1e9" as 19,
@@ -3764,7 +4364,16 @@ the repo. Function names are the reference; line numbers move.
       1234 (doc: 0). Confirmed Nov 27 (fid run). (Divmod checked against
       Python on 36 pairs of 10-39 digit numbers: all right.). Confidence:
       high.
-- [ ] BG312. **semver `^` and `~` with a partial version are not prefix
+      Fixed Nov 27 (night): bigint_from_str returns 0 at the first non-digit
+      (after the optional sign; blanks around are still trimmed) instead of
+      skipping it. Files: stdlib/bigint.fd. Test:
+      test_bg311_bigint_from_str_invalid.fd. Run with the fid of Nov 27 01:25
+      on the tree's sources (the fixed code is stdlib, a runtime, a script or
+      a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG312. **semver `^` and `~` with a partial version are not prefix
       bounds: `^0` matches only 0.0.0, `^0.0` only 0.0.0, `~1` only 1.0.x.**
       stdlib/semver.fd sv_match_token (with sv_pad): the module comment says
       "Partial versions in comparators: missing fields default to 0 and the
@@ -3777,7 +4386,18 @@ the repo. Function names are the reference; line numbers move.
       `semver_satisfies_str("0.0.5", "^0.0")` -> false;
       `semver_satisfies_str("1.5.0", "~1")` -> false (all should be true).
       Confirmed Nov 27 (fid run). Confidence: high.
-- [ ] BG313. **JWT `nbf`/`iat`/`exp` written in exponent form are read as tiny
+      Fixed Nov 27 (night): new sv_field_count; ^ with 1 field bumps major (^0
+      <1.0.0), with 2 fields and major 0 bumps minor (^0.0 <0.1.0); ~ with 1
+      field bumps major (~1 <2.0.0) — npm/Cargo rules. Full versions
+      unchanged. (Not touched: a bare partial "1.2" as an X-range, "1.x"
+      wildcards.) Files: stdlib/semver.fd. Test:
+      test_bg312_semver_partial_caret_tilde.fd. Run with the fid of Nov 27
+      01:25 on the tree's sources (the fixed code is stdlib, a runtime, a
+      script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG313. **JWT `nbf`/`iat`/`exp` written in exponent form are read as tiny
       numbers: a not-yet-valid token is accepted.** stdlib/jose.fd jwt_num
       (used by jwt_check_claims): jwt_num checks the claim is a JSON number,
       then converts it with `str_parse_int(v)`, which stops at the first
@@ -3788,7 +4408,17 @@ the repo. Function names are the reference; line numbers move.
       2e9}", &jwt_options(1700000000, "", ""))` -> "" (accepted; should be
       "token not yet valid"); same with `"iat": 3e9` -> "" (should be "token
       issued in the future"). Confirmed Nov 27 (fid run). Confidence: high.
-- [ ] BG314. **`dec_parse("1e999999")` spends 37 s of CPU: an 8-byte number
+      Fixed Nov 27 (night): jwt_num reads the claim with a new jwt_num_value:
+      a full JSON number (sign, fraction, exponent) to whole seconds, fraction
+      dropped toward zero, magnitude saturating at 1e18 so exp + leeway cannot
+      overflow. Files: stdlib/jose.fd. Test:
+      test_bg313_jwt_numericdate_exponent.fd. Run with the fid of Nov 27 01:25
+      on the tree's sources (the fixed code is stdlib, a runtime, a script or
+      a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG314. **`dec_parse("1e999999")` spends 37 s of CPU: an 8-byte number
       string is a denial of service.** stdlib/decimal.fd dec_parse: the
       exponent loop stops only once `e >= 100000`, so it accepts exponents up
       to 999,999, and a positive exponent is applied eagerly with
@@ -3802,7 +4432,18 @@ the repo. Function names are the reference; line numbers move.
       `dec_parse("12abc")` gives 12 and `dec_parse("1.2.3")` gives 1.2.
       Confirmed Nov 27 (C backend, timing above; the "12abc" result on fid
       run). Confidence: high.
-- [ ] BG315. **`x509_matches_host` rejects a certificate for an IPv6 host
+      Fixed Nov 27 (night): new pub const DEC_MAX_EXPONENT = 10000 (either
+      sign) and pub fn dec_try_parse -> Option<Decimal>; dec_parse =
+      dec_try_parse or 0. An exponent past the limit, an exponent with no
+      digits, and text after the number ("12abc", "1.2.3") are refused (Python
+      Decimal refuses the same texts). Files: stdlib/decimal.fd. Test:
+      test_bg314_decimal_parse_limits.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG315. **`x509_matches_host` rejects a certificate for an IPv6 host
       written the usual way ("::1", "2001:db8::1").** stdlib/x509.fd
       x509_matches_host (with x509_ip_text): an iPAddress SAN is turned into
       text by x509_ip_text as eight uncompressed groups
@@ -3815,7 +4456,19 @@ the repo. Function names are the reference; line numbers move.
       "2001:db8::1")` -> false, `x509_matches_host(c, "::1")` -> false; only
       "2001:db8:0:0:0:0:0:1" -> true. Confirmed Nov 27 (fid run, certificate
       made with openssl req -x509). Confidence: high.
-- [ ] BG316. **`tar_parse` panics on a header whose base-256 size (or any
+      Fixed Nov 27 (night): x509_matches_host parses an IP-literal host (new
+      pub x509_ip_parse: dotted IPv4 with no leading zeros, IPv6 in any RFC
+      4291 §2.2 form with "::" and an IPv4 tail, optional brackets, no zone
+      id) and compares its bytes with san_ip_raw, so "::1" / "2001:db8::1" /
+      "[::1]" match. DNS SAN and CN matching are unchanged; san_ip text is
+      unchanged. Files: stdlib/x509.fd. Test: test_bg315_x509_ipv6_host.fd.
+      Run with the fid of Nov 27 01:25 on the tree's sources (the fixed code
+      is stdlib, a runtime, a script or a tool the old fid runs): the test
+      passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG316. **`tar_parse` panics on a header whose base-256 size (or any
       numeric field) does not fit in i64.** stdlib/tar.fd tar_field_num
       (base-256 branch; also tar_dec for pax "size"/"uid"/... and the pax
       record length in tar_pax_parse): the GNU base-256 form is accumulated
@@ -3828,7 +4481,18 @@ the repo. Function names are the reference; line numbers move.
       "Panic: Integer overflow on multiplication: 72057594037927935 * 256"
       (should return err "truncated data ..." or "bad size"). Confirmed Nov 27
       (fid run). Confidence: high.
-- [ ] BG317. **`mail_build` lets body text forge MIME parts: the boundary is
+      Fixed Nov 27 (night): tar_field_num (base-256 and octal) and tar_dec
+      give -1 when the value would not fit in i64; tar_pax_parse fails a
+      record length longer than the data; tar_parse returns "bad size at
+      <off>" for a negative size and compares `size > b.len() - dstart` (no
+      overflow). Files: stdlib/tar.fd. Test:
+      test_bg316_tar_numeric_overflow.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG317. **`mail_build` lets body text forge MIME parts: the boundary is
       predictable and never checked against the content.** stdlib/smtp.fd
       mail_build / sm_text_part: boundaries are "=_alt_"/"=_mix_" plus 12 hex
       digits from a xorshift seeded by the `seed` argument (a fixed 2463534242
@@ -3844,7 +4508,19 @@ the repo. Function names are the reference; line numbers move.
       a second, forged text/html part before the real attachment. Confirmed
       Nov 27 (fid run, output shows the injected part between the real
       boundaries). Confidence: high.
-- [ ] BG318. **OBD-II: `obd_request_to_ecu` sends to the ECU's response ID,
+      Fixed Nov 27 (night): sm_text_part sends a text that contains "=_"
+      quoted-printable instead of 7bit. Every boundary starts with "=_", which
+      QP (writes "=" as "=3D") and base64 never produce, so no part can hold a
+      boundary line (RFC 2046 §5.1.1); boundaries stay seed-deterministic. Not
+      changed: att_types goes into the part header without CR/LF stripping (a
+      separate header issue). Files: stdlib/smtp.fd. Test:
+      test_bg317_mail_boundary_forge.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG318. **OBD-II: `obd_request_to_ecu` sends to the ECU's response ID,
       and requests/decoders omit the ISO 15765-2 length byte.** stdlib/can.fd
       obd_request_to_ecu; obd_engine_rpm_request / obd_vehicle_speed_request /
       obd_coolant_temp_request / obd_read_dtcs and the obd_decode_* functions:
@@ -3860,7 +4536,18 @@ the repo. Function names are the reference; line numbers move.
       `obd_engine_rpm_request()` -> bytes [1, 12] (should be [2, 1, 12]).
       Confirmed Nov 27 (fid run); the wire-format part checked against ISO
       15765-4 by reading. Confidence: high.
-- [ ] BG319. **YAML "billion laughs": `yaml_load` expands aliases with no
+      Fixed Nov 27 (night): new OBD_REQUEST_BASE 0x7E0; obd_request_to_ecu
+      sends to 0x7E0+ecu with [0x02, mode, pid]; the OBD request builders put
+      the PCI length byte first ([0x02,0x01,pid], [0x01,0x03], [0x01,0x04]);
+      the decoders read [len, 0x41, pid, A, B] (obd_single_frame_reply checks
+      PCI, mode and PID) and reject a reply without the PCI byte. Files:
+      stdlib/can.fd. Test: test_bg318_obd_iso15765.fd. Run with the fid of Nov
+      27 01:25 on the tree's sources (the fixed code is stdlib, a runtime, a
+      script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG319. **YAML "billion laughs": `yaml_load` expands aliases with no
       limit, so a few hundred bytes exhaust memory.** stdlib/yaml.fd yaml_load
       (alias handling: "an alias copies the anchored node"): every `*name`
       copies all entries of the anchored node into the flat entry list, with
@@ -3873,7 +4560,19 @@ the repo. Function names are the reference; line numbers move.
       67,182 entries; 10 such lines (~300 bytes) would be about 87 million
       entries. Confirmed Nov 27 (C backend: 180 bytes -> 67,182 entries; fid
       run: 4 levels, 118 bytes -> 1,864 entries). Confidence: high.
-- [ ] BG320. **safetensors: a hostile shape panics `st_tensor` ("All access is
+      Fixed Nov 27 (night): pub consts YAML_ALIAS_FLOOR = 1000 and
+      YAML_ALIAS_RATIO = 10: aliases in one document may copy at most 1000 +
+      10 x (entries the document writes itself); yp_alias counts the entries
+      an alias would copy before copying and past the limit fails ("aliases
+      expand too far: ...") in yaml_load, gives null in yaml_parse.
+      Amplification is now linear in the input. Files: stdlib/yaml.fd. Test:
+      test_bg319_yaml_alias_bomb.fd. Run with the fid of Nov 27 01:25 on the
+      tree's sources (the fixed code is stdlib, a runtime, a script or a tool
+      the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG320. **safetensors: a hostile shape panics `st_tensor` ("All access is
       bounds-checked" says the header).** stdlib/safetensors.fd st_tensor
       (also st_elems): the element count is built with checked `total = total
       * d` over the header's shape, and then `total * dsz`; nothing bounds the
@@ -3883,7 +4582,18 @@ the repo. Function names are the reference; line numbers move.
       -> `st_open` ok, `st_tensor(b, s, "t")` -> "Panic: Integer overflow on
       multiplication: 4294967296 * 4294967296". Confirmed Nov 27 (fid run).
       Confidence: high.
-- [ ] BG321. **`fid doc` / `fid scribe` exit 0 when the input cannot be read
+      Fixed Nov 27 (night): st_tensor checks data_offsets lie inside the file
+      first, then refuses a dimension with d > (e - a) / total before
+      multiplying, so no product can overflow; st_elems only sees shapes
+      st_tensor validated (a failed lookup has an empty shape). Files:
+      stdlib/safetensors.fd. Test: test_bg320_safetensors_shape_overflow.fd.
+      Run with the fid of Nov 27 01:25 on the tree's sources (the fixed code
+      is stdlib, a runtime, a script or a tool the old fid runs): the test
+      passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG321. **`fid doc` / `fid scribe` exit 0 when the input cannot be read
       (message on stdout).** compiler/main.fd cmd_scribe (compiler/scribe.fd
       process_directory returns "Cannot read ..."): cmd_scribe prints whatever
       process_directory returns and always `return 0`; cmd_veil right below it
@@ -3896,7 +4606,15 @@ the repo. Function names are the reference; line numbers move.
       echo $?` -> stdout "Cannot read nofile.fd", exit 0 (want stderr, exit
       1). Confirmed Nov 27 (fb4 fid.exe: exit=0 out="Cannot read nofile.fd").
       Confidence: high.
-- [ ] BG322. **`fid doctest` on a missing file or a mistyped path passes with
+      Fix written Nov 27 (night), not run yet: a process_directory result
+      starting "Cannot " / "No .fd files" (scribe_main's scribe_failed rule)
+      goes to stderr as "error: ...", exit 1. Files: compiler/main.fd. Test:
+      tests/tooling/doc-cli-check.sh. To verify: build the compiler and run
+      the test. Watch: scripts that grep stdout for "Cannot read"
+      (scripts/stdlib-docs.sh "fid doc failed" branch now fires as intended)
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      doc-cli-check.sh passes.
+- [x] BG322. **`fid doctest` on a missing file or a mistyped path passes with
       "0 examples", exit 0.** compiler/main.fd cmd_doctest: a non-directory
       input is pushed to `files` unchecked; `c_file_read` of a missing file
       gives "" and scribe_doctests finds nothing, so the summary is "0
@@ -3905,7 +4623,13 @@ the repo. Function names are the reference; line numbers move.
       Trigger: `fid doctest nofile.fd; echo $?` -> "doctest: 0 examples | 0
       run | 0 failed | 0 skipped(native)", exit 0 (want "cannot read", exit
       1). Confirmed Nov 27 (fb4 fid.exe). Confidence: high.
-- [ ] BG323. **The installer's .fd file association runs `fid.exe "<file>"`,
+      Fix written Nov 27 (night), not run yet: a non-directory input that does
+      not exist: "doctest: cannot read <f>" on stderr, exit 1. Files:
+      compiler/main.fd. To verify: build the compiler and run the test. Watch:
+      none
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      doc-cli-check.sh passes.
+- [~] BG323. **The installer's .fd file association runs `fid.exe "<file>"`,
       which is "Unknown command": double-clicking a .fd never runs it.**
       installer/fides.nsi Section "Associate .fd files" (SecAssoc);
       compiler/main.fd main dispatch (no `.fd`-as-command case): the open
@@ -3919,7 +4643,14 @@ the repo. Function names are the reference; line numbers move.
       `"$INSTDIR\fid.exe" run "%1"`, or main.fd should treat a `.fd` path as
       `run`). Confirmed Nov 27 (fb4 fid.exe with the Windows path of hello.fd:
       exit 1, "Unknown command"). Confidence: high.
-- [ ] BG324. **`fid lint` never reports an unused import of a stdlib module
+      Fix written Nov 27 (night), not run yet: open command is
+      `"$INSTDIR\fid.exe" run "%1"`. Files: installer/fides.nsi. To verify:
+      build the compiler and run the test. Watch: the console window still
+      closes when the program ends.
+      Not verifiable on this machine (Nov 28). Left: makensis builds the
+      script; the installer was not run (installing and double-clicking a .fd
+      not tried).
+- [x] BG324. **`fid lint` never reports an unused import of a stdlib module
       (`use json;` with no use: "No lint warnings");
       tests/tooling/lint-style-check.sh's "unused import 'string'" step
       fails.** compiler/typechecker.fd TypeChecker_lint_unused_imports, run
@@ -3939,7 +4670,20 @@ the repo. Function names are the reference; line numbers move.
       warnings but not the "warning: unused import: 'string'" that
       lint-style-check.sh line 65 requires. Confirmed Nov 27 (fb4 fid.exe, run
       in the repo root and on copies). Confidence: high.
-- [ ] BG325. **LSP rename leaves every use inside an f-string interpolation
+      Fix written Nov 27 (night), not run yet: called names are collected only
+      from the program's own functions, methods (last_fn_names, the last
+      registered program) and consts/globals. An imported module's calls of
+      its own functions no longer mark it used. A struct built by name now
+      counts as a use of its module. Files: compiler/typechecker.fd. Test:
+      test_bg324_unused_import_lint.fd, tests/tooling/lint-style-check.sh. To
+      verify: build the compiler and run the tests. Watch: a module used only
+      through types or consts, never through a call or struct literal, may now
+      be reported as unused (before, every import looked used). Check
+      scripts/tl-check.sh and lint-check.sh.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG325. **LSP rename leaves every use inside an f-string interpolation
       under the old name (locals and functions); references misses them for
       locals.** compiler/lsp.fd lsp_code_occ (used by handle_rename /
       lsp_local_occ), also fix_rename_line (fid fix's snake_case rename):
@@ -3959,7 +4703,18 @@ the repo. Function names are the reference; line numbers move.
       only. Rename at `total` (line 0) -> edits lines 0 and 5, not line 6;
       references -> lines 0, 5 AND 6. Confirmed Nov 27 (fb4 `fid lsp` over
       stdio with initialize/didOpen/rename/references). Confidence: high.
-- [ ] BG326. **`fid profile p.fd -o out` on Windows reports the OLD `out` when
+      Fix written Nov 27 (night), not run yet: an identifier `f` right before
+      `"` starts an f-string. Its `{...}` expressions (a format spec after a
+      top-level `:` left out, nested string literals skipped) are scanned for
+      the name, and its text is skipped as before. In lsp_code_occ the
+      struct-literal rule is off inside an interpolation; fix_rename_line uses
+      keys=true there. Files: compiler/lsp.fd. Test:
+      scripts/tl/lsp_bug_fixes.py. To verify: build the compiler and run the
+      test. Watch: low. `fid fix`'s snake_case rename now also renames inside
+      f-strings.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      lsp_bug_fixes.py passes.
+- [x] BG326. **`fid profile p.fd -o out` on Windows reports the OLD `out` when
       it already exists (the new profile is left in fides-profile.folded).**
       compiler/main.fd cmd_profile (`p_rename("fides-profile.folded", out)`,
       result ignored); C runtime p_rename is plain `rename()`: Windows
@@ -3973,7 +4728,16 @@ the repo. Function names are the reference; line numbers move.
       -o prof.txt` -> report "1 samples ... 100% main", prof.txt unchanged;
       the real samples (main;fib;fib;...) are in ./fides-profile.folded.
       Confirmed Nov 27 (fb4 fid.exe, CC="zig cc", Windows). Confidence: high.
-- [ ] BG327. **`fid qualify -o out.json` writes invalid JSON: every escaped
+      Fix written Nov 27 (night), not run yet: deletes a stale
+      fides-profile.folded before the run; after it, "no samples" if none was
+      written; rename to -o, and on failure delete the old file and rename
+      again (Windows rename does not replace), error if that fails too;
+      removes _fides_profile_tmp(.exe) and _fides_profile_tmp.c. Files:
+      compiler/main.fd. To verify: build the compiler and run the test. Watch:
+      the --pid path untouched
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      audit-explain-check.sh passes.
+- [x] BG327. **`fid qualify -o out.json` writes invalid JSON: every escaped
       string is quoted twice (`"source": ""q.fd""`).** compiler/main.fd
       cmd_qualify (lines ~6055, 6064, 6083) with compiler/json.fd
       json_escape_string: json_escape_string already returns the string WITH
@@ -3987,7 +4751,14 @@ the repo. Function names are the reference; line numbers move.
       ""q.fd"",`; Python json.load: "Expecting ',' delimiter: line 4 column
       15". (Any program: "source" is always written this way.) Confirmed Nov
       27 (fb4 fid.exe + python json). Confidence: high.
-- [ ] BG328. **`fid veil --format html` marks lines of never-called user
+      Fix written Nov 27 (night), not run yet: json_escape_string already adds
+      the quotes: "source", each "errors" entry and each rule's "requirement"
+      no longer wrapped again; the rule text is escaped too. Files:
+      compiler/main.fd. To verify: build the compiler and run the test. Watch:
+      none (output is now valid JSON)
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      doc-cli-check.sh passes.
+- [x] BG328. **`fid veil --format html` marks lines of never-called user
       functions "covered" (and blank/`}` lines "uncovered"): core.fd's line
       numbers are matched against the user's file.** compiler/veil.fd
       generate_html_report / line_in_set (and run_with_coverage, which since
@@ -4006,7 +4777,17 @@ the repo. Function names are the reference; line numbers move.
       867, 897) have class "covered"; 98 `}` lines have class "uncovered".
       Confirmed Nov 27 (fb4 fid.exe; veil.fd functions identical in the tree).
       Confidence: high.
-- [ ] BG329. **`fid run --timeout N` (and the global `--timeout`) is accepted
+      Fix written Nov 27 (night), not run yet: a source line is
+      executable/covered only through entries of functions the report's file
+      itself defines (parsed with parse_program_only, matched by vl_is_user);
+      core's entries no longer paint the user's line numbers. Summary counts
+      unchanged (AD1 parity kept). Files: compiler/veil.fd. To verify: build
+      the compiler and run the test. Watch: a file that does not parse falls
+      back to the old behaviour (names = 0); lines of functions from a sibling
+      module are not painted (correct: other file)
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      audit-explain-check.sh passes.
+- [x] BG329. **`fid run --timeout N` (and the global `--timeout`) is accepted
       and never enforced: an endless program runs forever.** compiler/main.fd
       cmd_run (`run_timeout = get_flag_int(n, start, "--timeout", g_timeout)`
       is only printed under -v); main's global flag loop ("TODO: --timeout
@@ -4020,7 +4801,19 @@ the repo. Function names are the reference; line numbers move.
       killed by the outer timeout after 25 s (exit 124); `--max-steps 1000` on
       the same file stops at once (exit 1). Confirmed Nov 27 (fb4 fid.exe;
       cmd_run's flag code identical in the tree). Confidence: high.
-- [ ] BG330. **The LSP server speaks byte columns where LSP means UTF-16 code
+      Fix written Nov 27 (night), not run yet: `fid run --timeout N` / global
+      `--timeout N` sets a wall-clock deadline counted from the program's
+      start; past it: "fid: timeout of N seconds exceeded (--timeout)", exit
+      124. main's command search now skips the value of
+      `--timeout`/`--profile-use` (`fid --timeout 2 run x.fd` was "Unknown
+      command: 2"). Files: compiler/main.fd, compiler/interp.fd,
+      compiler/compiler.fd. To verify: build the compiler and run the test.
+      Watch: interp.fd hot loop: one extra `|| g_ilim_wall_end > 0` test per
+      instruction; a program blocked in a syscall (sleep, read) is not
+      interrupted until it executes again
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      run-cli-check.sh passes.
+- [x] BG330. **The LSP server speaks byte columns where LSP means UTF-16 code
       units: after any non-ASCII character on a line,
       references/rename/diagnostic ranges land in the wrong place.**
       compiler/lsp.fd (all positions: word_at_position, lsp_code_occ/I64Triple
@@ -4036,7 +4829,19 @@ the repo. Function names are the reference; line numbers move.
       at `name` (line 1 char 9) -> line 2 range 25..29; the UTF-16 column of
       `name` is 23 (byte column 25). Confirmed Nov 27 (fb4 `fid lsp` over
       stdio). Confidence: high.
-- [ ] BG331. **Any `--` on a fid command line restarts command dispatch after
+      Fix written Nov 27 (night), not run yet: initialize announces
+      positionEncoding "utf-16". In: the 6 request positions in lsp_run are
+      read through lsp_in_char (UTF-16 -> byte column of that document line).
+      Out: send_notification passes every message through lsp_out_positions,
+      which turns each {line, character} from a byte column into UTF-16 units.
+      Files: compiler/lsp.fd, compiler/json.fd. Test:
+      scripts/tl/lsp_bug_fixes.py. To verify: build the compiler and run the
+      test. Watch: every outgoing message is rebuilt (a cost on large
+      responses such as formatting). Diagnostic columns change for lines with
+      non-ASCII text (before: character columns sent as-is).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      lsp_bug_fixes.py passes.
+- [x] BG331. **Any `--` on a fid command line restarts command dispatch after
       it: `fid watch f.fd run -- args` (watch's documented form) and `fid run
       tools/cas.fd -- root port` (cas.fd's documented usage) both fail
       "Unknown command".** compiler/main.fd main (the "Two invocation modes"
@@ -4053,10 +4858,20 @@ the repo. Function names are the reference; line numbers move.
       "Unknown command: alpha"; `fid run cas.fd -- croot 7391` -> "Unknown
       command: croot". Confirmed Nov 27 (fb4 fid.exe; main's loop identical in
       the tree). Confidence: high.
+      Fix written Nov 27 (night), not run yet: `--` restarts fid's command
+      line only when argv[0] is fidesc (the Rust interpreter running main.fd,
+      whose p_argv is the whole process line); a native fid leaves `--` to the
+      command. Files: compiler/main.fd, compiler/interp.fd. To verify: build
+      the compiler and run the test. Watch: any script running `fid run
+      main.fd -- <cmd>` relies on the interp change; tools that scan argv for
+      `--` themselves (ark_main, veil_main, scribe_main) are unchanged and
+      still work (no `--` reaches them now)
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      run-cli-check.sh passes.
 
 ### Low
 
-- [ ] BG332. **A float exponent with no digits is accepted: `1.5e`, `2.0e+`,
+- [x] BG332. **A float exponent with no digits is accepted: `1.5e`, `2.0e+`,
       `3.25E-` are floats.** compiler/lexer.fd Lexer_read_number (fraction
       branch: after 'e'/'E' and an optional sign the digit loop may consume
       nothing): reference §1.6: the exponent is `e`/`E`, an optional sign and
@@ -4065,7 +4880,16 @@ the repo. Function names are the reference; line numbers move.
       Trigger: `fn main() -> i64 { val a = 1.5e; println(a); val b = 2.0e+;
       println(b); return 0; }` -> prints 1.5 and 2; should be a lex error.
       Confirmed Nov 27 (fid run). Confidence: high.
-- [ ] BG333. **`\u{...}` escapes are not checked to be a Unicode scalar value:
+      Fix written Nov 27 (night), not run yet: an exponent after a fraction
+      with no digit after `e`/sign is "float literal 1.5e has no digits in its
+      exponent" (E004). Files: compiler/lexer.fd. Test:
+      test_bg332_float_exp_no_digits_fail.fd, test_bg332_float_exp_ok.fd,
+      test_bg332_float_exp_sign_fail.fd. To verify: build the compiler and run
+      the tests. Watch: low.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG333. **`\u{...}` escapes are not checked to be a Unicode scalar value:
       `"\u{}"`, `"\u{D800}"`, `"\u{FFFFFF}"`, `'\u{110000}'` are accepted.**
       compiler/lexer.fd Lexer_read_hex_value (until_brace: no minimum digit
       count, no range check) and its callers in the string / char literal
@@ -4080,7 +4904,19 @@ the repo. Function names are the reference; line numbers move.
       println(str_len("\u{FFFFFF}")); return 0; }` -> 1114112, 3, 1, 4; each
       escape should be a lex error. Confirmed Nov 27 (fid run). Confidence:
       high.
-- [ ] BG334. **Any function or method named `main` is exempt from the
+      Fix written Nov 27 (night), not run yet: `\u{}` is "empty \u{} escape:
+      no hex digit"; a value above 0x10FFFF or in D800-DFFF is "\u{...} escape
+      is not a Unicode scalar value" (both contain "escape": E003). Applies to
+      char, string and f-string literals (all call read_hex_value). The side
+      note: the string/f-string "unknown escape sequence" Fix line no longer
+      lists \' as a string escape. Files: compiler/lexer.fd. Test:
+      test_bg333_unicode_escape_ok.fd,
+      test_bg333_unicode_escape_range_fail.fd. To verify: build the compiler
+      and run the tests. Watch: low.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG334. **Any function or method named `main` is exempt from the
       missing-return check: `impl App { fn main(self) -> str { if .. { return
       "pos"; } } }` compiles.** compiler/typechecker.fd
       TypeChecker_check_func_body (`if returns_value && func.name != "main" &&
@@ -4093,7 +4929,16 @@ the repo. Function names are the reference; line numbers move.
       println(a.main()); return 0; }` -> run prints `void`, ccompile prints an
       empty line; should be E047. Confirmed Nov 27 (fid run, ccompile).
       Confidence: high.
-- [ ] BG335. **A struct literal may name the same field twice; the later value
+      Fix written Nov 27 (night), not run yet: only `main` as the program's
+      entry is exempt: a free function (mangled == "") in module main or the
+      program's module. A method App.main, or a main in an imported module,
+      gets E047. Files: compiler/typechecker.fd. Test:
+      test_bg334_method_main_fail.fd. To verify: build the compiler and run
+      the test.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG335. **A struct literal may name the same field twice; the later value
       silently wins.** compiler/typechecker.fd struct-literal check
       (Expr::StructLit, ~21540-21560: each field init is type- and fit-checked
       against its declaration, duplicates are never looked for); parser.fd
@@ -4104,7 +4949,14 @@ the repo. Function names are the reference; line numbers move.
       println(p.x); return 0; }` -> run and ccompile print 5; should be "field
       'x' given twice". Confirmed Nov 27 (fid run, ccompile). Confidence:
       high.
-- [ ] BG336. **`keys()` of a `HashMap<u64, V>` is ordered as signed: keys at
+      Fix written Nov 27 (night), not run yet: a field named twice is "field
+      'x' given twice in the struct literal of 'P'". Files:
+      compiler/typechecker.fd. Test: test_bg335_dup_field_fail.fd. To verify:
+      build the compiler and run the test.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG336. **`keys()` of a `HashMap<u64, V>` is ordered as signed: keys at
       or above 2^63 come before 1 (reference/semantics-2 §20.2 M-order:
       integer keys ascending by value).** stdlib/core.fd HashMap_keys (integer
       keys sorted with `Vec_sort(result)`, an i64 heapsort; HashMap_values
@@ -4118,7 +4970,16 @@ the repo. Function names are the reference; line numbers move.
       `9223372036854775808,18446744073709551615,1,` on run, ccompile, emit,
       --nat (want `1,9223372036854775808,18446744073709551615,`). Confirmed
       Nov 27 (all four). Confidence: high.
-- [ ] BG337. **An integer converted to f32 is rounded twice (to f64, then to
+      Fix written Nov 27 (night), not run yet: For a HashMap<u64, V>, keys(),
+      values() and `for k in m` list the keys in unsigned order. Files:
+      stdlib/core.fd, compiler/lower.fd. Test: test_bg336_u64_keys_order.fd.
+      To verify: build the compiler and run the test. Watch: In `for k in m`
+      over a u64 map, the loop variable prints signed (it is typed i64, a
+      separate issue), so that case is not in the test.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG337. **An integer converted to f32 is rounded twice (to f64, then to
       f32) on run, C and --nat; only pe_ir rounds once as semantics-2 §10
       F32-cast requires.** compiler/codegen_c.fd gen_inst `Inst::IntToFloat`
       (`dst = (double)v;`, the f32 destination then narrows the double);
@@ -4134,7 +4995,24 @@ the repo. Function names are the reference; line numbers move.
       18014400656965632 (correct). Same for u64. Confirmed Nov 27 (ng_i2f_u
       identical in the tree; the C line is the same in both trees).
       Confidence: high.
-- [ ] BG338. **`p_str_to_int` wraps on overflow on the machine layer (`--nat`,
+      Fix written Nov 27 (night), not run yet: an IntToFloat to F32 is written
+      `dst = (float)v;` (one rounding) instead of `(double)v` then narrowed. /
+      machine layer converts straight to single (cvtsi2ss; scvtf/ucvtf s, x;
+      fcvt.s.l/.lu). x86-64 u64 >= 2^63 keeps the halve-with-sticky-bit +
+      addss trick, which stays one rounding. The interpreter (and the
+      evaluator's model) fold the bits below 53 into a sticky bit (round to
+      odd) before the one f64->f32 rounding; u64 handled, i64::MIN
+      special-cased. Files: compiler/codegen_c.fd, compiler/interp.fd,
+      compiler/nat_ir.fd, compiler/nat_enc.fd. Test:
+      test_bg337_int_to_f32_rounding.fd. To verify: build the compiler and run
+      the test. Watch: none for C beyond the conversion itself. / --nat f32
+      conversions change everywhere (a64/rv/x64, freg and gpr paths);
+      FID_VERIFY=1's RL6 check must agree with the new encodings (it does on
+      paper: the evaluator and the reference both use nsf_i2s).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG338. **`p_str_to_int` wraps on overflow on the machine layer (`--nat`,
       Linux targets) where run/C/pe_ir saturate.**
       stdlib/linux_runtime/base.fd pert_str_to_int: `v = v * 10 + digit` with
       no overflow test (the runtime is unchecked), and `0 - v` for the sign;
@@ -4146,7 +5024,16 @@ the repo. Function names are the reference; line numbers move.
       `9223372036854775807 -9223372036854775808 9223372036854775807`; emit
       --nat: `-9223372036854775808 9223372036854775807 7766279631452241919`.
       Confirmed Nov 27 (all four backends). Confidence: high.
-- [ ] BG339. **`f"{x:.N}"` rounds the double twice, so values just below a
+      Fixed Nov 27 (night): overflow past i64 saturates to i64::MAX / i64::MIN
+      (atoll/_strtoi64 behaviour) instead of wrapping. Files:
+      stdlib/linux_runtime/base.fd. Test: test_bg338_str_to_int_saturate.fd.
+      Run with the fid of Nov 27 01:25 on the tree's sources (the fixed code
+      is stdlib, a runtime, a script or a tool the old fid runs): the test
+      passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG339. **`f"{x:.N}"` rounds the double twice, so values just below a
       half round up (0.0055 -> "0.006").** stdlib/core.fd fstr_fmt_f64: the
       fraction is `((av - ip) * 10^prec + 0.5) as i64`: the multiply is
       rounded to a double before the +0.5, so a value whose exact binary value
@@ -4157,7 +5044,19 @@ the repo. Function names are the reference; line numbers move.
       println(f"[{0.0055:.3}] [{0.0195:.3}]"); }` -> `[0.006] [0.020]`;
       correctly rounded is `[0.005] [0.019]`. Confirmed Nov 27 (run, ccompile,
       emit, emit --nat all print 0.006 / 0.020). Confidence: high.
-- [ ] BG340. **`--nat` Windows file primitives disagree with pe_ir/C/run on
+      Fixed Nov 27 (night): the scaled fraction is rounded once from the exact
+      product (Dekker two-product with Veltkamp splits, exact comparison of
+      p's fraction with 0.5 - e; a separate branch when p >= 2^53); exact
+      half-way values still round away from zero as before. 889 values
+      (precisions 0..18) against Python Decimal ROUND_HALF_UP on run, ccompile
+      and emit: 0 differences. Files: stdlib/core.fd. Test:
+      test_bg339_fstr_round_once.fd. Run with the fid of Nov 27 01:25 on the
+      tree's sources (the fixed code is stdlib, a runtime, a script or a tool
+      the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG340. **`--nat` Windows file primitives disagree with pe_ir/C/run on
       the same machine: `p_file_exists` of a directory is true and `p_rename`
       onto an existing file replaces it.** stdlib/linux_runtime/base.fd
       pert_file_exists (pe_open of a directory succeeds: win.fd pe_win_open ->
@@ -4172,7 +5071,18 @@ the repo. Function names are the reference; line numbers move.
       println(f"{p_rename("a.txt", "b.txt")} {p_file_size("b.txt")}"); }` ->
       run/C/emit: `false`, `-1 1`; emit --nat: `true`, `0 2`. Confirmed Nov 27
       (all four backends, Windows). Confidence: high.
-- [ ] BG341. **`char_to_str` / `StringBuilder.append_char` of a non-ASCII
+      Fixed Nov 27 (night): MoveFileEx flags 3 -> 2 (no REPLACE_EXISTING:
+      rename onto an existing file fails as Windows rename() does);
+      pert_file_exists is false for a directory when nat_os() == 1 (Linux
+      unchanged: fopen of a dir succeeds there too). Files:
+      stdlib/linux_runtime/win.fd, stdlib/linux_runtime/base.fd. Test:
+      test_bg340_file_exists_dir_rename.fd. Run with the fid of Nov 27 01:25
+      on the tree's sources (the fixed code is stdlib, a runtime, a script or
+      a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG341. **`char_to_str` / `StringBuilder.append_char` of a non-ASCII
       character literal keep only its low byte (invalid UTF-8).**
       stdlib/core.fd char_to_str, byte_to_str, StringBuilder::append_char (all
       p_char_to_str): reference.md §1.7 makes `'c'` the Unicode scalar value
@@ -4186,7 +5096,18 @@ the repo. Function names are the reference; line numbers move.
       3-byte UTF-8 string equal to "€" (or a rejection of values above 255).
       Confirmed Nov 27 (identical on run, ccompile, emit, emit --nat).
       Confidence: high.
-- [ ] BG342. **BG175's siblings: `str_parse_int_range` panics on a long digit
+      Fixed Nov 27 (night): a value above 255 is UTF-8 encoded (surrogates / >
+      U+10FFFF -> U+FFFD); 0..255 stays one byte because many callers
+      (compiler/json.fd, brotli, zstd, html...) append UTF-8/binary bytes one
+      at a time with these. append_char adds the encoded length to sb.len.
+      byte_to_str unchanged. Files: stdlib/core.fd. Test:
+      test_bg341_char_to_str_utf8.fd. Run with the fid of Nov 27 01:25 on the
+      tree's sources (the fixed code is stdlib, a runtime, a script or a tool
+      the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG342. **BG175's siblings: `str_parse_int_range` panics on a long digit
       run and `str_parse_hex` silently wraps past 16 digits.** stdlib/core.fd
       str_parse_int_range, str_parse_hex: BG175 made str_parse_int return 0
       (its documented failure) for a value outside i64. str_parse_int_range
@@ -4204,7 +5125,17 @@ the repo. Function names are the reference; line numbers move.
       `0`, `-1 0`, then `Panic: Integer overflow on multiplication` in
       str_parse_int_range. Confirmed Nov 27 (run, ccompile, emit, emit --nat
       identical). Confidence: high.
-- [ ] BG343. **A `HashMap<Vec<T>, V>` keys by the Vec handle's address, so two
+      Fixed Nov 27 (night): str_parse_int_range returns 0 past i64::MAX
+      (checked before the multiply); str_parse_hex returns 0 for more than 16
+      significant hex digits (16 keep two's complement: "ffffffffffffffff" is
+      -1). Files: stdlib/core.fd. Test:
+      test_bg342_parse_range_hex_overflow.fd. Run with the fid of Nov 27 01:25
+      on the tree's sources (the fixed code is stdlib, a runtime, a script or
+      a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG343. **A `HashMap<Vec<T>, V>` keys by the Vec handle's address, so two
       equal Vecs are two keys.** stdlib/core.fd hm_hash / hm_eq (a Vec key is
       neither an int key, a str key nor a struct key: compared as a word);
       compiler/lower.fd Lowerer_map_has_int_keys: `==` on two Vecs compares
@@ -4218,7 +5149,17 @@ the repo. Function names are the reference; line numbers move.
       println(f"{m.len()}"); }` -> `true` then `2`; want `true`, `1`.
       Confirmed Nov 27 (run, ccompile, emit, emit --nat print the same: len
       counts equal Vecs twice). Confidence: high.
-- [ ] BG344. **`int_to_str_padded` puts the zeros in front of the minus sign:
+      Fix written Nov 27 (night), not run yet: `HashMap<Vec<T>, V>` is
+      rejected at HashMap::new() with "a HashMap key cannot be Vec<..>: Vec
+      keys are not supported ...", plus a Fix line, in the style of the
+      float-key message. Files: compiler/typechecker.fd. Test:
+      test_bg343_vec_key_fail.fd. To verify: build the compiler and run the
+      test. Watch: Code in stdlib or tests that keys a map by a Vec now fails
+      to compile.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG344. **`int_to_str_padded` puts the zeros in front of the minus sign:
       `int_to_str_padded(-7, 4)` is "00-7".** stdlib/string.fd
       int_to_str_padded (str_pad_left of int_to_str(n) with '0'): the doc says
       "with a minimum width (zero-padded)"; padding the text "-7" on the left
@@ -4227,7 +5168,15 @@ the repo. Function names are the reference; line numbers move.
       ("-007"). Trigger: `use string; fn main() {
       println(int_to_str_padded(-7, 4)); }` -> `00-7`; want `-007`. Confirmed
       Nov 27 (run, ccompile, emit, emit --nat). Confidence: high.
-- [ ] BG345. **`StrView.parse_int` panics on a long digit run and on i64::MIN
+      Fixed Nov 27 (night): for n < 0 the zeros go after the sign (the width
+      counts the sign), as f"{n:04}". Files: stdlib/string.fd. Test:
+      test_bg344_int_to_str_padded_negative.fd. Run with the fid of Nov 27
+      01:25 on the tree's sources (the fixed code is stdlib, a runtime, a
+      script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG345. **`StrView.parse_int` panics on a long digit run and on i64::MIN
       instead of returning its fallback / the value.** stdlib/string.fd
       StrView::parse_int: the value is built positive with checked `n = n * 10
       + (c - 48)`, so 20 digits panic "Integer overflow on multiplication",
@@ -4242,7 +5191,16 @@ the repo. Function names are the reference; line numbers move.
       Confirmed Nov 27 (run, ccompile, emit --nat; emit cannot build the
       probe, see BG307). The MIN case: Read only (same
       loop), confidence high.
-- [ ] BG346. **unicode.fd's encoder writes invalid UTF-8 for surrogates and
+      Fixed Nov 27 (night): built negative with each step checked (BG175's
+      pattern): out of range -> fallback, i64::MIN parses. Files:
+      stdlib/string.fd. Test: test_bg345_strview_parse_int_overflow.fd. Run
+      with the fid of Nov 27 01:25 on the tree's sources (the fixed code is
+      stdlib, a runtime, a script or a tool the old fid runs): the test
+      passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG346. **unicode.fd's encoder writes invalid UTF-8 for surrogates and
       values past U+10FFFF, and `uni_len` counts invalid input differently
       from `uni_to_codepoints`.** stdlib/unicode.fd uni_encode_cp, uni_len:
       after BG215 the decoder (uni_to_codepoints) turns each invalid byte into
@@ -4261,7 +5219,15 @@ the repo. Function names are the reference; line numbers move.
       3`; want equal counts, and `1 1` (U+FFFD) for the encoder's invalid
       inputs. Confirmed Nov 27 (run, ccompile, emit, emit --nat identical).
       Confidence: high.
-- [ ] BG347. **`semver_compare` returns -31 (not -1/0/1) for alphanumeric
+      Fixed Nov 27 (night): surrogates and > U+10FFFF encode as U+FFFD;
+      uni_len uses uni_to_codepoints' validity rules. Files:
+      stdlib/unicode.fd. Test: test_bg346_unicode_encode_len.fd. Run with the
+      fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG347. **`semver_compare` returns -31 (not -1/0/1) for alphanumeric
       pre-release identifiers.** stdlib/semver.fd sv_pre_compare: for two
       non-numeric identifiers it returns `str_compare(xa, xb)` as it is, which
       is a byte difference, although semver_compare's doc promises "-1 if a <
@@ -4272,14 +5238,31 @@ the repo. Function names are the reference; line numbers move.
       (`"1.0.0-99999999999999999999"` vs `"...98"` -> 0) because they go
       through str_parse_int; SemVer compares them numerically at any size.
       Confidence: high.
-- [ ] BG348. **`fx_parse` overflows on Q31 input with 11 decimals and returns
+      Fixed Nov 27 (night): alphanumeric compare returns the sign only;
+      numeric identifiers compare by digit string at any size. Files:
+      stdlib/semver.fd. Test: test_bg347_semver_compare_sign.fd. Run with the
+      fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG348. **`fx_parse` overflows on Q31 input with 11 decimals and returns
       a wrong value.** stdlib/fixed_point.fd fx_parse: the fraction loop keeps
       up to 11 digits (`den < 100000000000`), then computes `num << frac`;
       with frac = 31 and an 11-digit `num` the shift exceeds 2^63 and wraps,
       so the fraction is garbage. Trigger: `fx_parse("0.12345678901", 31)` ->
       80653995 (the 9- and 10-digit inputs give the right 265121436).
       Confirmed Nov 27 (fid run). Confidence: high.
-- [ ] BG349. **`x509_matches_host` lets a DNS SAN wildcard match an IPv4
+      Fixed Nov 27 (night): fraction = num * 2^frac / den by long division,
+      rounded to nearest (no `num << frac` overflow). Files:
+      stdlib/fixed_point.fd. Test: test_bg348_fx_parse_q31_decimals.fd. Run
+      with the fid of Nov 27 01:25 on the tree's sources (the fixed code is
+      stdlib, a runtime, a script or a tool the old fid runs): the test
+      passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG349. **`x509_matches_host` lets a DNS SAN wildcard match an IPv4
       address literal.** stdlib/x509.fd x509_matches_host / x509_label_match:
       the host is tried against every dNSName whatever it is; RFC 6125 §6.2.1
       / RFC 9525 say an IP address is matched only against iPAddress SANs.
@@ -4288,7 +5271,17 @@ the repo. Function names are the reference; line numbers move.
       certificate with `DNS:*.0.0.1`; `x509_matches_host(c, "1.0.0.1")` ->
       true (should be false: no iPAddress SAN 1.0.0.1). Confirmed Nov 27 (fid
       run). Confidence: high.
-- [ ] BG350. **`mime_param` splits quoted parameter values at ';' and returns
+      Fixed Nov 27 (night): x509_matches_host returns after the iPAddress SAN
+      comparison when the host parses as an IP address (x509_ip_parse), so
+      neither a dNSName (wildcard "*.0.0.1" or "1.0.0.2") nor the CN can match
+      an address (RFC 6125 §6.2.1, RFC 9525 §6.3). Files: stdlib/x509.fd.
+      Test: test_bg349_x509_ip_vs_dns_wildcard.fd. Run with the fid of Nov 27
+      01:25 on the tree's sources (the fixed code is stdlib, a runtime, a
+      script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG350. **`mime_param` splits quoted parameter values at ';' and returns
       a half-quoted value.** stdlib/mime.fd mime_param: the parameter list is
       cut with `str_split(params, ";")` before quotes are looked at, so a
       quoted-string value holding ';' (legal per RFC 2045/7231) is broken in
@@ -4300,7 +5293,15 @@ the repo. Function names are the reference; line numbers move.
       `a;b.txt`); `mime_param("text/plain; name=\"a\\\"b\"", "name")` ->
       `a\"b` (should be `a"b`). Confirmed Nov 27 (fid run). (multipart.fd's
       own mp_header_param handles both correctly.). Confidence: high.
-- [ ] BG351. **`h_unescape` turns `&#0;`, surrogates and code points above
+      Fixed Nov 27 (night): parameters scanned left to right; quoted-string
+      values may hold ';' and '=', backslash escapes decoded. Files:
+      stdlib/mime.fd. Test: test_bg350_mime_param_quoted.fd. Run with the fid
+      of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG351. **`h_unescape` turns `&#0;`, surrogates and code points above
       U+10FFFF into NUL / invalid UTF-8.** stdlib/html.fd h_unescape: numeric
       character references are UTF-8 encoded as given; the HTML standard maps
       0, U+D800..U+DFFF and values above 0x10FFFF to U+FFFD. Here `&#0;`
@@ -4308,13 +5309,30 @@ the repo. Function names are the reference; line numbers move.
       80 80, neither valid UTF-8. Trigger:
       `h_unescape("&#0;&#x110000;&#xD800;")` -> bytes 00, F4 90 80 80, ED A0
       80 (od -c of the output). Confirmed Nov 27 (fid run). Confidence: high.
-- [ ] BG352. **`json_path` treats a non-numeric segment on an array as index
+      Fixed Nov 27 (night): numeric refs 0, U+D800..DFFF and > U+10FFFF become
+      U+FFFD; accumulation stops past U+10FFFF (a long reference no longer
+      overflows the checked multiply). Files: stdlib/html.fd. Test:
+      test_bg351_html_unescape_invalid_cp.fd. Run with the fid of Nov 27 01:25
+      on the tree's sources (the fixed code is stdlib, a runtime, a script or
+      a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG352. **`json_path` treats a non-numeric segment on an array as index
       0.** stdlib/json.fd json_path: for an array the segment goes through
       `str_parse_int(seg)`, which gives 0 for text that is not a number, so a
       path that names a key on an array (a schema mismatch) silently returns
       the first element instead of "". Trigger: `json_path("[10,20]", "x")` ->
       "10" (should be ""). Confirmed Nov 27 (fid run). Confidence: high.
-- [ ] BG353. **safetensors: a tensor with a zero-length dimension is
+      Fixed Nov 27 (night): on an array only an all-digit segment (<= 18
+      digits) indexes; anything else returns "". Files: stdlib/json.fd. Test:
+      test_bg352_json_path_array_key.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG353. **safetensors: a tensor with a zero-length dimension is
       rejected.** stdlib/safetensors.fd st_tensor: every dimension must be `>
       0` (`if d <= 0 { return t; }`), but the format allows empty tensors
       (shape [0, 4] with data_offsets [a, a]); such entries, which real
@@ -4322,7 +5340,18 @@ the repo. Function names are the reference; line numbers move.
       `{"z":{"dtype":"F32","shape":[0,4],"data_offsets":[0,0]}}` ->
       `st_tensor(...).found` false (should be true, 0 elements). Confirmed Nov
       27 (fid run). Confidence: high.
-- [ ] BG354. **WebSocket client handshake check is lax: any "101" in the reply
+      Fixed Nov 27 (night): st_tensor accepts a zero-length dimension (empty
+      tensor, must have e == a); the element count is now a checked product in
+      shape order (overflow refused, as the Rust reference's checked_mul
+      fold), then `total > e - a` is checked before `total * dsz`, so BG320's
+      no-overflow guarantee holds. Files: stdlib/safetensors.fd. Test:
+      test_bg353_safetensors_zero_dim.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG354. **WebSocket client handshake check is lax: any "101" in the reply
       and a case-folded Sec-WebSocket-Accept pass, while a valid header
       written without the single space fails.** stdlib/ws.fd ws_handshake: the
       reply is accepted when `str_contains(resp, "101")` (anywhere: a
@@ -4339,7 +5368,16 @@ the repo. Function names are the reference; line numbers move.
       `Sec-WebSocket-Accept:<accept>` is rejected. Read only (needs a socket
       peer). Confidence: high (the two str_contains tests are the whole
       check).
-- [ ] BG355. **`asn1_get_time` accepts impossible dates (Feb 31, Apr 31) and
+      Fixed Nov 27 (night): status line HTTP/1.x 101, Upgrade: websocket,
+      Connection holds "upgrade", Sec-WebSocket-Accept (any OWS) exactly the
+      accept value. Files: stdlib/ws.fd. Test:
+      test_bg354_ws_handshake_reply.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG355. **`asn1_get_time` accepts impossible dates (Feb 31, Apr 31) and
       normalises them, and GeneralizedTime without seconds.** stdlib/asn1.fd
       asn1_get_time (used for X.509 notBefore/notAfter and CRL times): the day
       is only checked against 1..31, never against the month, so
@@ -4352,7 +5390,16 @@ the repo. Function names are the reference; line numbers move.
       GeneralizedTime "202503030000Z" (no seconds) -> Some(1740960000).
       Confirmed Nov 27 (fid run; elements built with asn1_enc_tlv and read
       with asn1_read_der). Confidence: high.
-- [ ] BG356. **`RingBuffer::new(0).push(x)` panics with modulo by zero.**
+      Fixed Nov 27 (night): the day is checked against the month (leap years);
+      GeneralizedTime needs its seconds. UTCTime seconds stay optional (the
+      doc's YYMMDDHHMM[SS]Z). Files: stdlib/asn1.fd. Test:
+      test_bg355_asn1_time_dates.fd. Run with the fid of Nov 27 01:25 on the
+      tree's sources (the fixed code is stdlib, a runtime, a script or a tool
+      the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG356. **`RingBuffer::new(0).push(x)` panics with modulo by zero.**
       stdlib/collections.fd RingBuffer::push: push computes `(self.head +
       self.len) % self.capacity` before testing whether the buffer is full, so
       a zero-capacity ring (try_push and is_full handle it) traps; the doc
@@ -4360,7 +5407,15 @@ the repo. Function names are the reference; line numbers move.
       RingBuffer::new(0); r.push(1);` -> "Panic: Modulo by zero" (try_push
       returns false, is_full true). Confirmed Nov 27 (fid run). Confidence:
       high.
-- [ ] BG357. **`cookie_domain_match` suffix-matches IP addresses, so a cookie
+      Fixed Nov 27 (night): RingBuffer::push returns at once when capacity <=
+      0 (keeps nothing) instead of computing `% 0`. Files:
+      stdlib/collections.fd. Test: test_bg356_ringbuffer_zero_cap.fd. Run with
+      the fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib,
+      a runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG357. **`cookie_domain_match` suffix-matches IP addresses, so a cookie
       for "168.1.5" is sent to 192.168.1.5.** stdlib/cookie.fd
       cookie_domain_match: RFC 6265 §5.1.3 allows the "host ends with ." +
       domain" form only when the host is a host name, not an IP address; the
@@ -4370,7 +5425,15 @@ the repo. Function names are the reference; line numbers move.
       true; `cookie_domain_match("168.1.5", "192.168.1.5")` -> true (both
       should be false; only exact equality applies to IPs). Confirmed Nov 27
       (fid run). Confidence: high.
-- [ ] BG358. **`fid fmt -w` reports "formatted", exit 0, when the file could
+      Fixed Nov 27 (night): an IP host (has ':' or its last label is a number,
+      WHATWG "ends in a number") matches only by equality. Files:
+      stdlib/cookie.fd. Test: test_bg357_cookie_domain_ip.fd. Run with the fid
+      of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG358. **`fid fmt -w` reports "formatted", exit 0, when the file could
       not be written.** compiler/main.fd cmd_fmt (write_mode branch):
       `p_file_write(input, formatted);` result is ignored; the message and
       `return 0` follow regardless. A pre-commit hook running `fid fmt -w` on
@@ -4379,7 +5442,13 @@ the repo. Function names are the reference; line numbers move.
       echo $?` (f.fd unformatted) -> "ro.fd: formatted", exit 0, ro.fd
       byte-identical to before (want an error, exit 1). Confirmed Nov 27 (fb4
       fid.exe; cmp shows the file unchanged). Confidence: high.
-- [ ] BG359. **After a stage-0 pin update, bootstrap.sh keeps the previously
+      Fix written Nov 27 (night), not run yet: p_file_write < 0 in -w mode:
+      "Error: could not write <f>; it was not formatted", exit 1. Files:
+      compiler/main.fd. To verify: build the compiler and run the test. Watch:
+      none
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      fmt-guard-check.sh passes.
+- [~] BG359. **After a stage-0 pin update, bootstrap.sh keeps the previously
       fetched stage 0 without a warning (it checks the binary against the pin
       copied beside it, not the repo's pin).** scripts/bootstrap.sh stage-0
       selection (`PIN="$PINNED.sha256"; [ -f "$PIN" ] ||
@@ -4399,7 +5468,18 @@ the repo. Function names are the reference; line numbers move.
       scripts/fid-linux-x64.sha256 (or stage0.sha256) to another hash and run
       bootstrap.sh -> "stage 0: release/stage0/fid", no warning. Read only.
       Confidence: high.
-- [ ] BG360. **scribe names every typed constant with a trailing colon
+      Fix written Nov 27 (night), not run yet: bootstrap.sh checks
+      release/stage0/fid against the repository's pin for this host
+      (`stage0-fetch.sh --pin-file`, new), refetches on mismatch when
+      FID_STAGE0_FETCH != 0, else warns; stage0-fetch.sh's "already matches"
+      exit now also refreshes a missing/stale canonical release/stage0/fid and
+      its .sha256 copy; sha256sum or shasum. Files: scripts/bootstrap.sh,
+      scripts/stage0-fetch.sh. To verify: build the compiler and run the test.
+      Watch: bootstrap.sh holds another session's uncommitted edits elsewhere
+      (build-units); my hunks are lines ~41-75 and the PIN=1 block only.
+      Not verifiable on this machine (Nov 28). Left: checked with bash -n and
+      a simulated pin change; a real bootstrap after a pin update was not run.
+- [x] BG360. **scribe names every typed constant with a trailing colon
       (`LIMIT:`), in headings, anchors and the contents; the shipped
       docs/stdlib pages have them (35 pages).** compiler/scribe.fd
       extract_name_after (called by scribe_parse_const with prefix "const "):
@@ -4412,7 +5492,13 @@ the repo. Function names are the reference; line numbers move.
       `fid scribe m.fd --output o` -> `<section id="LIMIT:"><h3>LIMIT:</h3>`;
       `grep -rlE "^#+ [A-Z_0-9]+:$" docs/stdlib/*.md | wc -l` -> 35. Confirmed
       Nov 27 (fb4 fid.exe; scribe.fd identical in the tree). Confidence: high.
-- [ ] BG361. **`fid doc` ("as scribe") ignores scribe's `-o`/`-f` and any
+      Fixed Nov 27 (night): the name also ends at `:`, `=` and tab. Files:
+      compiler/scribe.fd. Run with the fid of Nov 27 01:25 on the tree's
+      sources (the fixed code is stdlib, a runtime, a script or a tool the old
+      fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      doc-cli-check.sh passes.
+- [x] BG361. **`fid doc` ("as scribe") ignores scribe's `-o`/`-f` and any
       second input, writing HTML into ./docs/ instead.** compiler/main.fd
       cmd_scribe (get_flag_value "--format"/"--output" only) vs
       compiler/scribe.fd scribe_main (`--format`|`-f`, `--output`|`-o`,
@@ -4424,7 +5510,15 @@ the repo. Function names are the reference; line numbers move.
       "Generated docs/m.html (2 items)", no outx/ (scribe.exe m.fd -o outx -f
       markdown writes outx/m.md). Confirmed Nov 27 (fb4 fid.exe). Confidence:
       high.
-- [ ] BG362. **`fid run` panic traces (and the --crash-file report `fid
+      Fix written Nov 27 (night), not run yet: scribe_main's argument rules:
+      options anywhere, -o/-f short forms, --help; a second input or unknown
+      argument is an error (exit 1); global flags (--borrowck=, --edition=,
+      --debug) skipped. Files: compiler/main.fd. To verify: build the compiler
+      and run the test. Watch: `fid doc a.fd b.fd` used to silently ignore
+      b.fd, now exit 1
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      doc-cli-check.sh passes.
+- [x] BG362. **`fid run` panic traces (and the --crash-file report `fid
       inspect` prints) put each function next to the line of its CALLER: "c at
       line 6" when line 6 is in b.** compiler/interp.fd
       Interpreter_format_call_stack: call_site_lines[i] is the line in frame
@@ -4442,7 +5536,20 @@ the repo. Function names are the reference; line numbers move.
       interpreter). Confidence: medium that it is unintended (the lines are
       consistently call sites; the `→ c at line 6` form still reads as a line
       in c, and main never gets its line).
-- [ ] BG363. **tools/cas.fd (the .fidcache remote cache server) cannot be
+      Fix written Nov 27 (night), not run yet: frame i is printed with
+      call_site_lines[i+1] (its own line), the innermost frame with the
+      panicking instruction's source line (0 = no line where it is not known:
+      the step, memory and recursion limits, replay, the debugger), and main
+      now gets its line. Files: compiler/interp.fd. Test:
+      test_bg362_trace_lines.fd, tests/tooling/bg362-trace-lines-check.sh. To
+      verify: build the compiler and run the tests. Watch: the trace text
+      changes for every interpreter panic. crash-report-check.sh still matches
+      "called from main". debugger.fd's traces have no innermost line now
+      (before: the caller's line).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them); bg362-trace-lines-check.sh passes.
+- [x] BG363. **tools/cas.fd (the .fidcache remote cache server) cannot be
       started the way it says (`fid run tools/cas.fd`): the interpreter has no
       p_co_accept.** tools/cas.fd header ("fid run tools/cas.fd -- [root]
       [port]"); compiler/interp.fd (no p_co_accept FFI); stdlib/http.fd
@@ -4457,7 +5564,14 @@ the repo. Function names are the reference; line numbers move.
       http_accept_task"; `curl http://127.0.0.1:7391/health` -> rc 7
       (refused). Confirmed Nov 27 (fb4 fid.exe; the ccompile'd server checked
       too). Confidence: high.
-- [ ] BG364. **`fid fmt` / `fmt -w` / `fmt --check` never refuse a file that
+      Fixed Nov 27 (night): header documents building it (`fid ccompile
+      tools/cas.fd -o fidcas.exe`, then `fidcas.exe [root] [port]`); main
+      returns i64 and, when argv[0] ends in ".fd" (the interpreter), prints
+      why it cannot serve and how to build it, exit 1; exit 1 on a failed
+      listen. Files: tools/cas.fd, docs/roadmap/inc-roadmap.md. Run with the
+      fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+- [x] BG364. **`fid fmt` / `fmt -w` / `fmt --check` never refuse a file that
       does not lex or parse: `-w` rewrites it ("formatted", exit 0); the LSP
       formatting request has not even the token guard.** compiler/main.fd
       cmd_fmt (no parse/lex error check before format_source; only
@@ -4476,6 +5590,16 @@ the repo. Function names are the reference; line numbers move.
       formatted", exit 0, line 2 reindented. Confirmed Nov 27 for the CLI (fb4
       fid.exe); the LSP part Read only (handle_formatting code). Confidence:
       high.
+      Fix written Nov 27 (night), not run yet: fmt lexes+parses first; any
+      lexer or parser error: "Error: <f> does not parse, so it was not
+      formatted:" + the error, exit 1, file untouched (-w/--check/stdout). LSP
+      formatting returns no edit for a document that does not parse or whose
+      tokens the formatter would change. Files: compiler/main.fd,
+      compiler/lsp.fd. To verify: build the compiler and run the test. Watch:
+      scripts/fmt-check.sh over the tree: a repo file that does not parse on
+      its own (none expected) would now error instead of "would reformat"
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      fmt-guard-check.sh passes.
 - [x] BG365. **release.yml's Linux archive is built without FIDES_VERSION, so
       a manual (workflow_dispatch) release names a different version than its
       Windows installer.** .github/workflows/release.yml job `linux`, step
@@ -4493,7 +5617,7 @@ the repo. Function names are the reference; line numbers move.
       Fixed Nov 27 (release.yml: the linux job has the windows job's
       Version step and passes FIDES_VERSION to bootstrap.sh). Not run: the
       workflow runs only on a v* tag or a manual dispatch.
-- [ ] BG366. **The installer lets the user untick "Standard Library" (fid then
+- [~] BG366. **The installer lets the user untick "Standard Library" (fid then
       cannot build anything) and an update over an older install keeps the
       stdlib modules the new release removed.** installer/fides.nsi Section
       "Standard Library" SecStdlib (no `SectionIn RO`, unlike SecCore),
@@ -4510,6 +5634,13 @@ the repo. Function names are the reference; line numbers move.
       `fid run hello.fd` (no core.fd); or install over an older release and
       look for modules in $INSTDIR\stdlib that the new release no longer has.
       Read only. Confidence: high.
+      Fix written Nov 27 (night), not run yet: `SectionIn RO` (named "Standard
+      Library (required)") and `RMDir /r "$INSTDIR\stdlib"` before `File /r`,
+      so an update drops removed modules. Files: installer/fides.nsi. To
+      verify: build the compiler and run the test. Watch: files a user put
+      into $INSTDIR\stdlib by hand are removed on update.
+      Not verifiable on this machine (Nov 28). Left: makensis builds the
+      script; an install and an update over an older install were not run.
 
 ## Found by the Nov 27 whole-repo review, second run
 
@@ -4544,7 +5675,7 @@ Same rules as the first run:
 
 ### Critical
 
-- [ ] BG367. **Safe code can make a function value out of any integer (`12345
+- [x] BG367. **Safe code can make a function value out of any integer (`12345
       as fn(i64) -> i64`) and call it: a jump to an arbitrary address with no
       `unsafe`.** compiler/typechecker.fd TypeChecker_check_cast with
       tc_cast_dst_is_value (the cast-needs-unsafe rule covers a reference,
@@ -4566,7 +5697,20 @@ Same rules as the first run:
       (`fid check`, `fid ccompile`, `fid emit` pe_ir; `fid run` refuses at run
       time). TypeChecker_check_cast and tc_cast_dst_is_value are unchanged
       between fb4 and the repo. Confidence: high.
-- [ ] BG368. **A method's `self` may be declared with any type (`impl A { fn
+      Fix written Nov 27 (night), not run yet: Type::Func is now a value
+      destination, so `int as fn(..)` and `rawptr as fn(..)` need `unsafe`
+      ("casting an integer to fn(i64) -> i64 needs an `unsafe` block"). A
+      function cast to its own type, or to an int, stays safe. Files:
+      compiler/typechecker.fd. Test: test_bg367_fn_cast_ok.fd,
+      test_bg367_int_as_fn_fail.fd, test_bg367_ptr_as_fn_fail.fd. To verify:
+      build the compiler and run the tests. Watch: the existing users
+      (test_cfp_closure_mix, test_fix_fnval_c_ptr, linux_runtime/win.fd) are
+      in @unsafe fns or in the runtime, so they are not affected. Compiler
+      modules are exempt.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG368. **A method's `self` may be declared with any type (`impl A { fn
       m(self: B) }`, `self: i64`): the receiver's memory is reinterpreted, so
       safe code reads an integer field as a str or a Vec.**
       compiler/typechecker.fd TypeChecker_register_program (impl registration,
@@ -4589,7 +5733,20 @@ Same rules as the first run:
       must be A". Confirmed Nov 27 (`fid run`, `fid emit` pe_ir). Neither
       fb4's nor the repo's typechecker.fd has any check of the declared `self`
       type (the registration code is the same). Confidence: high.
-- [ ] BG369. **A `[T; N]` struct field holds only the array's address, so a
+      Fix written Nov 27 (night), not run yet: `self` must be Self, the impl's
+      own type, &T or &mut T. References and type arguments are stripped,
+      aliases are resolved, and a type parameter in scope is accepted. Error:
+      "`self` of method 'm' of A must be A, &A or &mut A, got B". Files:
+      compiler/typechecker.fd. Test: test_bg368_self_forms.fd,
+      test_bg368_self_int_fail.fd, test_bg368_self_other_struct_fail.fd,
+      test_bg368_self_trait_impl_fail.fd. To verify: build the compiler and
+      run the tests. Watch: a regex scan of stdlib, compiler, tools and tests
+      found no impl whose self type differs from the impl's type; the only
+      variant forms are `&'a T`, which are accepted.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [~] BG369. **A `[T; N]` struct field holds only the array's address, so a
       struct built with an array literal and returned from a function reads
       the callee's dead frame.** compiler/lower.fd Lowerer_make_struct_layout
       (default layout: every non-struct field is one 8-byte word, so an
@@ -4622,7 +5779,19 @@ Same rules as the first run:
       Confirmed Nov 27 (run, ccompile, emit, emit --nat; outputs above).
       Lowerer_make_struct_layout and Lowerer_held_ir unchanged between fb4 and
       the repo. Confidence: high.
-- [ ] BG370. **MAVLink signing is bypassed: a parser given a key still accepts
+      Fix written Nov 27 (night), not run yet: (not run); partial by design.
+      Files: compiler/lower.fd. Test: test_bg369_array_field.fd. To verify:
+      build the compiler and run the test. Watch: the heap copies for struct
+      fields, tuple elements and enum payloads are never freed (struct glue
+      does not own arrays). The leak gate fails for programs with array
+      fields: none in stdlib/compiler;
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them). Left: the heap copies of an array put in a struct
+      field, a tuple or an enum payload are never freed, `s2.a[i] = x` after
+      `var s2 = s` still writes a shared copy, and a @repr(C) struct's array
+      field size is not fixed.
+- [x] BG370. **MAVLink signing is bypassed: a parser given a key still accepts
       unsigned v1/v2 frames, and replayed signed frames.** stdlib/mavlink.fd
       mav_try_frame (with mav_parser_set_key): mav_parser_set_key sets
       `check_sig = true`, but mav_try_frame checks the signature only inside
@@ -4643,10 +5812,22 @@ Same rules as the first run:
       accepted both times. Should be 0 for the unsigned ones and the replay.
       Confirmed Nov 27 (fid run: "unsigned accepted with key set: v2=1 v1=1
       sig_errors=0", "signed=1 replayed=1"). Confidence: high.
+      Fixed Nov 27 (night): with a key set, unsigned v1/v2 frames are dropped
+      (MavParser.unsigned_dropped) unless new mav_parser_accept_unsigned
+      allows them, and a signed frame whose timestamp is not newer than the
+      last accepted one of its (sysid, compid, link id) stream is dropped as a
+      replay (MavParser.replays; per-stream state sig_streams/sig_last_ts).
+      Module comment updated. Files: stdlib/mavlink.fd. Test:
+      test_bg370_mavlink_signing.fd. Run with the fid of Nov 27 01:25 on the
+      tree's sources (the fixed code is stdlib, a runtime, a script or a tool
+      the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
 
 ### High
 
-- [ ] BG371. **A turbofish call of a generic function with a trait bound is
+- [x] BG371. **A turbofish call of a generic function with a trait bound is
       always rejected ("Unknown annotation '@__trait_bound'"), even when the
       type implements the trait.** compiler/mono.fd (generic instantiation:
       BG144 pushes `Annotation_new("__trait_bound", [type, trait])` onto
@@ -4670,7 +5851,20 @@ Same rules as the first run:
       Confirmed Nov 27 (`fid run`/`check`). mono.fd's `__trait_bound` push and
       typechecker.fd annotation_target_mask are unchanged between fb4 and the
       repo. Confidence: high.
-- [ ] BG372. **Two `struct` (or `enum`) definitions of one name in a module
+      Fix written Nov 27 (night), not run yet: `__trait_bound` (written by
+      mono.fd instantiate on a turbofish instance, read by lower.fd) is no
+      longer an unknown annotation; instead its [type, trait] is checked with
+      TypeChecker_satisfies_bound, giving "Type error: Q does not implement
+      Show (required by a bound of 'pr__Q', a turbofish instance)". Files:
+      compiler/typechecker.fd. Test: test_bg371_turbofish_bound.fd,
+      test_bg371_turbofish_bound_fail.fd. To verify: build the compiler and
+      run the tests. Watch: a user-written `@__trait_bound(..)` is now
+      accepted (and checked) instead of E078; the instance body may still add
+      a "no method" error after the bound error.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG372. **Two `struct` (or `enum`) definitions of one name in a module
       are accepted; the type checker uses the first and lowering the second,
       so the program computes garbage.** compiler/compiler.fd
       cc_find_duplicate_funcs (the E060 "Duplicate definition" check walks
@@ -4688,7 +5882,20 @@ Same rules as the first run:
       str }` as the second, `println(p.x + 1)` prints an empty line. Confirmed
       Nov 27 (`fid run`). cc_find_duplicate_funcs is unchanged between fb4 and
       the repo. Confidence: high.
-- [ ] BG373. **`@no-alloc` accepts `s += t` on strings and `Vec::filled(n,
+      Fix written Nov 27 (night), not run yet: the per-module duplicate check
+      now also reports a struct (not @cfg) or enum defined twice, or a struct
+      and an enum of one name: "Duplicate definition: struct 'Pt' is defined
+      twice in module 'main'" (same E060 class and Fix line as the function
+      message). Files: compiler/compiler.fd. Test:
+      test_bg372_dup_enum_fail.fd, test_bg372_dup_struct_fail.fd,
+      test_bg412_methods_ok.fd. To verify: build the compiler and run the
+      tests. Watch: runs on every imported module too: a regex scan of
+      stdlib/, compiler/, tools/, examples/ and tests/ found no duplicate
+      struct/enum/method; it found one duplicate const (next entry).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG373. **`@no-alloc` accepts `s += t` on strings and `Vec::filled(n,
       x)`, both of which allocate.** compiler/typechecker.fd
       TypeChecker_check_expr_inner Expr::Binary (the in_no_alloc string-`+`
       error is raised only for a BinOp::Add expression, never for Stmt::Assign
@@ -4708,7 +5915,17 @@ Same rules as the first run:
       27 (`fid check`). The in_no_alloc string-`+` check (one occurrence) and
       tc_alloc_func_names are unchanged between fb4 and the repo. Confidence:
       high.
-- [ ] BG374. **`@constant_time` accepts `a == b` on secret strings,
+      Fix written Nov 27 (night), not run yet: @no-alloc now rejects `s += t`
+      and `o.f += t` on a str ("uses string `+=`, which allocates").
+      Vec::filled is now an allocating builtin. Files:
+      compiler/typechecker.fd. Test: test_bg373_no_alloc_add_assign_fail.fd,
+      test_bg373_no_alloc_vec_filled_fail.fd. To verify: build the compiler
+      and run the tests. Watch: adding Vec_filled also marks its callers in
+      heap_alloc_index. That is correct, since they allocate.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG374. **`@constant_time` accepts `a == b` on secret strings,
       `v.contains(secret)`, and a local closure that branches and returns
       early on a secret.** compiler/typechecker.fd TypeChecker_ct_check_one
       (calls collected with scan_stmts_for_calls while g_scan_dot_methods is
@@ -4735,7 +5952,22 @@ Same rules as the first run:
       TypeChecker_ct_check_one and peir_ct_check changed only by the CF32
       @public parameter lines (not the call/method handling). Confidence:
       high.
-- [ ] BG375. **`sandbox { }` lets IO through a `dyn Trait` method call or a
+      Fix written Nov 27 (night), not run yet: the check now reports: -
+      `==`/`!=` with a secret str, Vec or HashMap (a parameter or a typed
+      local), or a string literal against a secret; - early-exit searches
+      (.contains, .find, .starts_with, ...) and str_equal/str_compare/... on
+      secret data; - branches on a closure's own parameters, which now count
+      as secret, and an early `return` inside a closure. Files:
+      compiler/typechecker.fd. Test: test_bg374_ct_closure_branch_fail.fd,
+      test_bg374_ct_closure_return_fail.fd, test_bg374_ct_ok.fd,
+      test_bg374_ct_str_eq_fail.fd (+1 more). To verify: build the compiler
+      and run the tests. Watch: compiler/checks.fd peir_ct_check (the backend
+      IR check) is NOT changed (not my file); the type checker now rejects
+      these cases before it runs.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG375. **`sandbox { }` lets IO through a `dyn Trait` method call or a
       generic function whose bound method does IO; a compiled program prints
       inside the sandbox.** compiler/typechecker.fd
       TypeChecker_check_expr_inner, Expr::MethodCall (the `sandbox_depth > 0`
@@ -4759,7 +5991,18 @@ Same rules as the first run:
       Confirmed Nov 27 (`fid check`, `fid run` runtime panic, `fid emit` pe_ir
       prints). TypeChecker_check_sandbox_call is unchanged between fb4 and the
       repo. Confidence: high.
-- [ ] BG376. **`@no-unbounded` (and so `@crashfree`, `@medical`,
+      Fix written Nov 27 (night), not run yet: inside `sandbox { }`, `d.t()`
+      on a dyn T or a bound type is rejected when any impl of T.t has a
+      revoked effect. A call to a generic fn takes the effects of every impl
+      of every method of its bounds. Files: compiler/typechecker.fd. Test:
+      test_bg375_sandbox_dyn_fail.fd, test_bg375_sandbox_generic_fail.fd. To
+      verify: build the compiler and run the tests. Watch: the generic-call
+      part over-approximates. It counts every method of the bound traits, not
+      only the ones called, and it does not follow a second generic helper.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG376. **`@no-unbounded` (and so `@crashfree`, `@medical`,
       `@safety-critical`, `@autosar`, `@realtime`) accepts `loop { }`: only
       `while` is looked for.** compiler/typechecker.fd scan_stmt_for_while
       (Stmt::While pushes a site; Stmt::Loop only recurses into its body and
@@ -4776,7 +6019,18 @@ Same rules as the first run:
       loop { } return x; }` -> no errors. With `while true { }` both are
       rejected. Confirmed Nov 27 (`fid check`, `fid run`). scan_stmt_for_while
       is unchanged between fb4 and the repo. Confidence: high.
-- [ ] BG377. **`@realtime` accepts allocation (string `+`, f-strings, `clone`,
+      Fix written Nov 27 (night), not run yet: `loop { }` now counts as
+      unbounded for @no-unbounded (so also @crashfree, @medical and the others
+      that include it) and for @realtime. Files: compiler/typechecker.fd.
+      Test: test_bg376_crashfree_loop_fail.fd,
+      test_bg376_no_unbounded_loop_fail.fd, test_bg376_realtime_loop_fail.fd.
+      To verify: build the compiler and run the tests. Watch: loop sites from
+      scan_for_while_loops can now be negative. Only the two callers above
+      read them.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG377. **`@realtime` accepts allocation (string `+`, f-strings, `clone`,
       `Box::new`), `spawn`/`await`, dynamic dispatch through `dyn`, and
       indirect recursion.** compiler/typechecker.fd TypeChecker_realtime_one
       with tc_rt_forbidden_call (a fixed name list scanned over
@@ -4797,7 +6051,19 @@ Same rules as the first run:
       rejected E099). Confirmed Nov 27 (`fid check`). TypeChecker_realtime_one
       and tc_rt_forbidden_call are unchanged between fb4 and the repo.
       Confidence: high.
-- [ ] BG378. **`@no-indirect` and `@no-recursion` are still bypassed by a
+      Fix written Nov 27 (night), not run yet: @realtime now rejects: - spawn
+      and await; - string `+`, f-strings and `+=`; - allocating builtin
+      methods (.clone, .to_str, .split, ...) and allocating Type::f calls
+      (Box::new, Vec::with_capacity, Vec::filled, ...); - calls through dyn; -
+      recursion cycles through other free functions. Files:
+      compiler/typechecker.fd. To verify: build the compiler and run the test.
+      Watch: a builtin-named method (.map, .to_str, ...) called on a user type
+      is skipped only if some impl in the program defines a method of that
+      name. Indirect recursion is checked only for free @realtime functions;
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG378. **`@no-indirect` and `@no-recursion` are still bypassed by a
       function value taken from a call or method result (`val g = v.get(0);
       g(x)`, `val g = mk(); g(x)`, `v.get(0)(x)`): BG152's fix covers only
       some initializers.** compiler/typechecker.fd tc_let_is_fn_value (an
@@ -4820,7 +6086,23 @@ Same rules as the first run:
       2. With `val g: fn(i64) -> i64 = mk();` (typed) it is rejected.
       Confirmed Nov 27 (`fid check`, `fid run`). tc_let_is_fn_value is
       unchanged between fb4 and the repo. Confidence: high.
-- [ ] BG379. **A typed pattern binding (`Option::Some(v: str)`) is never
+      Fix written Nov 27 (night), not run yet: an untyped local counts as a
+      function value when it is bound to: - a call or method call that returns
+      a function type (functions and methods of the program), or - an element
+      accessor (.get, .pop, .first, .last, .unwrap, ...). `v.get(0)(x)`, which
+      the parser turns into a `__pcall_k` local, counts as an indirect call.
+      Files: compiler/typechecker.fd. Test:
+      test_bg378_no_indirect_call_chain_fail.fd,
+      test_bg378_no_indirect_call_result_fail.fd,
+      test_bg378_no_recursion_vec_get_fail.fd. To verify: build the compiler
+      and run the tests. Watch: the rule is used only when the local is then
+      called. A local named like a core function that the program does not
+      define (`val max = v.get(0); max(a, b)`) would now be taken for an
+      indirect call.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG379. **A typed pattern binding (`Option::Some(v: str)`) is never
       checked against the payload's type: the checker types `v` as the
       payload, lowering as the annotation, so the program reads an integer as
       a string or a float (wrong output, a crash on pe_ir).**
@@ -4844,7 +6126,18 @@ Same rules as the first run:
       emit` pe_ir). TypeChecker_pattern_binding_types and
       TypeChecker_check_enum_pattern are unchanged between fb4 and the repo.
       Confidence: high.
-- [ ] BG380. **An integer pattern on an `f64` scrutinee is accepted, and the
+      Fix written Nov 27 (night), not run yet: a typed binding must have the
+      payload's kind (integer, float, bool or str); other types must have the
+      same type name. Integers of another width are left alone. This covers
+      both the statement match and the value match, since both call
+      check_enum_pattern. Files: compiler/typechecker.fd. Test:
+      test_bg379_binding_type_f64_fail.fd,
+      test_bg379_binding_type_str_fail.fd, test_bg379_binding_types_ok.fd. To
+      verify: build the compiler and run the tests. Watch: low.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG380. **An integer pattern on an `f64` scrutinee is accepted, and the
       three backends disagree: `fid run` panics, C matches, pe_ir does not.**
       compiler/typechecker.fd TypeChecker_check_literal_pattern (BG129's check
       accepts the arm whenever TypeChecker_types_compatible(scrutinee, i64),
@@ -4863,7 +6156,19 @@ Same rules as the first run:
       be a type error (or one defined result). Confirmed Nov 27 (`fid run`,
       `fid ccompile`, `fid emit` pe_ir). TypeChecker_check_literal_pattern is
       unchanged between fb4 and the repo. Confidence: high.
-- [ ] BG381. **`?` on an `Option` inside a function returning `Result<T, E>`
+      Fix written Nov 27 (night), not run yet: an integer pattern on a float
+      scrutinee is now an error. An integer pattern that does not fit the
+      scrutinee's integer type (300 against a u8) is reported as "can never
+      match". Files: compiler/typechecker.fd. Test:
+      test_bg380_int_pattern_f64_fail.fd,
+      test_bg380_int_pattern_u8_range_fail.fd. To verify: build the compiler
+      and run the tests. Watch: a stdlib match of a narrow-typed value against
+      a literal outside its signed range (for example 0x80000000 on an i32)
+      would now be an error. I did not scan the stdlib for this.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG381. **`?` on an `Option` inside a function returning `Result<T, E>`
       (and on a `Result` inside one returning `Option`) is accepted: `None`
       becomes an `Err` holding the word 0, so a struct error faults on
       pe_ir.** compiler/typechecker.fd TypeChecker_check_try_error_type
@@ -4887,7 +6192,17 @@ Same rules as the first run:
       Confirmed Nov 27 (`fid run`, `fid emit` pe_ir).
       TypeChecker_check_try_error_type is unchanged between fb4 and the repo.
       Confidence: high.
-- [ ] BG382. **`@gas(N)` counts nothing for a method call: `s.heavy()`
+      Fix written Nov 27 (night), not run yet: `?` on an Option inside a
+      function returning a Result, or the reverse, is now a type error. `try {
+      }` blocks are exempt; closures use their own return type. Files:
+      compiler/typechecker.fd. Test: test_bg381_try_option_in_result_fail.fd,
+      test_bg381_try_result_in_option_fail.fd. To verify: build the compiler
+      and run the tests. Watch: a heuristic scan of stdlib, compiler and tools
+      for `f(..)?` / `.m(..)?` mixing Option and Result found none.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG382. **`@gas(N)` counts nothing for a method call: `s.heavy()`
       (inherent or trait method) is free, however much it costs.**
       compiler/typechecker.fd gas_total (callees from scan_stmts_for_calls
       with g_scan_dot_methods off: a method call is recorded under its bare
@@ -4908,7 +6223,20 @@ Same rules as the first run:
       E093 "total gas cost is 12011". Confirmed Nov 27 (`fid check`).
       gas_total and TypeChecker_verify_gas are unchanged between fb4 and the
       repo. Confidence: high.
-- [ ] BG383. **`spawn f(x)` of a plain (non-async) function that returns a
+      Fix written Nov 27 (night), not run yet: callees are now scanned with
+      g_scan_dot_methods on. `Type::f` is recorded as "Type_f" and is found. A
+      method call ".m" costs as much as the dearest method named m in the
+      program: the receiver type is not known here, so this is a sound upper
+      bound. Files: compiler/typechecker.fd. Test:
+      test_bg382_gas_method_fail.fd, test_bg382_gas_pipe_fail.fd,
+      test_bg382_gas_trait_method_fail.fd. To verify: build the compiler and
+      run the tests. Watch: in a @gas fn, a builtin call like `v.len()` is
+      charged the cost of a user method named `len` if the program has one (an
+      over-charge). `S::new()` calls are now charged; they were free before.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG383. **`spawn f(x)` of a plain (non-async) function that returns a
       struct or a fixed array passes no result slot: the callee gets its
       arguments shifted and every backend crashes (`fid run` sees the argument
       as `void`).** compiler/lower.fd Lowerer_spawn_call (and Expr::Spawn in
@@ -4932,7 +6260,19 @@ Same rules as the first run:
       ccompile, emit, emit --nat as above). Lowerer_spawn_call and
       Lowerer_spawn_wrapper unchanged between fb4 and the repo. Confidence:
       high.
-- [ ] BG384. **An array value pushed into a `Vec<[T; N]>` or put in an enum
+      Fix written Nov 27 (night), not run yet: a callee with a struct/array
+      result is started through an IR wrapper `__spawn_N(env, args..)`. The
+      wrapper passes a heap result block first and returns its address. await
+      copies a struct out and frees it, and uses an array block as it is (as
+      for async tasks). Files: compiler/lower.fd. Test:
+      test_bg383_spawn_struct_result.fd. To verify: build the compiler and run
+      the test. Watch: lw-a's BG272 f32 hook (`__spawnw_N`) is kept. It
+      applies only when entry == callee, that is when my wrapper is not used.
+      own_on is off while the wrapper is emitted.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [~] BG384. **An array value pushed into a `Vec<[T; N]>` or put in an enum
       payload keeps only the address of the local array: the elements are lost
       or garbage after the function returns or the loop goes on.**
       compiler/lower.fd Lowerer_rc_kind (a `Type::Array` is RC_NONE, so
@@ -4960,7 +6300,17 @@ Same rules as the first run:
       slot's IrType, a pointer). Confirmed Nov 27 (run, ccompile, emit, emit
       --nat). Lowerer_rc_kind and Lowerer_rc_tid unchanged between fb4 and the
       repo. Confidence: high.
-- [ ] BG385. **`spawn f(p)` with a plain struct argument hands the thread the
+      Fix written Nov 27 (night), not run yet: (not run) Files:
+      compiler/lower.fd. Test: test_bg384_array_containers.fd. To verify:
+      build the compiler and run the test. Watch: the array copies for enum
+      payloads and closures leak. The closure copies are freed by BG431's env
+      release when the closure variable is only called. Map values of array
+      type also go inline (HashMap_insert_mem).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them). Left: the heap copies of an array put in a tuple
+      or an enum payload are never freed.
+- [x] BG385. **`spawn f(p)` with a plain struct argument hands the thread the
       address of the caller's local, not a copy: a later write by the caller
       shows in the thread, and a handle returned from the function that
       spawned reads a dead frame.** compiler/lower.fd Lowerer_spawn_call: for
@@ -4988,7 +6338,16 @@ Same rules as the first run:
       27 (ccompile, emit, --nat, wasm; `fid run` timed out on the 20M-step
       loop). Lowerer_spawn_call unchanged between fb4 and the repo.
       Confidence: high.
-- [ ] BG386. **A fixed-array result through a function value (`val g = mk;
+      Fix written Nov 27 (night), not run yet: a struct, enum or array
+      argument (not a reference) is heap-copied before p_thread_spawn. The IR
+      wrapper frees each copy after the call. Files: compiler/lower.fd. Test:
+      test_bg385_spawn_struct_copy.fd. To verify: build the compiler and run
+      the test. Watch: the copy is shallow (the type checker rejects spawning
+      a struct that owns strings).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG386. **A fixed-array result through a function value (`val g = mk;
       g(3)`, a closure `fn(k) -> [i64; 3]`, `apply(mk, 4)`) is garbage on
       emit, --nat and wasm: the IR optimizer's closure devirtualisation puts
       the env before the result pointer.** compiler/iropt.fd
@@ -5014,7 +6373,16 @@ Same rules as the first run:
       on run/C, 5197968 / 0 on emit / --nat. Confirmed Nov 27 (run, ccompile,
       emit, --nat; bisected with FID_IROPT_OFF). iro_cp_direct_args and
       iro_closure_devirt unchanged between fb4 and the repo. Confidence: high.
-- [ ] BG387. **A trait method returning a fixed array, called through `dyn`,
+      Fix written Nov 27 (night), not run yet: the buffer (cargs[0]) of an
+      IrType::Array CallPtr result goes before the env, as a Struct result's
+      does. Files: compiler/iropt.fd. Test: test_bg386_fnvalue_array.fd. To
+      verify: build the compiler and run the test. Watch: the devirtualised
+      direct Call keeps the ret type Array (its result is unused). The
+      backends must accept a Call with an Array ret type.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG387. **A trait method returning a fixed array, called through `dyn`,
       crashes on run, C, emit and --nat (and gives a wrong value on wasm):
       BG184's fix covers struct results only.** compiler/lower.fd
       Lowerer_lower_method_call, the `dyn:` receiver branch (`match dyn_ret {
@@ -5036,7 +6404,15 @@ Same rules as the first run:
       right. Confirmed Nov 27 (all five backends). Lowerer_lower_method_call,
       Lowerer_dyn_sret_all and Lowerer_dyn_sret_wrapper unchanged between fb4
       and the repo. Confidence: high.
-- [ ] BG388. **`spawn f(..)` ignores default parameters and named arguments:
+      Fix written Nov 27 (night), not run yet: an Array result goes through
+      the `__dsret` wrapper (heap block, StructCopy out, p_free), as a Struct
+      result does. Files: compiler/lower.fd. Test:
+      test_bg387_dyn_array_result.fd. To verify: build the compiler and run
+      the test. Watch: low.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG388. **`spawn f(..)` ignores default parameters and named arguments:
       `spawn f(1)` for `fn f(a: i64, b: i64 = 10)` passes no `b`, and `spawn
       g(b: 2, a: 1)` passes the values in source order.** compiler/lower.fd
       Lowerer_lower_expr, `Expr::Spawn(e)` → `Expr::Call(callee, args)` arm
@@ -5058,7 +6434,15 @@ Same rules as the first run:
       expected) and y = 304 everywhere (403 expected). Confirmed Nov 27 (all
       five backends). The Expr::Spawn arm is identical in fb4 and the repo;
       Lowerer_spawn_call unchanged. Confidence: high.
-- [ ] BG389. **A method call that leaves out a parameter with a default
+      Fix written Nov 27 (night), not run yet: the arguments go through
+      Lowerer_resolve_call_args (named arguments to positions, defaults filled
+      in) before lowering. Files: compiler/lower.fd. Test:
+      test_bg388_spawn_defaults.fd. To verify: build the compiler and run the
+      test. Watch: low.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG389. **A method call that leaves out a parameter with a default
       (`c.m(2)` for `fn m(self, a: i64, b: i64 = 7)`) is accepted and then
       called without it: `fid run` faults, the C does not compile, the native
       backends read a stale register.** compiler/lower.fd
@@ -5082,7 +6466,17 @@ Same rules as the first run:
       `C::m(c, 2)` gives 2020 / 1021). Confirmed Nov 27 (all five backends).
       Lowerer_resolve_call_args unchanged between fb4 and the repo;
       Lowerer_lower_method_call unchanged (checked above). Confidence: high.
-- [ ] BG390. **A variadic method (`fn tot(self, ...ns: i64)`) called with
+      Fix written Nov 27 (night), not run yet: the impl method's Func
+      (Lowerer_lookup_impl_method, through the mangled name) gives the
+      parameter names and defaults. Missing defaults are filled in and named
+      arguments are put in order, only when a default or a named argument is
+      present. Files: compiler/lower.fd. Test: test_bg389_method_defaults.fd.
+      To verify: build the compiler and run the test. Watch: generic impls
+      keep their raw defaults.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG390. **A variadic method (`fn tot(self, ...ns: i64)`) called with
       several arguments is accepted, but the arguments are never packed into
       the Vec: `fid run`/wasm drop them, emit and --nat crash in Vec_len.**
       compiler/lower.fd Lowerer_lower_method_call (arguments lowered one by
@@ -5103,7 +6497,13 @@ Same rules as the first run:
       Lowerer_lower_method_call, Lowerer_pack_variadic and
       Lowerer_lower_call_expr unchanged between fb4 and the repo. Confidence:
       high.
-- [ ] BG391. **Default parameter values of a generic function are lost at
+      Fix written Nov 27 (night), not run yet: (not run) Files:
+      compiler/lower.fd. Test: test_bg390_method_variadic.fd. To verify: build
+      the compiler and run the test. Watch: low.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG391. **Default parameter values of a generic function are lost at
       monomorphization: `idd(1)` for `fn idd<T>(x: T, k: i64 = 3) -> i64`
       passes 0, and named arguments to a generic function get 0 for the
       defaulted ones.** compiler/mono.fd instantiate (the parameter copy:
@@ -5125,7 +6525,16 @@ Same rules as the first run:
       emit, --nat and wasm all print 0, 9, 8, 20. Confirmed Nov 27 (all five
       backends). mono.fd instantiate unchanged between fb4 and the repo.
       Confidence: high.
-- [ ] BG392. **Every call of a user `impl` method that returns a `str` or a
+      Fix written Nov 27 (night), not run yet: the instance's (and a
+      substituted closure's) parameters keep has_default and default_expr (the
+      default run through subst_expr), so Lowerer_resolve_call_args fills
+      `idd(1)` / named-argument calls from the real defaults instead of 0.
+      Files: compiler/mono.fd. Test: test_bg391_generic_default_params.fd. To
+      verify: build the compiler and run the test. Watch: low.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG392. **Every call of a user `impl` method that returns a `str` or a
       `Vec` (any owned value) leaks the returned value (bound to a variable or
       used as a temporary); the same body as a free function does not leak.
       `StringBuilder.to_str()` leaks on every call for the same reason.**
@@ -5156,7 +6565,20 @@ Same rules as the first run:
       l24.fd). Confirmed Nov 27 (`fid run --leaks`, probes l4.fd, l5.fd,
       l6.fd). Cited functions unchanged since fb4 apart from the json line.
       Confidence: high.
-- [ ] BG393. **An enum pattern against a scrutinee that is not an enum is
+      Fix written Nov 27 (night), not run yet: each method's result type is
+      also registered under its mangled name (`Type_method`, `Self` resolved;
+      a program function of that name still takes the lookup over).
+      Lowerer_rc_note_call and Lowerer_rc_note_sret then make the result a
+      temporary. Files: compiler/lower.fd. Test:
+      test_bg392_method_owned_result.fd. To verify: build the compiler and run
+      the test. Watch: behaviour change for every method returning a
+      str/Vec/map/Box or an owning struct: its result is now owned the way a
+      free function's is. Lowerer_lookup_func_ret_type now answers for mangled
+      names too.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG393. **An enum pattern against a scrutinee that is not an enum is
       accepted: `match v.pop() { Option::Some(x) => .. }` on a `Vec<str>`
       matches nothing, on a `Vec<i64>` binds the tag word, and `match s: str {
       Option::Some(y) => .. }` crashes.** compiler/typechecker.fd
@@ -5179,7 +6601,23 @@ Same rules as the first run:
       ("the value matched is a i64, not an Option"). Confirmed Nov 27 (`fid
       check` and `fid run`, probes v1.fd, m1.fd). Functions unchanged since
       fb4. Confidence: high.
-- [ ] BG394. **pe_ir: `read_stdin(n)` never returns None at the end of input
+      Fix written Nov 27 (night), not run yet: a variant pattern against a
+      scrutinee known to be no enum (a number, bool, str, Vec/HashMap, struct,
+      tuple, array, fn or dyn) is now an error: "is a variant of enum
+      'Option', but the value matched is a 'i64', which is no enum". Unknown,
+      parameter and inferred types are left alone, and so are the compiler and
+      core modules. Files: compiler/typechecker.fd. Test:
+      test_bg393_enum_pattern_on_int_fail.fd,
+      test_bg393_enum_pattern_on_str_fail.fd,
+      test_bg393_enum_pattern_on_struct_fail.fd,
+      test_bg489_result_pattern_on_str_fail.fd. To verify: build the compiler
+      and run the tests. Watch: stdlib code where the checker gives a
+      scrutinee a wrong concrete type would now get an error. core and
+      compiler::* are exempt.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG394. **pe_ir: `read_stdin(n)` never returns None at the end of input
       (it gives Some("") forever), so the usual `while` loop over `read_stdin`
       chunks never ends.** stdlib/pe_runtime/base.fd pert_read_stdin (returns
       `p_str_adopt(buf)` with `got == 0` at EOF; sets pert_stdin_eof_flag but
@@ -5199,7 +6637,16 @@ Same rules as the first run:
       1000000` (without the cap: an endless loop). With `ab\0cdefgh` on stdin:
       --nat `total 9`, run/C/pe_ir `total 7`. Confirmed Nov 27 (all four
       backends, probe i3.fd). Runtime read from the repo. Confidence: high.
-- [ ] BG395. **X.509 name constraints are bypassed through the subject CN: a
+      Fixed Nov 27 (night): returns the null str when nothing was read (n > 0)
+      or n < 0, as C/--nat; frees its 8-byte read cell (leaked before). NUL
+      handling unchanged (matches run/C). Files: stdlib/pe_runtime/base.fd.
+      Test: test_bg394_read_stdin_eof.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG395. **X.509 name constraints are bypassed through the subject CN: a
       name-constrained CA can issue a SAN-less leaf with CN=<any host>,
       `x509_verify_chain` accepts it and `x509_matches_host` matches the host
       from the CN.** stdlib/x509.fd x509_nc_names (only SAN
@@ -5220,7 +6667,19 @@ Same rules as the first run:
       permitted: dns:bank.test"). `openssl verify` rejects both. Confirmed Nov
       27 (C backend; probe r2/crypto/p8.fd, certs r2/crypto/pki/int.pem,
       bad.pem, bad2.pem). Confidence: high.
-- [ ] BG396. **gRPC decompression bomb: the 4 MiB message limit is checked on
+      Fixed Nov 27 (night): x509_nc_names adds "dns:<CN>" for a leaf (not a
+      CA) with no DNS or IP SAN when the CN looks like a DNS name (new
+      x509_cn_hostlike: [A-Za-z0-9-_*] with at least one inner dot, as OpenSSL
+      decides it), the same condition under which x509_matches_host uses the
+      CN. Single-label CNs ("mail", "localhost") are not constrained, as in
+      OpenSSL. Files: stdlib/x509.fd. Test: test_bg395_x509_nc_subject_cn.fd.
+      Run with the fid of Nov 27 01:25 on the tree's sources (the fixed code
+      is stdlib, a runtime, a script or a tool the old fid runs): the test
+      passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG396. **gRPC decompression bomb: the 4 MiB message limit is checked on
       the compressed bytes only; `gr_unpack` gunzips with no limit (up to 256
       MB, i.e. 2 GiB of Vec<i64>), so a 7.8 KB request reaches the handler as
       an 8 MB message.** stdlib/grpc.fd gr_unpack
@@ -5238,7 +6697,13 @@ Same rules as the first run:
       8000000 bytes", http 200, grpc-status 0 (limit 4,194,304). Should be
       RESOURCE_EXHAUSTED. Confirmed Nov 27 (C backend; probe
       r2/crypto/p15.fd). Confidence: high.
-- [ ] BG397. **A by-value `self: T` struct parameter can be changed (field
+      Fixed Nov 27 (night): . Run with the fid of Nov 27 01:25 on the tree's
+      sources (the fixed code is stdlib, a runtime, a script or a tool the old
+      fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG397. **A by-value `self: T` struct parameter can be changed (field
       assignment or an `&mut self` method call) and the change leaks into the
       caller's variable, against reference.md §5.3 ("a by-value parameter of
       type Vec, HashMap or a struct may not be changed") and §8.1 copy
@@ -5270,7 +6735,22 @@ Same rules as the first run:
       TypeChecker_check_param_change and the `!= "self"` exclusion are
       unchanged between fb4/compiler and the repo; compiler/cowcheck.fd is
       byte-identical. Confidence: high.
-- [ ] BG398. **`dnp3_objhdr_decode` reads past the buffer and panics on a
+      Fix written Nov 27 (night), not run yet: a by-value self (a bare `self`
+      or `self: T`) of struct, Vec or HashMap type is now a by-value
+      parameter. Changing it is an error: "'self' is a by-value receiver of
+      'm' and cannot be changed". Files: compiler/typechecker.fd,
+      stdlib/buffer.fd, stdlib/memo.fd, docs/stdlib/buffer.md,
+      docs/stdlib/memo.md. Test: test_bg397_byte_cursor_lp.fd,
+      test_bg397_memo.fd, test_bg397_self_field_assign_fail.fd,
+      test_bg397_self_mut_method_fail.fd (+1 more). To verify: build the
+      compiler and run the tests. Watch: I ran a regex scan of compiler,
+      stdlib, tools, tests and examples. It looked at impl methods and free
+      functions with a by-value `self` that assign, push, take `&mut` or call
+      an &mut-self method.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG398. **`dnp3_objhdr_decode` reads past the buffer and panics on a
       truncated object header (and accepts length < 5 link frames).**
       stdlib/dnp3.fd dnp3_objhdr_decode (also dnp3_link_parse):
       dnp3_objhdr_decode checks only `pos + 3 <= b.len()` (group, variation,
@@ -5289,7 +6769,17 @@ Same rules as the first run:
       index out of bounds ... called from dnp3_objhdr_decode"; "len0 ok=true
       func=4"). CRC-16/DNP itself checked correct (check value 0xEA82).
       Confidence: high.
-- [ ] BG399. **Markdown XSS: `md_safe_url` lets `java<TAB>script:` and a
+      Fixed Nov 27 (night): dnp3_objhdr_decode checks the range/count bytes
+      against b.len() per qualifier and returns ok=false for a cut-short
+      header, start > stop, or an unknown qualifier; dnp3_link_parse rejects
+      LENGTH < 5 ("bad length"). Files: stdlib/dnp3.fd. Test:
+      test_bg398_dnp3_objhdr_bounds.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG399. **Markdown XSS: `md_safe_url` lets `java<TAB>script:` and a
       leading control character through, which browsers run as javascript:
       links.** stdlib/markdown.fd md_safe_url (used by md_inline for
       [text](url), ![alt](src) and autolinks): md_safe_url lower-cases and
@@ -5308,7 +6798,17 @@ Same rules as the first run:
       tab/LF/CR and C0 controls before the scheme test, or allow-list
       http/https/mailto/relative). Confirmed Nov 27 (fid run, bytes checked
       with od -c). Confidence: high.
-- [ ] BG400. **PNG and BMP decoders panic on hostile dimensions (checked i64
+      Fixed Nov 27 (night): md_safe_url tests the scheme on the URL with every
+      byte <= 32 removed (covers WHATWG's tab/LF/CR removal and leading
+      C0/space stripping), so java\tscript:, \x01javascript:, vb\tscript:,
+      da\nta: become "#"; other URLs are returned unchanged. Files:
+      stdlib/markdown.fd. Test: test_bg399_md_url_controls.fd. Run with the
+      fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG400. **PNG and BMP decoders panic on hostile dimensions (checked i64
       overflow in the size arithmetic) instead of failing, and PNG inflates
       IDAT with no limit tied to width x height.** stdlib/image.fd
       image_png_decode (`stride = w * bpp`, `raw = zlib_decompress(idat)`,
@@ -5331,7 +6831,20 @@ Same rules as the first run:
       bytes) decodes "width 1" after inflating all 8 MB (want: width 0 for the
       first two, inflate capped at h*(stride+1) for the third). Confirmed Nov
       27 (fid run and C, all three; found by two passes). Confidence: high.
-- [ ] BG401. **physics rays use a 10-step Newton square root that has not
+      Fixed Nov 27 (night): PNG: width/height > 2^31-1 rejected; h*(stride+1)
+      checked by division against the 256 MB cap zlib_decompress already had
+      (bigger images failed before too), then IDAT inflated with new
+      compress.fd zlib_decompress_max(data, need) (zlib_decompress =
+      zlib_decompress_max(data, 256 MB)) — a stream inflating past the
+      scanline size is now an error (width 0) found as ... Files:
+      stdlib/image.fd, stdlib/compress.fd. Test:
+      test_bg400_image_hostile_dims.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG401. **physics rays use a 10-step Newton square root that has not
       converged: a direction of length 1000 is "normalized" to 0.77, so hit
       distances are wrong (500 reported as 648).** stdlib/physics.fd
       physics_ray_new, physics_ray_vs_circle, physics_circle_distance
@@ -5350,7 +6863,16 @@ Same rules as the first run:
       circle (1000,0) r=200 -> 797.595 (want 800); unit ray along y=0 vs
       circle (10,5) r=5 (tangent) -> -1 (want 10). Confirmed Nov 27 (fid run;
       expected values by hand/Python math.sqrt). Confidence: high.
-- [ ] BG402. **Gorilla timestamps: a delta-of-delta of exactly 64, 256 or 2048
+      Fixed Nov 27 (night): `use math;` and math_sqrt in
+      physics_circle_distance, physics_ray_new and physics_ray_vs_circle in
+      place of the 10-step Newton loops (tangent ray: sqrt(0) = 0, no 0/0).
+      Files: stdlib/physics.fd. Test: test_bg401_physics_sqrt.fd. Run with the
+      fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG402. **Gorilla timestamps: a delta-of-delta of exactly 64, 256 or 2048
       decodes as -64, -256, -2048 (silent data corruption).**
       stdlib/timeseries.fd ts_gorilla_append (bucket ranges) vs
       ts_gorilla_decode (ts_sext): the encoder puts dod in the 7/9/12-bit
@@ -5363,7 +6885,17 @@ Same rules as the first run:
       true. Trigger: times 0, 10, 84 (dod 64), 414 (dod 256), 2792 (dod 2048),
       any values: `ts_gorilla_decode(ts_gorilla_encode(&s))` gives 0, 10, -44,
       -354, -2712. Confirmed Nov 27 (fid run). Confidence: high.
-- [ ] BG403. **SunSpec meter model 203 is decoded at wrong register offsets:
+      Fixed Nov 27 (night): decoder side: new ts_dod_bits maps the n-bit
+      pattern that sign-extends to -2^(n-1) to +2^(n-1) (the encoder's buckets
+      are the paper's [-63,64]/[-255,256]/[-2047,2048]); the encoded format is
+      unchanged, so blocks written before decode right too. Files:
+      stdlib/timeseries.fd. Test: test_bg402_gorilla_dod_edges.fd. Run with
+      the fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib,
+      a runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG403. **SunSpec meter model 203 is decoded at wrong register offsets:
       frequency reads real power, power reads phase B, voltage reads phase C,
       energy reads per-phase totals.** stdlib/sunspec.fd sunspec_meter (and
       its doc comment): sunspec_meter takes `off` as the first data point
@@ -5383,7 +6915,17 @@ Same rules as the first run:
       V=232 Hz=1000 W=0 exp=0 imp=0. Confirmed Nov 27 (fid run; layout checked
       against github.com/sunspec/models json/model_203.json). Confidence:
       high.
-- [ ] BG404. **DLMS A-XDR decoder: no bounds checks (truncated value panics),
+      Fixed Nov 27 (night): sunspec_meter reads model 203 at the
+      model_203.json data offsets (PhV 5, V_SF 13, Hz 14, Hz_SF 15, W 16, W_SF
+      20, TotWhExp 36, TotWhImp 44, TotWh_SF 52); doc comment corrected.
+      Files: stdlib/sunspec.fd. Test: test_bg403_sunspec_meter_offsets.fd. Run
+      with the fid of Nov 27 01:25 on the tree's sources (the fixed code is
+      stdlib, a runtime, a script or a tool the old fid runs): the test
+      passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG404. **DLMS A-XDR decoder: no bounds checks (truncated value panics),
       an attacker-chosen element count loops for ever, and a bad element
       inside a structure is reported ok.** stdlib/dlms.fd dlms_decode,
       axdr_read_len: dlms_decode reads fixed-size values, octet/visible
@@ -5401,7 +6943,18 @@ Same rules as the first run:
       of [1, 0x88, 0x3F, 0xFF x7] -> still running after 30 s (killed by
       timeout); of [2, 1, 99] -> ok=true count=1. Confirmed Nov 27 (fid run,
       all three). Confidence: high.
-- [ ] BG405. **LwM2M Write ignores the request URI: a PUT to one resource can
+      Fixed Nov 27 (night): dlms_decode bounds-checks every fixed-size value,
+      string and date-time; axdr_read_len fails on a cut-short, indefinite
+      (0x80) or >4-byte length; a structure/array count larger than the bytes
+      left fails at once; a failing element fails its container; nesting is
+      limited to DLMS_AXDR_MAX_DEPTH (64). Failures give ok=false, next=pos.
+      Files: stdlib/dlms.fd. Test: test_bg404_dlms_axdr_bounds.fd. Run with
+      the fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib,
+      a runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG405. **LwM2M Write ignores the request URI: a PUT to one resource can
       write any resource of any object, and SenML values bypass the resource's
       defined type.** stdlib/lwm2m.fd lwm2m_handle_request (PUT/POST branch),
       lwm2m_senml_write, lwm2m_tlv_write: lwm2m_handle_request checks that
@@ -5424,7 +6977,19 @@ Same rules as the first run:
       level (Integer) now a string. Confirmed Nov 27 (fid run: "code=2.04
       manufacturer=EVIL /5/0/1=http://x/fw battery=str in int"). Confidence:
       high.
-- [ ] BG406. **IEC 61850 GOOSE/SV decoders panic on a truncated or lying BER
+      Fixed Nov 27 (night): new lwm2m_senml_write_at(s, text, obj, inst, res,
+      ri) and lwm2m_tlv_write_at(s, obj, inst, res, b, replace);
+      lwm2m_handle_request uses them with the URI's obj/inst/res/ri. SenML
+      records outside the URI, or whose value kind (vs/vb/vlo/vd/v) does not
+      match the defined (else existing) type, fail the whole pack, which is
+      checked before anything is applied. Files: stdlib/lwm2m.fd. Test:
+      test_bg405_lwm2m_write_target.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG406. **IEC 61850 GOOSE/SV decoders panic on a truncated or lying BER
       length (any station-bus multicast frame can kill a subscriber), and
       report no error.** stdlib/iec61850.fd ber_read, goose_decode_pdu,
       sv_decode (ber_str, ber_get_uint): ber_read checks only `pos + 2 <=
@@ -5440,7 +7005,18 @@ Same rules as the first run:
       a real one. Trigger: `goose_decode_pdu` of 61 04 80 10 41 42 (gocbRef
       claims 16 bytes, 2 present) -> Panic: Vec index out of bounds in ber_str
       (want a decode error). Confirmed Nov 27 (fid run). Confidence: high.
-- [ ] BG407. **DDS/RTPS reader hangs on one GAP or HEARTBEAT datagram with a
+      Fixed Nov 27 (night): ber_read fails on a cut-short/indefinite/>4-byte
+      long-form length and on content past the buffer; members must fit their
+      container (ber_member); new goose_decode_checked / sv_decode_checked
+      return {ok, error, pdu/asdu} (outer tag 0x61/0x62 required, t 8 bytes,
+      booleans 1 byte, integers 1..8 bytes) Files: stdlib/iec61850.fd. Test:
+      test_bg406_iec61850_ber_bounds.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG407. **DDS/RTPS reader hangs on one GAP or HEARTBEAT datagram with a
       far sequence number (one loop step per skipped sample).** stdlib/dds.fd
       rtps_reader_receive (GAP and HEARTBEAT branches), rtps_reader_store,
       rtps_reader_advance: a GAP is applied with `while sn < sub.set_base {
@@ -5458,7 +7034,18 @@ Same rules as the first run:
       still running after 40 s (killed by timeout); expected: next = 2^40 at
       once. Confirmed Nov 27 (fid run, GAP case; the HEARTBEAT loop is the
       same shape, read only). Confidence: high.
-- [ ] BG408. **HTTP server: whitespace before the colon hides a framing
+      Fixed Nov 27 (night): GAP ranges and a HEARTBEAT's firstSN move `next`
+      (rtps_reader_skip_to: one step per pending sample, delivering pending
+      ones on the way) instead of one store per sequence number; a GAP range
+      ahead of `next` is kept as one [lo, hi) range (new
+      RtpsReader.gap_lo/gap_hi) applied by rtps_reader_advance when reached.
+      Files: stdlib/dds.fd. Test: test_bg407_dds_gap_far.fd. Run with the fid
+      of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG408. **HTTP server: whitespace before the colon hides a framing
       header, so `Content-Length : 27` is ignored and its body is served as
       the next request (smuggling; not covered by BG177's fix).**
       stdlib/http.fd http_parse_head (header name = bytes up to ':'),
@@ -5478,7 +7065,18 @@ Same rules as the first run:
       27\r\n\r\nGET /smuggled HTTP/1.1\r\n\r\n" -> [POST /a] body=<> then [GET
       /smuggled] (want a 400 and close). Confirmed Nov 27 (ccompile, output as
       stated). Confidence: high.
-- [ ] BG409. **CoAP Block2: an over-long Block option from the wire gives a
+      Fixed Nov 27 (night): http_read_message answers 400 to a request with a
+      malformed field line (new hs_head_bad_fields: whitespace/control in the
+      name or before the colon, no colon, empty name, obs-fold line), RFC 9112
+      §5.1/§5.2; for a response the framing header names are compared with
+      trailing SP/HTAB trimmed (hs_name_trim), as §5.1 has a proxy do. Files:
+      stdlib/http.fd. Test: test_bg408_http_space_before_colon.fd. Run with
+      the fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib,
+      a runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG409. **CoAP Block2: an over-long Block option from the wire gives a
       block number of 2^59, and `coap_block2_respond` / `coap_block_asm_add`
       panic on `num * size`; the reserved SZX 7 is accepted as 2048-byte
       blocks.** stdlib/coap.fd coap_block2_respond, coap_block_asm_add,
@@ -5500,7 +7098,18 @@ Same rules as the first run:
       resp, &body, coap_block_num(v), coap_block_szx(v))` -> Panic: Integer
       overflow on multiplication: 574200121902233591 * 2048 (want false / 4.00
       Bad Option). Confirmed Nov 27 (fid run). Confidence: high.
-- [ ] BG410. **`fid test` (the bootstrap suite runner) fails every test on
+      Fixed Nov 27 (night): new coap_block_ok(num, szx) (0 <= NUM < 2^20, SZX
+      0..6), COAP_BLOCK_NUM_LIMIT, and coap_block_option_ok(m, num) (option
+      0-3 bytes, SZX != 7; a server answers 4.00 when false);
+      coap_block2_respond returns false and coap_block_slice empty for an
+      invalid block; coap_block_asm_add fails on an invalid Block2 option.
+      Files: stdlib/coap.fd. Test: test_bg409_coap_block_limits.fd. Run with
+      the fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib,
+      a runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG410. **`fid test` (the bootstrap suite runner) fails every test on
       Windows: it runs the built program as `tests/_fides_test_tmp.exe`, which
       cmd.exe reads as the command `tests`.** compiler/main.fd cmd_test
       (Backend 1: `exe_name = "tests/_fides_test_tmp.exe"` then
@@ -5520,7 +7129,13 @@ Same rules as the first run:
       same way for any exe. Confirmed Nov 27 (fb4 fid.exe, Windows, zig cc).
       cmd_test is unchanged between fb4/compiler and the repo. Confidence:
       high.
-- [ ] BG411. **`ark install` writes outside ark_modules/: a dependency's own
+      Fix written Nov 27 (night), not run yet: the built test runs as
+      `tests\_fides_test_tmp.exe` on Windows (cmd.exe read the `/` as a
+      switch), `./tests/_fides_test_tmp` on POSIX. Files: compiler/main.fd. To
+      verify: build the compiler and run the test. Watch: none
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      test-runner-check.sh passes.
+- [x] BG411. **`ark install` writes outside ark_modules/: a dependency's own
       ark.toml may name a pact `../../x`, and ark copies it to
       `ark_modules/../../x(.fd)`.** compiler/ark.fd ark_install_picks ->
       ark_install_path_in (`dest = base + "/" + name`, `dest2 = base + "/" +
@@ -5545,10 +7160,18 @@ Same rules as the first run:
       nothing written). Confirmed Nov 27 (fb4 fid.exe `fid ark`, Windows:
       ark1/pwned.fd created beside app/). compiler/ark.fd is identical in fb4
       and the repo. Confidence: high.
+      Fixed Nov 27 (night): a pact name with / \ : .. a leading dot, control
+      chars or quotes is refused: "ark: invalid pact name '<n>' (for <via>):
+      ...", exit 1, nothing written. Files: compiler/ark.fd. Test:
+      tests/ark/ark-safety.sh. Run with the fid of Nov 27 01:25 on the tree's
+      sources (the fixed code is stdlib, a runtime, a script or a tool the old
+      fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      ark-safety.sh passes.
 
 ### Medium
 
-- [ ] BG412. **A method defined twice (in one `impl` block or in two `impl`
+- [x] BG412. **A method defined twice (in one `impl` block or in two `impl`
       blocks of the same type), and a `const`/global defined twice, are
       accepted silently; for methods the later wins, for consts/globals the
       first.** compiler/compiler.fd cc_find_duplicate_funcs (checks
@@ -5562,7 +7185,21 @@ Same rules as the first run:
       WHAT; `fid run` prints 2 (methods) and 1 / 5 (const/global), exit 0.
       Confirmed Nov 27 (`fid run`). cc_find_duplicate_funcs unchanged between
       fb4 and the repo. Confidence: high.
-- [ ] BG413. **The lock-order check (SR-18) never sees the standard library's
+      Fix written Nov 27 (night), not run yet: consts and globals defined
+      twice (or a const and a global of one name) and a method defined twice
+      for a non-generic type (one impl block or several; @cfg methods and
+      generic types' specializing impls excluded) are E060 "Duplicate
+      definition: const 'N' ..." / "global 'G' ..." / "method 'get' of 'Pt' is
+      defined twice ...". Files: compiler/compiler.fd, compiler/disasm.fd.
+      Test: test_bg412_dup_const_fail.fd, test_bg412_dup_global_fail.fd,
+      test_bg412_dup_method_fail.fd, test_bg412_dup_method_two_impls_fail.fd
+      (+1 more). To verify: build the compiler and run the tests. Watch: the
+      new errors can only appear where definitions really collide; the scan
+      above is regex-based, so a verifier's self-compile is the real check.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG413. **The lock-order check (SR-18) never sees the standard library's
       own mutex type: `SyncMutex.lock()` in opposite orders, even in one
       function, passes `fid check`.** compiler/lockcheck.fd lc_name_of (a lock
       handle that is a field load, `self.handle`, is "no named lock") with
@@ -5583,7 +7220,21 @@ Same rules as the first run:
       errors. The p_mutex_lock version: E083. Confirmed Nov 27 (`fid check`).
       lc_name_of and lc_is_lock are unchanged between fb4 and the repo (stdlib
       read from the repo). Confidence: high.
-- [ ] BG414. **A match guard is never type-checked as a condition: `3 if "yes"
+      Fix written Nov 27 (night), not run yet: in the type checker's order
+      check, `m.lock()` / `m.unlock()` (and read_/write_ on a SyncRwLock) on a
+      SyncMutex/SyncRwLock parameter or local takes or releases the lock
+      `m.handle`. Two threads started with spawn are seen this way. In the IR
+      check, SyncMutex_lock counts as an acquire of the struct it is passed.
+      Files: compiler/lockcheck.fd, compiler/typechecker.fd. Test:
+      test_bg413_sync_mutex_order_fail.fd, test_bg413_sync_mutex_order_ok.fd,
+      test_bg413_sync_mutex_threads_fail.fd. To verify: build the compiler and
+      run the tests. Watch: - lockcheck.fd already held another session's
+      uncommitted edits; I left them untouched. - In the IR check a struct is
+      one lock node, so two mutex fields of one struct are one lock.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG414. **A match guard is never type-checked as a condition: `3 if "yes"
       =>`, a struct or an f64 guard compile and the arm silently never runs.**
       compiler/typechecker.fd TypeChecker_check_stmt_inner Stmt::Match ("//
       Check guard": `TypeChecker_check_expr(self, g)`, result discarded) and
@@ -5601,7 +7252,16 @@ Same rules as the first run:
       run`/`check`). The guard code in TypeChecker_check_stmt_inner is
       unchanged between fb4 and the repo (the function's diff touches only
       BG201/BG252 lines). Confidence: high.
-- [ ] BG415. **`<`/`>` on two values of the same struct or the same enum are
+      Fix written Nov 27 (night), not run yet: a guard must be bool/i32/i64,
+      like an `if` condition: "if condition must be bool, got P (the guard `if
+      ...` of a match arm)" (E045). Files: compiler/typechecker.fd. Test:
+      test_bg414_guard_float_fail.fd, test_bg414_guard_ok.fd,
+      test_bg414_guard_struct_fail.fd, test_bg414_guard_value_str_fail.fd. To
+      verify: build the compiler and run the tests.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG415. **`<`/`>` on two values of the same struct or the same enum are
       accepted and order addresses or words; `fid run` and pe_ir give opposite
       answers (`E::A < E::B` and `E::B < E::A` are both true on run, both
       false on pe_ir).** compiler/typechecker.fd TypeChecker_check_comparison
@@ -5620,7 +7280,18 @@ Same rules as the first run:
       false; emit: false true. Confirmed Nov 27 (`fid run`, `fid emit` pe_ir).
       TypeChecker_check_comparison is unchanged between fb4 and the repo.
       Confidence: high.
-- [ ] BG416. **A `@linear` value is lost on the early return of `?` without an
+      Fix written Nov 27 (night), not run yet: `<` `>` `<=` `>=` on two values
+      of the same struct or enum is now an error: "cannot order two values of
+      enum 'E' with `<`: only `==` and `!=` are defined". Units are checked
+      before this and keep their ordering. Files: compiler/typechecker.fd.
+      Test: test_bg415_order_enum_fail.fd, test_bg415_order_struct_fail.fd,
+      test_bg415_struct_eq_ok.fd. To verify: build the compiler and run the
+      tests. Watch: grep found no stdlib code ordering enum literals. compiler
+      and core stay exempt, as before.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG416. **A `@linear` value is lost on the early return of `?` without an
       error (an explicit `return` on the same path is rejected).**
       compiler/typechecker.fd TypeChecker_linear_check_return (the "lost on
       the path through the `return`" check) is called only from Stmt::Return
@@ -5639,7 +7310,19 @@ Same rules as the first run:
       Confirmed Nov 27 (`fid check`, `fid run`).
       TypeChecker_linear_check_return and its single call site are unchanged
       between fb4 and the repo. Confidence: high.
-- [ ] BG417. **A `region r with budget(N)` does not count `s += t` or
+      Fix written Nov 27 (night), not run yet: a `?` reports each live,
+      unconsumed linear variable that its own statement does not read ("It is
+      lost on the path through the `?` on line N"). Not inside `try { }`. It
+      does not mark the variable consumed. Files: compiler/typechecker.fd,
+      compiler/escape.fd. Test: test_bg416_linear_try_fail.fd,
+      test_bg416_linear_try_ok.fd. To verify: build the compiler and run the
+      tests. Watch: TypeChecker_check_stmt, a statement function tc-a may also
+      be editing, got about 15 lines around its check_stmt_inner call. A value
+      the `?`'s statement only borrows (`g(&t)?`) is not reported;
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG417. **A `region r with budget(N)` does not count `s += t` or
       `Vec::filled(n, x)`: a region of budget 64 may append 16 KB of text or
       allocate a 100,000-element Vec.** compiler/typechecker.fd
       TypeChecker_check_expr_inner Expr::Binary (TypeChecker_budget_heap(self,
@@ -5660,7 +7343,16 @@ Same rules as the first run:
       println(v.len()); }` -> no errors. Confirmed Nov 27 (`fid check`). The
       Expr::Binary budget call is the same in fb4 and the repo. Confidence:
       high.
-- [ ] BG418. **The C backend cannot compile a program with a global fixed
+      Fix written Nov 27 (night), not run yet: `s += t` inside a budgeted
+      region charges "string `+=`" as heap of unknown size. Vec::filled is an
+      allocating builtin there. Files: compiler/typechecker.fd. Test:
+      test_bg417_budget_add_assign_fail.fd,
+      test_bg417_budget_vec_filled_fail.fd. To verify: build the compiler and
+      run the tests. Watch: low.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG418. **The C backend cannot compile a program with a global fixed
       array: it writes `static int64_t[4] _g_GA = 0;`.** compiler/codegen_c.fd
       emit_globals (with c_type_global / gen_global_init_expr): emit_globals
       special-cases only `IrType::Struct` (`= {0}`); every other global is
@@ -5677,7 +7369,20 @@ Same rules as the first run:
       not assignable". Confirmed Nov 27 (ccompile with zig cc; run, emit,
       --nat print 31). emit_globals, c_type_global, gen_global_init_expr
       unchanged between fb4 and the repo. Confidence: high.
-- [ ] BG419. **`fid wasm`: a narrowing cast to a signed type is not
+      Fix written Nov 27 (night), not run yet: an IrType::Array global is
+      declared `static int64_t _g_GA[4] = {1LL, 2LL, 3LL, 4LL};` (nested
+      arrays `name[3][2]`); a literal of plain int/float/bool elements is the
+      static initializer and needs no run-time init; any other literal gets
+      `{0}` and __init_globals stores each element (`_g_GA[i] = ...`) instead
+      of assigning the array. Files: compiler/codegen_c.fd. Test:
+      test_bg418_c_global_array.fd. To verify: build the compiler and run the
+      test. Watch: csplit's extern text (cs_extern_of) strips at the first
+      `=`, which works for the new form; an array literal holding nested
+      non-literal arrays still produces invalid run-time stores (rare).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG419. **`fid wasm`: a narrowing cast to a signed type is not
       sign-extended, so `(-3 as i64) as i8` prints 253 and `(-300 as i16) as
       i8` 212 (M7, fixed on pe_ir and --nat, is still there on the WASM
       backend).** compiler/wasm.fd wg_gen_inst, the `Inst::IntTrunc(value, _,
@@ -5698,7 +7403,16 @@ Same rules as the first run:
       Node v24). The IntTrunc arm of wg_gen_inst is identical in fb4 and the
       repo (compared after stripping CRLF; the rest of wasm.fd grew since
       fb4). Confidence: high.
-- [ ] BG420. **The opt-in `simplify` pass folds a float compared with itself:
+      Fix written Nov 27 (night), not run yet: a truncation to I8/I16/I32
+      emits i64.extend8_s / extend16_s / extend32_s (0xC2/0xC3/0xC4) instead
+      of the mask; U8/U16/U32 keep the mask. Files: compiler/wasm.fd. Test:
+      test_bg419_wasm_signed_trunc.fd. To verify: build the compiler and run
+      the test. Watch: none expected (the IntExtend arm already uses these
+      opcodes).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG420. **The opt-in `simplify` pass folds a float compared with itself:
       `x != x` becomes false and `x == x` / `x <= x` true, so a NaN test
       (`isnan(x) = x != x`) is always false with FID_IROPT_ON=simplify (or
       `all`).** compiler/iropt.fd iro_identities (called by iro_simplify), the
@@ -5718,7 +7432,17 @@ Same rules as the first run:
       --nat, default vs FID_IROPT_ON=simplify; also the semantics test's F3
       line with FID_IROPT_ON=all). iro_identities, iro_int_ty and iro_simplify
       unchanged between fb4 and the repo. Confidence: high.
-- [ ] BG421. **`fid wasm`: a call through a function value whose result is a
+      Fix written Nov 27 (night), not run yet: the self-comparison folds
+      (Eq/LtEq/GtEq true, Neq/Lt/Gt false) require the operand's own type
+      (iro_value_ty of l) to be an integer or pointer; the guard had tested
+      the result type, Bool, which iro_int_ty accepts. Files:
+      compiler/iropt.fd. Test: test_bg420_simplify_nan_self_cmp.fd. To verify:
+      build the compiler and run the test. Watch: none; iro_cp_direct_args
+      untouched.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG421. **`fid wasm`: a call through a function value whose result is a
       fixed array passes the env as the result pointer (BG135's fix covered
       pe_ir and nat_ir for arrays, wasm only for structs).** compiler/wasm.fd
       wg_gen_inst, the `Inst::CallPtr(fn_ptr, args, cp_ret, _, _)` arm
@@ -5735,7 +7459,15 @@ Same rules as the first run:
       a struct result through a function value is right on wasm. Confirmed Nov
       27 (wasm under Node v24). wg_gen_inst unchanged between fb4 and the repo
       (CRLF stripped). Confidence: high.
-- [ ] BG422. **`comptime f(1)` of a function with a default parameter is
+      Fix written Nov 27 (night), not run yet: an IrType::Array result sets
+      cp_sret as a Struct does, so args[0] (the result pointer) is passed
+      before the env. Files: compiler/wasm.fd. Test:
+      test_bg421_wasm_callptr_array.fd. To verify: build the compiler and run
+      the test. Watch: low; mirrors pe_ir/nat_ir.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG422. **`comptime f(1)` of a function with a default parameter is
       rejected ("expects 2 args, got 1"), and `comptime h(b: 3, a: 4)` with
       named arguments fails ("cannot evaluate binop on non-literal").**
       compiler/comptime_eval.fd call_comptime_func: call_comptime_func
@@ -5755,7 +7487,18 @@ Same rules as the first run:
       binop on non-literal in comptime fn 'h'"; 110 and 403 expected.
       Confirmed Nov 27 (run, emit). call_comptime_func unchanged between fb4
       and the repo. Confidence: high.
-- [ ] BG423. **`==` on two `HashMap`s (and on structs holding one) compares
+      Fix written Nov 27 (night), not run yet: the call sites keep a named
+      argument as NamedArg(name, evaluated value); ct_resolve_args puts named
+      args at their parameters, positional ones in order, and evaluates a
+      missing parameter's default with the parameters before it bound (so `b =
+      a * 2` reads the callee's `a`) Files: compiler/comptime_eval.fd. Test:
+      test_bg422_comptime_default_named.fd. To verify: build the compiler and
+      run the test. Watch: low; the fast path (no named arg, full count) is
+      the old behaviour.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG423. **`==` on two `HashMap`s (and on structs holding one) compares
       the handles, so a struct is not even equal to its own copy: `val q = p;
       p == q` is false.** compiler/lower.fd vec_eq_fn_for (only `Vec<..>` gets
       a content comparison; a HashMap falls to the plain word BinOp) and
@@ -5777,7 +7520,20 @@ Same rules as the first run:
       shared). vec_eq_fn_for unchanged between fb4 and the repo. Confidence:
       high (that it disagrees with proposal 0001; the reference itself does
       not define map `==`).
-- [ ] BG424. **A default parameter value is evaluated in the caller's scope: a
+      Fix written Nov 27 (night), not run yet: `==` on HashMap<K, V> now
+      compares by content when K is str, an integer or bool and V is a number,
+      bool, str or float. Two maps are equal when they have the same length
+      and every key of a is in b with an equal value. Struct fields holding
+      such maps compare the same way. Files: compiler/lower.fd,
+      compiler/compiler.fd, stdlib/core.fd. Test: test_bg423_map_eq.fd. To
+      verify: build the compiler and run the test. Watch:
+      compiler/comptime_eval.fd ct_gen_vec_eq_fn mirrors vec_eq_fn_for and I
+      did not change it, so types made by comptime keep the old comparison.
+      Maps with struct keys still compare handles.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG424. **A default parameter value is evaluated in the caller's scope: a
       caller's local that shadows a global the default names is used instead
       (`fn g(x: i64, k: i64 = LIMIT)` called from a function with `var LIMIT =
       500` gets 500).** compiler/lower.fd Lowerer_resolve_call_args (fills a
@@ -5800,7 +7556,19 @@ Same rules as the first run:
       (and `f(1)` 1002, or a compile error). Confirmed Nov 27 (run, emit).
       Lowerer_resolve_call_args unchanged between fb4 and the repo.
       Confidence: high.
-- [ ] BG425. **A struct field default is resolved where the literal is
+      Fix written Nov 27 (night), not run yet: a default that names something
+      is computed by a generated function `__dflt_<fn>_<i>(the earlier params
+      it names)`. The call passes its own arguments for those params. Literal
+      defaults are unchanged. Generic, comptime and async functions and
+      generic impls are left as before. mono.fd is untouched. Files:
+      compiler/lower.fd. Test: test_bg424_default_scope.fd. To verify: build
+      the compiler and run the test. Watch: an earlier argument that a default
+      names is evaluated twice (once for its param, once for the helper). The
+      helpers are not type-checked.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG425. **A struct field default is resolved where the literal is
       written: `struct Cfg { port: i64 = PORT }` built with `Cfg { .. }` in a
       function that has a local `PORT` takes the local.** compiler/mono.fd
       mn_fill_struct_defaults (copies `f.default_expr` into the literal as a
@@ -5818,7 +7586,19 @@ Same rules as the first run:
       emit; 8080 expected. Confirmed Nov 27 (run, emit).
       mn_fill_struct_defaults unchanged between fb4 and the repo. Confidence:
       high.
-- [ ] BG426. **`read_file` of a file holding a zero byte returns the text cut
+      Fix written Nov 27 (night), not run yet: a non-literal field default of
+      a non-generic struct becomes a call of a generated `fn
+      __sdef_<Struct>_<field>() -> <field type> { return <default>; }` (one
+      per field, processed by process_func and added to the program), so its
+      names resolve in the global scope, not the literal's; literal defaults
+      stay inline, generic structs unchanged. Files: compiler/mono.fd. Test:
+      test_bg425_struct_default_scope.fd. To verify: build the compiler and
+      run the test. Watch: one extra call per defaulted non-literal field; the
+      generated functions are not type-checked (as mono instances are not);
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG426. **`read_file` of a file holding a zero byte returns the text cut
       at the first zero on `fid run`, C and pe_ir (the whole file on --nat),
       though `p_file_write` writes the zero (BG81) and reference.md §1.8 makes
       strings counted.** compiler/codegen_c.fd (the emitted C `p_file_read` ->
@@ -5838,7 +7618,17 @@ Same rules as the first run:
       -> run/C/emit: `5` then `2`; emit --nat: `5` then `5`. Want 5
       everywhere. Confirmed Nov 27 (all four backends, probe f1.fd).
       codegen_c.fd p_file_read lines same in fb4. Confidence: high.
-- [ ] BG427. **Machine layer: `p_file_write` / `p_file_append` report success
+      Fix written Nov 27 (night), not run yet: the buffer is a counted string
+      from p_str_alloc_c(size) (length word set to the bytes actually read),
+      so p_str_own_c keeps it as is instead of taking strlen of a headerless
+      block. / (not run) for run; pe_ir needs NO change. Files:
+      compiler/codegen_c.fd, compiler/interp.fd. Test:
+      test_bg426_read_file_nul.fd. To verify: build the compiler and run the
+      test. Watch: low. / low (one extra p_file_size call per read).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG427. **Machine layer: `p_file_write` / `p_file_append` report success
       (0) when nothing is written; on --nat Windows writing to a directory
       returns 0.** stdlib/linux_runtime/base.fd pe_write_file (ignores the
       outcome of pe_write_all, which itself returns nothing on a failed
@@ -5855,7 +7645,18 @@ Same rules as the first run:
       {p_file_append("dd", "x")}"); }` -> run/C/emit: `-1 -1`; emit --nat: `0
       0` (probes f1.fd, f3.fd). Confirmed Nov 27 (all four backends, probe
       f1.fd). Runtime read from the repo. Confidence: high.
-- [ ] BG428. **`fid run`: `env_var` of a variable set to the empty string and
+      Fixed Nov 27 (night): pe_write_file loops its own writes (EINTR retried)
+      and returns -1 on a failed/short write or failed close; pe_win_open of a
+      directory with write access returns -21 (EISDIR) instead of a listing
+      handle. Files: stdlib/linux_runtime/base.fd,
+      stdlib/linux_runtime/win.fd. Test: test_bg427_file_write_dir.fd. Run
+      with the fid of Nov 27 01:25 on the tree's sources (the fixed code is
+      stdlib, a runtime, a script or a tool the old fid runs): the test
+      passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG428. **`fid run`: `env_var` of a variable set to the empty string and
       `arg_at` of an empty argument are None (C and both native backends:
       Some("")).** compiler/interp.fd Interpreter_call_runtime2, `p_getenv`
       and `p_argv` (return `Value::Str(ev2)` / `Value::Str(p_argv(..))` for a
@@ -5876,7 +7677,17 @@ Same rules as the first run:
       exe with `FID_EMPTY= ./p.exe ''` -> `some` `arg`. Confirmed Nov 27 (all
       four backends, probe e1.fd). Function unchanged since fb4 in these
       branches. Confidence: high.
-- [ ] BG429. **On Windows every backend passes UTF-8 path text to the ANSI
+      Fix written Nov 27 (night), not run yet: an empty value or argument is
+      returned as interp_empty_read()'s string (the 2g.42 sentinel, which does
+      not compare equal to 0), so core's env_var/arg_at give Some(""). Files:
+      compiler/interp.fd. Test: test_bg428_empty_env_arg.fd,
+      tests/tooling/bg428-empty-env-arg-check.sh. To verify: build the
+      compiler and run the tests. Watch: low; the same mechanism read_line and
+      p_file_read already use.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them); bg428-empty-env-arg-check.sh passes.
+- [x] BG429. **On Windows every backend passes UTF-8 path text to the ANSI
       file API: `p_file_write("é.txt", ..)` creates `Ã©.txt`, an existing
       `ü.txt` cannot be opened, and non-ASCII arguments and environment values
       arrive as one-byte code-page text, not UTF-8.** compiler/codegen_c.fd
@@ -5899,7 +7710,19 @@ Same rules as the first run:
       prints `1`, `none`, and the directory now holds `uni_Ã©.txt`; want `2`,
       `pre`, `uni_é.txt`. Confirmed Nov 27 (run, C, emit, emit --nat on
       Windows: identical, probe u1.fd). Confidence: high.
-- [ ] BG430. **pe_ir: `StringBuilder.to_str()` stops at the first zero byte,
+      Fix written Nov 27 (night), not run yet: on _WIN32 every user path goes
+      through MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS) to
+      _wfopen/_wremove/_wrename/_wmkdir/_wrmdir/GetFileAttributesW/_wstat64/FindFirstFileW/CopyFileW
+      (text that is not valid UTF-8 falls back to the narrow call); directory
+      names come back as UTF-8; env values from GetEnvironmentVariableW as
+      UTF-8. Files: compiler/codegen_c.fd. Test: test_bg429_utf8_paths.fd. To
+      verify: build the compiler and run the test. Watch: Windows-only C text,
+      not compiled here: watch for mingw/zig/MSVC header differences
+      (_wstat64, struct _stat64, _wfopen, wcscmp);
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG430. **pe_ir: `StringBuilder.to_str()` stops at the first zero byte,
       so everything appended after a string holding a NUL is lost (run, C and
       --nat keep it).** stdlib/pe_runtime/base.fd pert_sb_to_str
       (`p_malloc(len + 1)` + `p_str_adopt(out)`); stdlib/core.fd p_str_adopt
@@ -5914,7 +7737,15 @@ Same rules as the first run:
       println(f"{sb.len()} {str_len(s)}"); }` -> run/C/--nat: `8 8`; emit
       (pe_ir): `8 3`. Confirmed Nov 27 (all four backends, probe sb1.fd).
       Runtime read from the repo. Confidence: high.
-- [ ] BG431. **A closure that captures a `str` or `Vec` (or map) leaks the
+      Fixed Nov 27 (night): builds a counted string (p_str_buf(len)) of the
+      builder's full length, so p_str_adopt keeps bytes after a NUL. Files:
+      stdlib/pe_runtime/base.fd. Test: test_bg430_sb_to_str_nul.fd. Run with
+      the fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib,
+      a runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [~] BG431. **A closure that captures a `str` or `Vec` (or map) leaks the
       captured value: the environment takes an owner and no closure is ever
       dropped.** compiler/lower.fd Lowerer_make_fn_env (`cap_val =
       Lowerer_rc_dup(self, cap_val, cap_own_ty)` for every RC capture, env
@@ -5935,7 +7766,21 @@ Same rules as the first run:
       line. Without the closures: every block freed. Confirmed Nov 27 (`fid
       run --leaks`, probe l7.fd). Function unchanged since fb4. Confidence:
       high.
-- [ ] BG432. **On Windows `p_file_size` of a file of 2 GiB or more is -1
+      Fix written Nov 27 (night), not run yet: in `val c = fn..`, when the
+      name is used afterwards only as a callee (cowcheck cow_uses_stmts == 0
+      over the rest of its block, no defer), c owns its heap env. The env is
+      an owned slot of pseudo type `__clenv#n`. Scope end, return and break
+      drop the captures (str/Vec/map, heap struct/array copies) and p_free the
+      env. Files: compiler/lower.fd. Test: test_bg431_closure_capture_leak.fd.
+      To verify: build the compiler and run the test. Watch: these envs now
+      escape iropt's env-to-stack move (the drop loads the env). Escaping
+      closures still leak.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them). Left: a closure that escapes (stored, returned,
+      passed on) still leaks its captured values; only a closure variable that
+      is afterwards just called frees its environment.
+- [x] BG432. **On Windows `p_file_size` of a file of 2 GiB or more is -1
       ("missing") on run, C and pe_ir: the size comes from 32-bit `ftell`
       (--nat gives the real size).** compiler/codegen_c.fd (emitted
       `p_file_size`: `fseek(f, 0, SEEK_END); int64_t sz = ftell(f);`, also
@@ -5954,7 +7799,21 @@ Same rules as the first run:
       run/C/emit: `-1 true`; emit --nat: `3221225472 true`. Confirmed Nov 27
       (all four backends, probe fs1.fd, 3 GiB file deleted afterwards).
       Confidence: high.
-- [ ] BG433. **A `Vec::new()` written directly as a call argument
+      Fix written Nov 27 (night), not run yet: sizes come from
+      _fseeki64/_ftelli64 on Windows (fseeko/ftello elsewhere, fseek/ftell on
+      WASI) instead of 32-bit ftell. / after the fopen check, the size comes
+      from GetFileAttributesExA (nFileSizeHigh at 28, nFileSizeLow at 32: 64
+      bits). Not _ftelli64: that would need a new msvcrt name in
+      compiler/pe_ir_enc.fd's import list, which an older fid emitting with
+      the tree's runtime would not have. Missing file and a directory still
+      give -1, an empty file 0 (checked with emit). Files:
+      compiler/codegen_c.fd, stdlib/pe_runtime/base.fd. Test:
+      test_bg432_file_size_64.fd. To verify: build the compiler and run the
+      test.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG433. **A `Vec::new()` written directly as a call argument
       (`fill(Vec::new())`, `m.insert("g", Vec::new())` for a `HashMap<str,
       Vec<str>>`) is made with no element type, so the strings later pushed
       into it (or into a Vec gotten from it) are never freed.**
@@ -5978,7 +7837,15 @@ Same rules as the first run:
       Vec<str> = groups.get("g"); g.push(f"m{1}");`. Confirmed Nov 27 (`fid
       run --leaks`, probes l16.fd, l19.fd, l20.fd). Functions unchanged since
       fb4. Confidence: high.
-- [ ] BG434. **`return match x { .. => f"..", .. }` and `return if c { f".." }
+      Fix written Nov 27 (night), not run yet: `Vec::new()`/`HashMap::new()`
+      written as an argument is made by Lowerer_rc_new_coll with the
+      parameter's, the Vec element's or the map value's type. Files:
+      compiler/lower.fd. Test: test_bg433_vec_new_arg_leak.fd. To verify:
+      build the compiler and run the test. Watch: low.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG434. **`return match x { .. => f"..", .. }` and `return if c { f".." }
       else { f".." }` leak the returned string on every call (the same value
       bound with `val r = ..; return r;` does not).** compiler/lower.fd
       Lowerer_lower_stmt, Stmt::Return (`Lowerer_rc_try_move` fails, then
@@ -5998,7 +7865,17 @@ Same rules as the first run:
       and label2 (line 2). With `val r: str = match ..; return r;`: every
       block freed. Confirmed Nov 27 (`fid run --leaks`, probes l21.fd, l22.fd,
       l23.fd). Return branch unchanged since fb4. Confidence: high.
-- [ ] BG435. **pe_ir's `p_dir_list` still has BG68's heap overflow: it sizes
+      Fix written Nov 27 (night), not run yet: `return if/match` is lowered
+      with let_hint set to the function's result type (when that type owns).
+      Lowerer_rc_result_type then owns the arms as that type, and the result
+      is a claimed temporary. Files: compiler/lower.fd. Test:
+      test_bg434_return_branch_leak.fd. To verify: build the compiler and run
+      the test. Watch: let_hint is visible to the whole if/match while it is
+      lowered (as it is for a let).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [~] BG435. **pe_ir's `p_dir_list` still has BG68's heap overflow: it sizes
       the buffer in one FindFirstFile pass and fills it in a second, unbounded
       pass, so a file created in between writes past the block.**
       stdlib/pe_runtime/base.fd pert_dir_list (first loop sums `need`, `out =
@@ -6017,7 +7894,16 @@ Same rules as the first run:
       with the loop, so I could not provoke the race deterministically here.)
       Read only (code read Nov 27, stdlib from the repo; compared with the
       fixed C runtime and with linux_runtime/sys.fd). Confidence: high.
-- [ ] BG436. **`fid run` never gets back the memory of replaced strings: a
+      Fix written Nov 27 (night), not run yet: one FindFirstFile walk, each
+      name copied into its own counted string, then joined: no buffer sized by
+      an earlier walk; also frees the find-data block (leaked before). Files:
+      stdlib/pe_runtime/base.fd. Test: test_bg469_dir_list_order.fd. To
+      verify: build the compiler and run the test.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them). Left: the listing works on emit; the race (a
+      directory that changes between the two passes) was not provoked.
+- [x] BG436. **`fid run` never gets back the memory of replaced strings: a
       loop that keeps reassigning a string variable exhausts the interpreter's
       127 MB heap ("Out of memory: the interpreter holds at most 133169152
       bytes") at a few KB of live data.** compiler/interp.fd — the
@@ -6047,7 +7933,19 @@ Same rules as the first run:
       probes ic.fd at 3000/5000/6500/8000/9000/10000/30000 and ic4.fd).
       Mechanism read only. Confidence: high (symptom), medium (exact
       mechanism).
-- [ ] BG437. **`x509_verify_chain` rejects a valid chain when two trust
+      Fix written Nov 27 (night), not run yet: what exactly changed. (1)
+      Memory gets two I64Tables: cstr_own (state per host string; reverse
+      entries copy+2^62 -> host string) and cstr_keep (host string ->
+      Value::Str, so its address keeps naming it while it has an entry).
+      Files: compiler/interp.fd. Test: test_bg436_string_replace_memory.fd. To
+      verify: build the compiler and run the test. Watch: this is the risky
+      one. Safety rests on the single-slot rule. A copy can still be freed
+      while something holds it raw if an interpreter builtin other than
+      p_to_str hands back its str argument unchanged as a "new" temporary ...
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG437. **`x509_verify_chain` rejects a valid chain when two trust
       anchors share a subject name (root re-key / renewal): it tries only the
       first anchor whose name matches and fails with "bad signature" (or
       "trust anchor expired") without trying the others.** stdlib/x509.fd
@@ -6067,7 +7965,19 @@ Same rules as the first run:
       signature"; `[root2, root1]` -> ok=true. `openssl verify -CAfile
       root1+root2 leaf.pem` -> OK. Confirmed Nov 27 (ccompile/C backend; probe
       r2/crypto/p7.fd with r2/crypto/pki/*.pem). Confidence: high.
-- [ ] BG438. **Machine-layer runtime (`emit` for Linux targets, `--nat`
+      Fixed Nov 27 (night): x509_verify_chain's last-certificate branch tries
+      every anchor whose name matches (skipping expired ones, failed CA checks
+      and bad signatures) and returns the first one's error only if none
+      works; x509_verify_chain_crl takes as CRL issuer the anchor with the
+      name that is valid and verifies the certificate's signature, not the
+      first one with the name. Files: stdlib/x509.fd. Test:
+      test_bg437_x509_same_name_anchors.fd. Run with the fid of Nov 27 01:25
+      on the tree's sources (the fixed code is stdlib, a runtime, a script or
+      a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [~] BG438. **Machine-layer runtime (`emit` for Linux targets, `--nat`
       Windows, darwin, wasi): `p_os_random_u64` ignores a failed getrandom and
       returns uninitialised heap bytes instead of panicking, so
       `crypto_random_bytes`, `uuid_v4`, key and nonce generation silently get
@@ -6092,7 +8002,17 @@ Same rules as the first run:
       runtime text in compiler/codegen_c.fd. Fix: check `pe_sys(...) == 8` and
       `p_panic` otherwise (loop on a short read / -EINTR). Read only (stdlib
       is current). Confidence: high.
-- [ ] BG439. **`oidc_half_hash` hashes with SHA-256 for the *384 algorithms
+      Fix written Nov 27 (night), not run yet: loops getrandom until 8 bytes
+      (EINTR retried, short reads continued); any other result panics "no
+      random source in the operating system" via pert_panic, as C/pe_ir.
+      Files: stdlib/linux_runtime/base.fd. Test:
+      test_bg438_os_random_checked.fd. To verify: build the compiler and run
+      the test.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them). Left: only the working getrandom path ran; the
+      failure path was not provoked.
+- [x] BG439. **`oidc_half_hash` hashes with SHA-256 for the *384 algorithms
       (ES384, HS384), so `oidc_validate_id_token` rejects every valid
       ES384/HS384 ID token that carries an at_hash.** stdlib/oauth2.fd
       oidc_half_hash (used by oidc_validate_id_token's at_hash check): OIDC
@@ -6108,7 +8028,16 @@ Same rules as the first run:
       correct value is base64url(SHA-384(token)[0..24]) =
       "qijbNZLJUenLNKW0AjL6YizBFf1l_j4t" (Python hashlib). Confirmed Nov 27
       (fid run). Confidence: high.
-- [ ] BG440. **gRPC: a compressed message whose gzip data is corrupt is
+      Fixed Nov 27 (night): oidc_half_hash uses SHA-384 (ecdsa.fd ec_sha384;
+      `use ecdsa` added) for algorithms ending in "384", per OIDC Core
+      §3.1.3.6; SHA-256/SHA-512 cases unchanged. Files: stdlib/oauth2.fd.
+      Test: test_bg439_oidc_half_hash_384.fd. Run with the fid of Nov 27 01:25
+      on the tree's sources (the fixed code is stdlib, a runtime, a script or
+      a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG440. **gRPC: a compressed message whose gzip data is corrupt is
       delivered to the handler as an empty (all-defaults) message and the call
       succeeds.** stdlib/grpc.fd gr_unpack (the result of gzip_decompress is
       pushed without checking for failure; gzip_decompress returns an empty
@@ -6122,7 +8051,19 @@ Same rules as the first run:
       grpc_frame(40 junk bytes, true) with grpc-encoding gzip -> "handler got
       message of 0 bytes", http 200, grpc-status 0. Confirmed Nov 27 (C
       backend; probe r2/crypto/p15.fd). Confidence: high.
-- [ ] BG441. **SRTP/SRTCP: every unauthenticated packet with a new SSRC
+      Fixed Nov 27 (night): new gr_gunzip inflates one gzip member with
+      compress.fd's inflate_from capped at the limit (max_message on the
+      server, GRPC_MAX_MESSAGE on the client), after refusing an ISIZE above
+      it; a one-byte stored block is put in front of the DEFLATE data (RFC
+      1951 §3.2.4) so an empty result always means failure, then CRC-32 and
+      ISIZE are checked. Files: stdlib/grpc.fd, stdlib/compress.fd. Test:
+      test_bg396_grpc_gzip_limit.fd. Run with the fid of Nov 27 01:25 on the
+      tree's sources (the fixed code is stdlib, a runtime, a script or a tool
+      the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG441. **SRTP/SRTCP: every unauthenticated packet with a new SSRC
       permanently adds per-SSRC state (two 64-entry replay windows and five
       counters) before its tag is checked, so forged packets grow the context
       without bound and slow every later lookup.** stdlib/srtp.fd
@@ -6141,7 +8082,17 @@ Same rules as the first run:
       5000 and `c.wins.len()` = 5000 afterwards. Should stay 0 (look up
       without creating; create only after the tag verifies). Confirmed Nov 27
       (C backend; probe r2/crypto/p17.fd). Confidence: high.
-- [ ] BG442. **`gzip_decompress` returns only the first member of a
+      Fixed Nov 27 (night): new srp_find looks an SSRC up without creating
+      state; srtp_unprotect/srtcp_unprotect use the defaults (ROC 0, empty
+      replay window) for an unknown SSRC and call srp_slot only after the tag
+      verifies. srtp_protect/set_roc keep creating slots as before. Files:
+      stdlib/srtp.fd. Test: test_bg441_srtp_no_state_unauth.fd. Run with the
+      fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG442. **`gzip_decompress` returns only the first member of a
       multi-member gzip file and silently drops the rest (concatenated .gz
       files, pigz/bgzip output, appended logs).** stdlib/compress.fd
       gzip_decompress (inflates once from `pos`, checks that member's
@@ -6156,7 +8107,18 @@ Same rules as the first run:
       the same bytes -> len 6, "hello ". Expected 11 bytes "hello world" (or
       at least an error for the trailing data). Confirmed Nov 27 (fid run).
       Confidence: high.
-- [ ] BG443. **LoRaWAN `lw_data_decode` ignores the caller's 32-bit frame
+      Fixed Nov 27 (night): gzip_decompress loops over members (new gz_member:
+      one member's header/inflate/CRC/ISIZE, `end` past its trailer) and
+      concatenates them, 256 MB cap over the total; NUL padding after the last
+      member skipped, any other trailing data or a bad later member -> empty
+      (Python gzip.decompress semantics). gzip_decompress_str follows. Files:
+      stdlib/compress.fd. Test: test_bg442_gzip_multi_member.fd. Run with the
+      fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG443. **LoRaWAN `lw_data_decode` ignores the caller's 32-bit frame
       counter whenever its low 16 bits differ from the frame's, and checks the
       MIC with the frame's raw 16-bit FCnt instead, so a replayed old frame
       decodes with mic_ok = true (even when passed lw_fcnt_extend's -1
@@ -6175,7 +8137,17 @@ Same rules as the first run:
       `lw_data_decode(nk, ak, frame, 70100)` -> mic_ok=true fcnt=100. Expected
       mic_ok=false (or ok=false) when fcnt32 does not end in the frame's FCnt.
       Confirmed Nov 27 (fid run; probe r2/crypto/p25.fd). Confidence: high.
-- [ ] BG444. **QUIC's TLS 1.3 client accepts an RSASSA-PKCS1-v1_5 signature
+      Fixed Nov 27 (night): lw_data_decode no longer falls back to the frame's
+      16-bit FCnt: a fcnt32 that is negative (lw_fcnt_extend's -1), above
+      2^32-1, or not ending in the frame's FCnt gives ok=false, mic_ok=false
+      (fcnt = the 16-bit FCnt); the MIC is checked with the full fcnt32.
+      Files: stdlib/lorawan.fd. Test: test_bg443_lorawan_fcnt32.fd. Run with
+      the fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib,
+      a runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG444. **QUIC's TLS 1.3 client accepts an RSASSA-PKCS1-v1_5 signature
       (schemes 0x0401/0x0501/0x0601) in the server's CertificateVerify, which
       RFC 8446 §4.4.3 forbids.** stdlib/quic_tls.fd qhs_client_cv ->
       qhs_cv_verify -> quic_tls_scheme_verify (the 0x0401/0x0501/0x0601
@@ -6197,7 +8169,19 @@ Same rules as the first run:
       over the TLS 1.3 CV content from an RSA-certificate server reaches
       `x509_rsa_pkcs1_verify` and, if it verifies, `t.state = QTS_WAIT_FIN`.
       Read only. Confidence: high.
-- [ ] BG445. **`iec104_parse` accepts an APDU length below 4 (or above 253)
+      Fixed Nov 27 (night): new qhs_cv_scheme_allowed refuses
+      0x0201/0x0401/0x0501/0x0601 for CertificateVerify (RFC 8446 §4.2.3,
+      §4.4.3): qhs_client_cv sends illegal_parameter (47) and qhs_cv_verify
+      returns false. The ClientHello still offers those codes (for certificate
+      signatures) and quic_tls_scheme_verify is unchanged (comments updated).
+      Files: stdlib/quic_tls.fd. Test: test_bg444_quic_cv_no_pkcs1.fd. Run
+      with the fid of Nov 27 01:25 on the tree's sources (the fixed code is
+      stdlib, a runtime, a script or a tool the old fid runs): the test
+      passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG445. **`iec104_parse` accepts an APDU length below 4 (or above 253)
       and decodes the control field from the next frame's bytes.**
       stdlib/iec104.fd iec104_parse: the length octet is taken as is: `total =
       2 + length`, and the 4 control octets are always read from b[2..6] even
@@ -6212,7 +8196,16 @@ Same rules as the first run:
       `iec104_parse` ok=true format=I ns=564 total_len=2 (want ok=false, "bad
       length"). Confirmed Nov 27 (fid run: "len0: ok=true format=0 ns=564
       total=2"; APCI_I is 0). Confidence: high.
-- [ ] BG446. **iec104 sequence state accepts any N(S)/N(R): lost I-frames go
+      Fixed Nov 27 (night): iec104_parse rejects an APDU length outside
+      4..253, S/U frames whose length is not 4, and U frames whose control
+      octet is not one of the six single-function codes. Files:
+      stdlib/iec104.fd. Test: test_bg445_iec104_apdu_length.fd. Run with the
+      fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG446. **iec104 sequence state accepts any N(S)/N(R): lost I-frames go
       unnoticed and an ack of unsent frames jams the send window.**
       stdlib/iec104.fd iec104_on_recv_i, iec104_on_recv_s: iec104_on_recv_i
       sets `s.vr = (ns + 1) & 0x7FFF` whatever `ns` is, without comparing it
@@ -6227,7 +8220,18 @@ Same rules as the first run:
       can_send=false, has_unacked=true; `iec104_on_recv_i(&mut s2, 0, 0, 1);
       iec104_on_recv_i(&mut s2, 7, 0, 2);` -> vr=8 with no error. Confirmed
       Nov 27 (fid run output as stated). Confidence: high.
-- [ ] BG447. **`image_bmp_decode` rejects every top-down BMP (negative
+      Fixed Nov 27 (night): new Iec104State.seq_error (sticky) and
+      iec104_nr_valid; iec104_on_recv_i requires ns == vr and va <= nr <= vs
+      (mod 2^15), iec104_on_recv_s a valid nr; on error the state is left
+      unchanged and seq_error is set (the caller must close the connection,
+      IEC 60870-5-104 §5.1). Files: stdlib/iec104.fd. Test:
+      test_bg446_iec104_seq_check.fd. Run with the fid of Nov 27 01:25 on the
+      tree's sources (the fixed code is stdlib, a runtime, a script or a tool
+      the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG447. **`image_bmp_decode` rejects every top-down BMP (negative
       height): the sign is fixed after the negativity test.** stdlib/image.fd
       image_bmp_decode: the height is read with img_u32le (0..2^32-1), so the
       first test `if h < 0 { top_down = true; h = 0 - h; }` can never fire;
@@ -6240,7 +8244,16 @@ Same rules as the first run:
       -2 (0xFFFFFFFE): `image_bmp_decode` -> width 0, height 0; the same file
       with biHeight = 2 decodes (1x2). Confirmed Nov 27 (fid run: "bottom-up:
       w=1 h=2", "top-down: w=0 h=0"). Confidence: high.
-- [ ] BG448. **ARINC 653 ports enforce neither the configured message size nor
+      Fixed Nov 27 (night): image_bmp_decode: biHeight >= 2^31 (negative as
+      i32) becomes 2^32 - h rows, top-down; the dead `h < 0` test and the sign
+      bug are gone. Files: stdlib/image.fd. Test: test_bg447_bmp_top_down.fd.
+      Run with the fid of Nov 27 01:25 on the tree's sources (the fixed code
+      is stdlib, a runtime, a script or a tool the old fid runs): the test
+      passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG448. **ARINC 653 ports enforce neither the configured message size nor
       the port direction, and a queuing port can never be drained.**
       stdlib/arinc.fd arinc_queuing_port_send, arinc_sampling_port_write,
       arinc_queuing_port_receive: arinc_queuing_port_send checks only `count
@@ -6259,7 +8272,19 @@ Same rules as the first run:
       NO_ERROR; `arinc_sampling_port_write` of 3 bytes on a 2-byte destination
       port -> NO_ERROR. Confirmed Nov 27 (fid run: "NO_ERROR" for both).
       Confidence: high.
-- [ ] BG449. **`dlms_hdlc_parse` panics on a short frame and never checks the
+      Fixed Nov 27 (night): arinc_queuing_port_send and
+      arinc_sampling_port_write return INVALID_MODE on a destination port and
+      INVALID_CONFIG for a message longer than max_message_size; new
+      arinc_queuing_port_receive_message(&mut port, &mut out) removes the
+      oldest message (INVALID_MODE on a source port, PORT_EMPTY when empty);
+      arinc_queuing_port_receive stays a peek (doc says so). Files:
+      stdlib/arinc.fd. Test: test_bg448_arinc_port_checks.fd. Run with the fid
+      of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG449. **`dlms_hdlc_parse` panics on a short frame and never checks the
       format field's length against the frame.** stdlib/dlms.fd
       dlms_hdlc_parse (with decode_addr): only `b.len() >= 7` and the two
       flags are checked; the addresses, control byte and HCS are then read by
@@ -6272,7 +8297,17 @@ Same rules as the first run:
       Trigger: `dlms_hdlc_parse` of 7E A0 07 03 21 93 7E -> Panic: Vec index
       out of bounds (want ok=false, "frame too short"). Confirmed Nov 27 (fid
       run). Confidence: high.
-- [ ] BG450. **MySQL binary-protocol TIME values come back as "1 02:00:00"
+      Fixed Nov 27 (night): dlms_hdlc_parse rejects an address with no end bit
+      within 4 bytes, a frame where control+HCS do not fit before the closing
+      flag ("frame too short"), and a format-field length != b.len()-2;
+      decode_addr reports an unterminated address. Files: stdlib/dlms.fd.
+      Test: test_bg449_dlms_hdlc_short.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG450. **MySQL binary-protocol TIME values come back as "1 02:00:00"
       (not "26:00:00") and lose their microseconds, unlike the same column
       through mysql_query.** stdlib/mysql.fd mysql_parse_binary_row
       (MYSQL_TYPE_TIME branch): for a prepared statement's TIME the decoder
@@ -6287,7 +8322,17 @@ Same rules as the first run:
       [len 12, 0 days, 12:34:56, micro 789000] -> "1 02:00:00" and "12:34:56"
       (want "26:00:00" and "12:34:56.789000"). Confirmed Nov 27 (fid run).
       Confidence: high.
-- [ ] BG451. **INI keys and section names are serialized unescaped: a key with
+      Fixed Nov 27 (night): mysql_parse_binary_row's TIME branch writes
+      [-]hhh:mm:ss with hours = days*24 + hh (the text protocol's form) and
+      appends the 12-byte form's microseconds as .uuuuuu, like the DATETIME
+      branch. Files: stdlib/mysql.fd. Test: test_bg450_mysql_binary_time.fd.
+      Run with the fid of Nov 27 01:25 on the tree's sources (the fixed code
+      is stdlib, a runtime, a script or a tool the old fid runs): the test
+      passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG451. **INI keys and section names are serialized unescaped: a key with
       ':' or '=' comes back split, and a key or section with a newline or ']'
       injects sections and keys (BG191 fixed only values).** stdlib/ini.fd
       ini_serialize (`out + e.key + " = " + v`, `"\n[" + secs.get(s) +
@@ -6303,7 +8348,19 @@ Same rules as the first run:
       "v");` then `ini_parse(ini_serialize(doc))` -> [prefs] c = "path = 1",
       [admin] role = x, [a] k = v. Confirmed Nov 27 (fid run). Confidence:
       high.
-- [ ] BG452. **`resp_encode_inline` joins arguments raw: a space splits an
+      Fixed Nov 27 (night): new pub ini_valid_key / ini_valid_section (what
+      ini_parse reads back as written: no '=' ':' line break or edge blank, no
+      leading ; # [ for keys; no ']' line break or edge blank for sections);
+      ini_set refuses invalid names (doc unchanged) and ini_serialize leaves
+      such entries/sections out. Chose reject over escape: the parser has no
+      quoted-key syntax. Files: stdlib/ini.fd. Test:
+      test_bg451_ini_key_section_injection.fd. Run with the fid of Nov 27
+      01:25 on the tree's sources (the fixed code is stdlib, a runtime, a
+      script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG452. **`resp_encode_inline` joins arguments raw: a space splits an
       argument and a CR LF in one injects a second Redis command.**
       stdlib/redis.fd resp_encode_inline: the inline encoder writes each
       argument with rs_put_text, separated by a space, and ends with CR LF; it
@@ -6318,7 +8375,16 @@ Same rules as the first run:
       SET followed by FLUSHALL. Want quoting (`"hello world\r\n..."` with
       escapes) or an error. Confirmed Nov 27 (fid run; bytes checked).
       Confidence: high.
-- [ ] BG453. **JSON Schema `multipleOf` accepts every negative number: -3 is a
+      Fixed Nov 27 (night): resp_encode_inline writes an argument that is
+      empty or holds whitespace/control bytes/quotes/DEL double-quoted with
+      sdssplitargs escapes (\" \ \n \r \t \xHH); plain words unchanged. Files:
+      stdlib/redis.fd. Test: test_bg452_resp_inline_quoting.fd. Run with the
+      fid of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG453. **JSON Schema `multipleOf` accepts every negative number: -3 is a
       "multiple of 2".** stdlib/jsonschema.fd js_check_number (multipleOf):
       the remainder is computed as `r = q - (q as i64 as f64)` with q = x / d;
       `as i64` truncates toward zero, so for a negative non-multiple r is
@@ -6331,7 +8397,16 @@ Same rules as the first run:
       true (also -7; "3" -> false); `jsonschema_valid("{\"multipleOf\":0.5}",
       "-0.75")` -> true while "0.75" -> false. Confirmed Nov 27 (fid run).
       Confidence: high.
-- [ ] BG454. **`fid test` on Linux/macOS reads every test from
+      Fixed Nov 27 (night): multipleOf takes the fraction of |x / d| (and
+      treats |q| >= 2^53 as an integer, so `as i64` never sees a huge value).
+      Files: stdlib/jsonschema.fd. Test:
+      test_bg453_jsonschema_multipleof_negative.fd. Run with the fid of Nov 27
+      01:25 on the tree's sources (the fixed code is stdlib, a runtime, a
+      script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG454. **`fid test` on Linux/macOS reads every test from
       "tests\bootstrap\tests/bootstrap/<name>.fd": all of them "(could not
       read)".** compiler/main.fd cmd_test (POSIX listing `ls
       tests/bootstrap/*.fd > tests/_fides_test_list.txt`, then `test_path =
@@ -6352,7 +8427,14 @@ Same rules as the first run:
       Read only (POSIX host needed). Confidence: high (`ls dir/*.fd` prints
       the dir prefix; the path concat is literal). cmd_test unchanged since
       fb4.
-- [ ] BG455. **`fid test` knows only a hard-coded list of 74 expected-fail
+      Fix written Nov 27 (night), not run yet: listing entries reduced to the
+      bare name (the POSIX `ls` gives the dir prefix); test_path =
+      "tests/bootstrap/" + name (forward slash, every host). Files:
+      compiler/main.fd. To verify: build the compiler and run the test. Watch:
+      none
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      test-runner-check.sh passes.
+- [x] BG455. **`fid test` knows only a hard-coded list of 74 expected-fail
       tests and never reads `// expect-error`: the other ~510 expected-fail
       tests are run as normal tests and counted failures, and an expected-fail
       "pass" is any failure at all.** compiler/main.fd cmd_test
@@ -6373,7 +8455,15 @@ Same rules as the first run:
       recognised as expected-fail and matched against "undefined variable").
       Confirmed Nov 27 (fb4 fid.exe, Windows). cmd_test unchanged since fb4.
       Confidence: high.
-- [ ] BG456. **`fid test <file>` finds tests by scanning lines, not the
+      Fix written Nov 27 (night), not run yet: expected-fail = the old list OR
+      scripts/tier1.sh is_reject_test's rule (*_fail.fd / *_fail2.fd except
+      test_panic_*_fail.fd, or `expect-error` in the first 3 lines) Files:
+      compiler/main.fd. To verify: build the compiler and run the test. Watch:
+      `fid test --fail` now runs ~600 tests (was 74) and is slower; the normal
+      run no longer runs those ~510 files
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      test-runner-check.sh passes.
+- [x] BG456. **`fid test <file>` finds tests by scanning lines, not the
       program: a test written `@cold fn test_x()` is silently never run (the
       file "passes"), and a static method or commented-out `fn test_*()`
       breaks the build.** compiler/main.fd test_fns (after str_trim and an
@@ -6397,7 +8487,17 @@ Same rules as the first run:
       _fides_test_main.fd:42:36", "fid test: the build failed". Confirmed Nov
       27 (fb4 fid.exe, CC=zig cc, both cases). test_fns and cmd_test_file
       unchanged since fb4. Confidence: high.
-- [ ] BG457. **verify-selfhost.sh compares failures by test name only, not by
+      Fix written Nov 27 (night), not run yet: tests/fuzz targets are the
+      parsed program's free functions (prog.funcs: name prefix, 0 params
+      (fuzz: 1), not generic, line > 0); impl methods (prog.impls) and
+      commented-out code are not seen; `@cold fn test_x()` is. A file that
+      does not lex/parse falls back to the old line scan (the build then
+      reports the error). Files: compiler/main.fd. To verify: build the
+      compiler and run the test. Watch: an `@cfg`'d-out `fn test_*` is still
+      collected (as before)
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      test-runner-check.sh passes.
+- [x] BG457. **verify-selfhost.sh compares failures by test name only, not by
       backend: a new failure on one backend is hidden by an old failure of the
       same test on another, and the gate passes.** verify-selfhost.sh (results
       "OUTPUT=...${name}: FAIL\n" for all three backends; CURRENT_FAILS /
@@ -6417,7 +8517,13 @@ Same rules as the first run:
       -> exit 0 (want: the interpreter and native regressions listed, exit 1).
       Confirmed Nov 27 (the comparison block of verify-selfhost.sh run in bash
       on the two texts above). Confidence: high.
-- [ ] BG458. **`fid repl` cannot evaluate an expression unless `tcc` is on
+      Fixed Nov 27 (night): FAIL lines are qualified by their backend section
+      ("Interpreter / test_x.fd: FAIL") for both current and baseline;
+      membership is exact-line (grep -qxF, was a substring match). Baseline
+      file format unchanged. Files: verify-selfhost.sh. Run with the fid of
+      Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a runtime,
+      a script or a tool the old fid runs): the test passes.
+- [x] BG458. **`fid repl` cannot evaluate an expression unless `tcc` is on
       PATH (Windows), and never on Linux/macOS: it ignores $CC and runs
       `_fides_repl_tmp` without `./`.** compiler/main.fd cmd_repl (expression
       branch: `build_cmd = "tcc -O2 -w -o " + exe_name ...` / `"gcc -O2 ..."`,
@@ -6438,7 +8544,17 @@ Same rules as the first run:
       "'_fides_repl_tmp.exe' is not recognized ...", no `3` printed (want 3).
       Confirmed Nov 27 (fb4 fid.exe, Windows, no tcc on PATH; the POSIX half
       read only, high confidence). cmd_repl unchanged since fb4.
-- [ ] BG459. **`fid audit` (and `--strict`) does not see an `unsafe{` block
+      Fix written Nov 27 (night), not run yet: the expression program is
+      written to _fides_repl_tmp.fd and built with `"<fid>" ccompile ... -o
+      _fides_repl_tmp(.exe)` (CC honoured as every build; project_run handles
+      cmd.exe quoting), run as .\ / ./; a failed build prints "repl: the C
+      build failed (... set CC)"; temp files deleted. Files: compiler/main.fd.
+      To verify: build the compiler and run the test. Watch: slower per
+      expression (a child fid); ccompile's own stderr progress lines may show
+      in the REPL
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      test-runner-check.sh passes.
+- [x] BG459. **`fid audit` (and `--strict`) does not see an `unsafe{` block
       written without a space: a program doing malloc, raw stores and free
       reports "0 unsafe site(s)".** compiler/main.fd audit_is_unsafe_block
       (`str_find(rest, "unsafe {")`, else only `t == "unsafe"`), used by
@@ -6457,7 +8573,14 @@ Same rules as the first run:
       reports the site and exits 1. Confirmed Nov 27 (fb4 fid.exe).
       audit_is_unsafe_block and cmd_audit unchanged since fb4. Confidence:
       high.
-- [ ] BG460. **`fid ir` / `fid dump-ir` reject every program with a `use`
+      Fix written Nov 27 (night), not run yet: the word `unsafe` on identifier
+      boundaries followed by optional spaces/tabs/CR and then `{` or the end
+      of the line (it matched exactly "unsafe {"). Files: compiler/main.fd. To
+      verify: build the compiler and run the test. Watch: none (code-only
+      text, strings/comments already removed by audit_code_only)
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      audit-explain-check.sh passes.
+- [x] BG460. **`fid ir` / `fid dump-ir` reject every program with a `use`
       (stdlib or a sibling module): "undefined function", "--> <stdin>".**
       compiler/main.fd cmd_ir (`lower_to_ir_module(source)`),
       compiler/compiler.fd lower_to_ir_module -> build_program(source) (no
@@ -6475,7 +8598,14 @@ Same rules as the first run:
       sibling mylib.fd. Confirmed Nov 27 (fb4 fid.exe). cmd_ir,
       lower_to_ir_module and build_program unchanged since fb4. Confidence:
       high.
-- [ ] BG461. **LSP hover answers nothing in any file with a `use`: it builds
+      Fix written Nov 27 (night), not run yet:
+      lower_to_ir_module_with_path(source, input, "on") (imports resolve,
+      errors name the file). Files: compiler/main.fd. To verify: build the
+      compiler and run the test. Watch: that path also runs the lock checker
+      (c_lockcheck_errors) as run/dump-c do
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      run-cli-check.sh passes.
+- [x] BG461. **LSP hover answers nothing in any file with a `use`: it builds
       the document without its path, so even core's `int_to_str` has no
       hover.** compiler/lsp.fd handle_hover (`build_program_with_path(text,
       OptStr::None)`, then the fallback `parse_program_only(text)`);
@@ -6497,7 +8627,17 @@ Same rules as the first run:
       int_to_str -> hover gives the signature. Confirmed Nov 27 (fb4 `fid lsp`
       over stdio, Python driver). compiler/lsp.fd is identical in fb4 and the
       repo. Confidence: high.
-- [ ] BG462. **`fid notebook` writes the source into HTML unescaped (a string
+      Fix written Nov 27 (night), not run yet: the document is built with
+      build_program_with_path(text, lsp_doc_path(uri)), as diagnostics_json
+      does (BG53), so `use`s resolve and the program holds imported and core
+      functions. handle_rename still builds without a path (not in the bug;
+      left alone). Files: compiler/lsp.fd. Test: scripts/tl/lsp_bug_fixes.py.
+      To verify: build the compiler and run the test. Watch: hover, completion
+      and signature help now do a full build with imports (slower per request,
+      through the same modcache as diagnostics).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      lsp_bug_fixes.py passes.
+- [x] BG462. **`fid notebook` writes the source into HTML unescaped (a string
       `"<script>...</script>"` in the program runs in the browser) and
       evaluates nothing, though its usage says "Each code block is evaluated,
       output rendered inline".** compiler/main.fd cmd_notebook (`html + "<div
@@ -6518,10 +8658,20 @@ Same rules as the first run:
       `&lt;script&gt;`, and the run's output, or no claim of it). Confirmed
       Nov 27 (fb4 fid.exe). cmd_notebook unchanged since fb4. Confidence:
       high.
+      Fix written Nov 27 (night), not run yet: everything from the file
+      (title, h1, text and code) is escape_html'd (scribe.fd's); a run of ///
+      lines is one text cell, a run of code lines one code cell with
+      indentation kept; "evaluated" claim removed from the usage; opt-in
+      `--run` runs `fid run <file>` (60 s) and adds its escaped output as the
+      last cell; a write failure is exit 1. Files: compiler/main.fd. To
+      verify: build the compiler and run the test. Watch: output layout
+      changed (fewer, larger cells)
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      doc-cli-check.sh passes.
 
 ### Low
 
-- [ ] BG463. **`i64::MIN % -1` (and `i32`/`i8` MIN % -1) gives 0 on every
+- [x] BG463. **`i64::MIN % -1` (and `i32`/`i8` MIN % -1) gives 0 on every
       backend, while the formal semantics and the fuzzer's C oracle say it
       panics.** docs/verification/semantics.md §3 integer table ("a % b |
       panic if τ signed, a = min(τ), b = −1") and scripts/fuzz/gen_vs_c.py
@@ -6541,7 +8691,20 @@ Same rules as the first run:
       semantics.md / gen_vs_c.py expect a panic. Same with an i32 and an i8
       MIN. Confirmed Nov 27 (all five backends print 0). PeirGen_gen_int_div
       and wg_divmod unchanged between fb4 and the repo. Confidence: high.
-- [ ] BG464. **`==` on two `Vec<f64>` compares bit patterns: `[0.0] == [-0.0]`
+      Fixed Nov 27 (night): MIN % -1 = 0 is the exact remainder and in range;
+      reference.md and the language guide only ever said MIN / -1 panics;
+      me7's SMT model was already corrected the same way. So the docs/oracle
+      were wrong. Files: docs/verification/semantics.md,
+      docs/reference/reference.md, docs/reference/language-guide.md,
+      scripts/fuzz/gen_vs_c.py, tools/fuzz_vs_c.fd. Test:
+      test_bg463_min_rem_neg1.fd,
+      tests/conformance/s3_5_min_rem_neg_one_zero.fd. Run with the fid of Nov
+      27 01:25 on the tree's sources (the fixed code is stdlib, a runtime, a
+      script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG464. **`==` on two `Vec<f64>` compares bit patterns: `[0.0] == [-0.0]`
       is false and `[NaN] == [NaN]` is true.** compiler/lower.fd vec_eq_fn_for
       (`Type::F64 => "Vec_eq_words"`) with stdlib/core.fd Vec_eq_words
       (`Vec_get(a, i) != Vec_get(b, i)` on the raw words, and `if a == b {
@@ -6560,7 +8723,16 @@ Same rules as the first run:
       be built at the time: the machine was out of commit memory).
       vec_eq_fn_for and Vec_eq_words unchanged between fb4 and the repo.
       Confidence: high.
-- [ ] BG465. **--nat Windows: `env_var` is case-sensitive, so
+      Fix written Nov 27 (night), not run yet: Elements are compared with IEEE
+      `==`, done on the bits with integer operations: a NaN is unequal to
+      everything and -0.0 == 0.0. There is no shortcut for two handles sharing
+      one buffer. Files: compiler/lower.fd, stdlib/core.fd. Test:
+      test_bg464_vec_f64_eq.fd. To verify: build the compiler and run the
+      test. Watch: The same comptime_eval mirror as in BG423.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG465. **--nat Windows: `env_var` is case-sensitive, so
       `env_var("FOOBAR")` misses a variable the environment holds as `FooBar`
       (every other backend finds it, as Windows does).**
       stdlib/linux_runtime/base.fd pert_getenv (byte-exact compare of `name`
@@ -6576,7 +8748,16 @@ Same rules as the first run:
       `FID_LONG=x` exported -> run/C/emit: `set`; emit --nat: `none`.
       Confirmed Nov 27 (all four backends, probe e1.fd). Runtime read from the
       repo. Confidence: high.
-- [ ] BG466. **`random_int_range(min, max)` panics with an integer overflow
+      Fixed Nov 27 (night): on Windows (nat_os() == 1) environment names are
+      compared ignoring ASCII case; Linux etc. unchanged. (Internal pe_env_ptr
+      for FID_* knobs left byte-exact.) Files: stdlib/linux_runtime/base.fd.
+      Test: test_bg465_env_var_case.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG466. **`random_int_range(min, max)` panics with an integer overflow
       when the range spans more than i64::MAX values (`random_int_range(0,
       i64::MAX)`, `random_int_range(i64::MIN, i64::MAX)`).** stdlib/random.fd
       random_int_range: the bound is computed as `max - min + 1` with checked
@@ -6589,7 +8770,18 @@ Same rules as the first run:
       (run: "9223372036854775807 + 1 at line 174"). Confirmed Nov 27 (run, C,
       emit, emit --nat; found by two passes). Stdlib read from the repo.
       Confidence: high.
-- [ ] BG467. **`fid run`: `p_file_read_at` (stdlib fs.fd's streaming File
+      Fixed Nov 27 (night): random_int_range detects (without overflow) a
+      range of >= 2^63 values and hands it to a new @wrapping
+      random_range_wide: full range -> next(), span 2^63-1 -> mask, else
+      unsigned rejection on (max - min) as u64. Smaller ranges unchanged (same
+      sequence). Files: stdlib/random.fd. Test:
+      test_bg466_random_int_range_wide.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG467. **`fid run`: `p_file_read_at` (stdlib fs.fd's streaming File
       reads) reads the whole file into an i64 per byte, so reading 10 bytes
       near the end of a 3 GiB file panics "out of memory (allocating
       4294967304 bytes)".** compiler/interp.fd p_file_read_at branch (`var
@@ -6607,7 +8799,18 @@ Same rules as the first run:
       Interpreter_call_runtime (file builtins); not touched by the fb4->repo
       diff of this area (the p_file_read_at block text is the same).
       Confidence: high.
-- [ ] BG468. **--nat Windows: `p_system` (and `p_process_run`'s code) returns
+      Fix written Nov 27 (night), not run yet: calls the host's
+      p_file_read_at(fpath, off, n) (every runtime has it since Nov 19-20:
+      both C generators, pe_runtime, linux_runtime) instead of
+      p_file_read_bytes of the whole file, then masks each byte. Files:
+      compiler/interp.fd. Test: test_bg467_read_at_large.fd,
+      tests/tooling/bg467-read-at-large-check.sh. To verify: build the
+      compiler and run the tests. Watch: a stage-0 host without p_file_read_at
+      no longer links. All pinned stage-0s (Nov 21) and fidesc have it.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them); bg467-read-at-large-check.sh passes.
+- [x] BG468. **--nat Windows: `p_system` (and `p_process_run`'s code) returns
       a negative exit code zero-extended: `exit -1` gives 4294967295, a
       crashed child 3221225477 instead of -1073741819.**
       stdlib/linux_runtime/win.fd, the syscall-1000 shell runner used by
@@ -6621,7 +8824,15 @@ Same rules as the first run:
       -1")}"); }` -> run/C/emit: `-1`; emit --nat: `4294967295`. Confirmed Nov
       27 (all four backends, probe p1.fd). Runtime read from the repo.
       Confidence: high.
-- [ ] BG469. **`p_dir_list` order depends on the backend: the machine layer
+      Fixed Nov 27 (night): the GetExitCodeProcess DWORD is sign-extended
+      (`exit -1` -> -1). Files: stdlib/linux_runtime/win.fd. Test:
+      test_bg468_system_negative_code.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG469. **`p_dir_list` order depends on the backend: the machine layer
       sorts names byte by byte, the C runtime (all platforms), the interpreter
       and pe_ir return the file system's order (NTFS: case-insensitive; ext4
       readdir: hash order).** stdlib/linux_runtime/sys.fd pert_dir_list
@@ -6641,7 +8852,19 @@ Same rules as the first run:
       "\n", ",")); }` -> run/C/emit (Windows): `a.txt,B.txt,Z.txt,_u.txt`;
       emit --nat: `B.txt,Z.txt,_u.txt,a.txt`. Confirmed Nov 27 (all four
       backends, probe f4.fd). The C text is the same in fb4. Confidence: high.
-- [ ] BG470. **The type checker accepts a call to any `p_`-prefixed name as a
+      Fix written Nov 27 (night), not run yet: decided for one order
+      everywhere: byte order (strcmp), the machine layer's documented order.
+      pe_ir sorts (insertion sort as sys.fd); the C runtime (hence `fid run`
+      once fid is rebuilt) sorts with qsort. Files: stdlib/pe_runtime/base.fd,
+      compiler/codegen_c.fd. Test: test_bg469_dir_list_order.fd. The stdlib
+      part runs and passes; its C runtime half (codegen_c.fd) needs the
+      rebuilt compiler. Watch: codegen_c.fd is another agent's file (one
+      helper + two return lines). Behaviour change: every backend's listing
+      order is now byte order (uppercase before lowercase).
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG470. **The type checker accepts a call to any `p_`-prefixed name as a
       runtime builtin returning i64, so a misspelt or nonexistent builtin
       (`p_bogus_xyz(1)`, and `p_remove` / `p_time_now`, which reference.md
       §9.1 lists) passes `fid check` and only fails later, differently on each
@@ -6665,7 +8888,19 @@ Same rules as the first run:
       `println(f"{p_bogus_xyz(1)}")` behaves the same. Confirmed Nov 27
       (check, run, ccompile, emit, emit --nat; probes rm1.fd, rm2.fd, rm3.fd).
       Branch unchanged since fb4. Confidence: high.
-- [ ] BG471. **`hash_mix64` is documented as the splitmix64 finalizer but uses
+      Fix written Nov 27 (night), not run yet: in the program's own module
+      only (main, or the program's declared module when it is not stdlib or
+      compiler), a `p_` call that is neither a declared function nor one of
+      853 known runtime builtins is "undefined function 'p_x': no runtime has
+      a builtin of that name" (E041). Files: compiler/typechecker.fd. Test:
+      test_bg470_p_remove_fail.fd, test_bg470_unknown_builtin_fail.fd. To
+      verify: build the compiler and run the tests. Watch: (1) the list must
+      be maintained: a backend builtin added later and called from a test's
+      main is rejected until it is added to tc_builtin_names.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG471. **`hash_mix64` is documented as the splitmix64 finalizer but uses
       arithmetic shifts, so it computes a different function; its own doc
       example (`hash_mix64(0) == -280303742238208354`) is false.**
       stdlib/hash.fd hash_mix64 (same construction in stdlib/random.fd sm64,
@@ -6681,7 +8916,15 @@ Same rules as the first run:
       reference splitmix64 gives -2152535657050944081 (Python with logical
       shifts). Fix: mask after each shift (`(z >> 30) & 0x3FFFFFFFF`) or use
       u64. Confirmed Nov 27 (fid run, C backend). Confidence: high.
-- [ ] BG472. **The `uuid_parse_opt` doc example does not compile (statement
+      Fixed Nov 27 (night): each right shift masked (logical shift): real
+      splitmix64, hash_mix64(0) = -2152535657050944081. Files: stdlib/hash.fd.
+      Test: test_bg471_hash_mix64_splitmix.fd. Run with the fid of Nov 27
+      01:25 on the tree's sources (the fixed code is stdlib, a runtime, a
+      script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG472. **The `uuid_parse_opt` doc example does not compile (statement
       `match` with expression arms), so `scripts/doctest.py` fails on
       stdlib/uuid.fd; the module header also says uuid_v4 is "not
       cryptographically secure" though it reads OS entropy.** stdlib/uuid.fd
@@ -6699,7 +8942,11 @@ Same rules as the first run:
       'println'". (The same doctest run over 27 crypto/encoding modules, 90
       examples, fails only this one and hash.fd's hash_mix64 example.)
       Confirmed Nov 27 (fid run via scripts/doctest.py). Confidence: high.
-- [ ] BG473. **`chacha20poly_decrypt` (tls_crypto) and `cb_gcm_decrypt`
+      Fixed Nov 27 (night): the example's arms are blocks; the header says
+      uuid_v4 uses OS entropy. Files: stdlib/uuid.fd. Run with the fid of Nov
+      27 01:25 on the tree's sources (the fixed code is stdlib, a runtime, a
+      script or a tool the old fid runs): the test passes.
+- [x] BG473. **`chacha20poly_decrypt` (tls_crypto) and `cb_gcm_decrypt`
       (crypto_bind) return an empty Vec both for a forged ciphertext and for a
       genuine empty plaintext, so a caller cannot tell an authentication
       failure from an authenticated empty message.** stdlib/tls_crypto.fd
@@ -6718,7 +8965,17 @@ Same rules as the first run:
       [], []))` -> len 0; with the tag's first byte flipped -> len 0. Same
       with cb_gcm_decrypt over BCrypt (sealed 16 bytes; genuine -> 0, forged
       -> 0). Confirmed Nov 27 (C backend, Windows BCrypt). Confidence: high.
-- [ ] BG474. **`ws_recv` accepts frames RFC 6455 requires a peer to fail on,
+      Fixed Nov 27 (night): the open functions report `ok` (tag verified)
+      apart from the plaintext; the old functions' docs say empty is ambiguous
+      and point to them. Files: stdlib/tls_crypto.fd, stdlib/crypto_bind.fd,
+      stdlib/crypto_bind_unix.fd. Test: test_bg473_chacha_open_empty.fd,
+      test_bg473_gcm_open_empty.fd. Run with the fid of Nov 27 01:25 on the
+      tree's sources (the fixed code is stdlib, a runtime, a script or a tool
+      the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG474. **`ws_recv` accepts frames RFC 6455 requires a peer to fail on,
       and silently merges two messages when a new data frame arrives inside a
       fragmented one.** stdlib/ws.fd ws_recv: the frame loop never checks
       RSV1-3 (must be 0 without an extension, §5.2), reserved opcodes 3-7 and
@@ -6735,7 +8992,17 @@ Same rules as the first run:
       then `82 02 'x' 'y'` (binary, FIN=1, unmasked) returns one frame, opcode
       2, bytes "abcxy", instead of failing (unmasked client frames,
       interleaved message). Read only. Confidence: high.
-- [ ] BG475. **`crypto_sha256_bytes` writes only the low 32 bits of the
+      Fixed Nov 27 (night): opcode -1 for RSV bits, reserved opcodes,
+      fragmented / > 125-byte control frames, wrong masking for the side, a
+      lone continuation, a new data frame inside a fragmented message, invalid
+      UTF-8 text. Files: stdlib/ws.fd. Test:
+      test_bg474_ws_recv_protocol_errors.fd. Run with the fid of Nov 27 01:25
+      on the tree's sources (the fixed code is stdlib, a runtime, a script or
+      a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [~] BG475. **`crypto_sha256_bytes` writes only the low 32 bits of the
       message bit length, so SHA-256 (and HMAC/PBKDF2/HKDF built on it) is
       wrong for inputs of 512 MiB or more.** stdlib/crypto.fd
       crypto_sha256_bytes (padding: four literal `padded.push(0)` for the high
@@ -6753,7 +9020,15 @@ Same rules as the first run:
       the length block encodes 0 instead of 2^32 bits. Fix: push `(bit_len >>
       56) & 255` ... `(bit_len >> 32) & 255` instead of the four zeros. Read
       only. Confidence: high.
-- [ ] BG476. **encoding.fd `utf8_len` was left out of the BG215 fix: it still
+      Fix written Nov 27 (night), not run yet: the high 32 bits of the bit
+      length are written ((bit_len >> 56..32) & 255) instead of four zeros.
+      Files: stdlib/crypto.fd. Test: test_bg475_sha256_length_word.fd. To
+      verify: build the compiler and run the test.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them). Left: the 512 MiB input the bug needs is too large
+      for the suite; the short-message vectors pass.
+- [x] BG476. **encoding.fd `utf8_len` was left out of the BG215 fix: it still
       counts an overlong/surrogate/out-of-range sequence as one character, so
       `utf8_len(s) != utf8_decode(s).len()` and its own doc ("Invalid bytes
       each count as one (replacement) character") is false.**
@@ -6770,7 +9045,15 @@ Same rules as the first run:
       `utf8_decode(...)` -> 3 code points; same for "eda080" (1 vs 3),
       "f08f8080" (1 vs 4), "f4908080" (1 vs 4). Valid input agrees. Confirmed
       Nov 27 (fid run). Confidence: high.
-- [ ] BG477. **SSH: after the first key exchange, an SSH_MSG_NEWKEYS that
+      Fixed Nov 27 (night): an ill-formed sequence (utf8_seq_ok false) counts
+      one per byte, as utf8_decode. Files: stdlib/encoding.fd. Test:
+      test_bg476_utf8_len_invalid.fd. Run with the fid of Nov 27 01:25 on the
+      tree's sources (the fixed code is stdlib, a runtime, a script or a tool
+      the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG477. **SSH: after the first key exchange, an SSH_MSG_NEWKEYS that
       arrives before a re-key's ECDH (or outside any re-key) is accepted,
       re-installs the old keys as "new" and completes the key exchange,
       because pending_in_key is never cleared.** stdlib/ssh.fd ssh_on_newkeys
@@ -6790,7 +9073,16 @@ Same rules as the first run:
       proceeds. Fix: clear pending keys in ssh_kex_done and ssh_send_kexinit,
       or track the exchange state explicitly. Read only. Confidence: high
       (logic; not exercised).
-- [ ] BG478. **`cbor_diag` prints a float of magnitude >= 2^53 as a bare
+      Fixed Nov 27 (night): pending_in_key / pending_out_key are cleared when
+      an exchange ends and when a KEXINIT is sent, so a stray NEWKEYS hits the
+      existing "NEWKEYS before the key exchange" failure. Files:
+      stdlib/ssh.fd. Test: test_bg477_ssh_stray_newkeys.fd. Run with the fid
+      of Nov 27 01:25 on the tree's sources (the fixed code is stdlib, a
+      runtime, a script or a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG478. **`cbor_diag` prints a float of magnitude >= 2^53 as a bare
       integer ("340282346638528859811704183484516925440", 1e300 as 301
       digits), so the diagnostic notation names an integer, not a float.**
       stdlib/cbor.fd cbor_float_diag (the ".0" suffix is added only below
@@ -6806,7 +9098,16 @@ Same rules as the first run:
       -> a 301-digit integer. Expected "3.4028234663852886e+38" / "1.0e+300"
       (or at least a trailing ".0"). Confirmed Nov 27 (fid run). Confidence:
       high.
-- [ ] BG479. **inflate accepts a dynamic block whose Huffman code lengths are
+      Fixed Nov 27 (night): integral floats >= 2^53: below 10^16 "<digits>.0";
+      from 10^16 the shortest round-tripping "D.DDDe+E"
+      (3.4028234663852886e+38, 1.0e+300). Files: stdlib/cbor.fd. Test:
+      test_bg478_cbor_diag_big_float.fd. Run with the fid of Nov 27 01:25 on
+      the tree's sources (the fixed code is stdlib, a runtime, a script or a
+      tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG479. **inflate accepts a dynamic block whose Huffman code lengths are
       over-subscribed (an invalid prefix code) and decodes it, where zlib
       rejects the stream ("invalid literal/lengths set").** stdlib/compress.fd
       huff_build (counts lengths and builds the tables with no Kraft check),
@@ -6824,7 +9125,17 @@ Same rules as the first run:
       `inflate(raw)` returns 2 bytes "4141" ("AA"). Expected: empty (error).
       Confirmed Nov 27 (fid run; probe r2/crypto/p27.fd, data
       r2/crypto/over.hex). Confidence: high.
-- [ ] BG480. **A `fn bench_*()` that prints anything is reported as
+      Fixed Nov 27 (night): the code-length code must be complete;
+      literal/length and distance codes must not be over-subscribed and must
+      be complete except a single length-1 code (zlib/puff rules); a dynamic
+      block with no code for 256 is an error. Files: stdlib/compress.fd. Test:
+      test_bg479_inflate_oversubscribed.fd. Run with the fid of Nov 27 01:25
+      on the tree's sources (the fixed code is stdlib, a runtime, a script or
+      a tool the old fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG480. **A `fn bench_*()` that prints anything is reported as
       "10000000000 runs  0 ns/op": the timing is read from the bench's whole
       stdout.** compiler/main.fd cmd_test_file (bench loop: `us =
       str_parse_int(str_trim(c_file_read("_fides_bench_out.txt")))`, `if us >=
@@ -6840,7 +9151,14 @@ Same rules as the first run:
       runs  0 ns/op" (want the real time per op; the bench's output kept apart
       from the timing line). Confirmed Nov 27 (fb4 fid.exe, CC=zig cc).
       cmd_test_file unchanged since fb4. Confidence: high.
-- [ ] BG481. **`fid explain --alloc` says "no heap allocations" for a function
+      Fix written Nov 27 (night), not run yet: the harness prints
+      "\n__fid_bench_us <n>\n" after the bench; the loop reads the last such
+      line (missing: "FAIL <bench> (no timing line)"); reps is capped at 2^30
+      for the run made, not only checked after it. Files: compiler/main.fd. To
+      verify: build the compiler and run the test. Watch: none
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      test-runner-check.sh passes.
+- [x] BG481. **`fid explain --alloc` says "no heap allocations" for a function
       whose string `+` allocates: it knows `str_concat`, not the
       `p_str_concat` / `p_str_concat_int` the lowering calls.**
       compiler/checks.fd explain_alloc_kind (name list: "Str_dup",
@@ -6862,7 +9180,13 @@ Same rules as the first run:
       int_to_str(s);` (p_str_concat_int). Confirmed Nov 27 (fb4 fid.exe).
       explain_alloc_kind / explain_allocs unchanged since fb4. Confidence:
       high.
-- [ ] BG482. **`ark remove` of a source pact leaves ark_modules/<name>.fd in
+      Fix written Nov 27 (night), not run yet: p_str_concat and
+      p_str_concat_int are listed as "string concatenation (heap: a counted
+      string of dynamic length)". Files: compiler/checks.fd. To verify: build
+      the compiler and run the test. Watch: none
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      audit-explain-check.sh passes.
+- [x] BG482. **`ark remove` of a source pact leaves ark_modules/<name>.fd in
       place (and `ark install` keeps it), so `use <name>;` still builds after
       the dependency is gone.** compiler/ark.fd ark_cmd_remove (only
       `ark_bin_drop_iface(...)`, which deletes a file only when
@@ -6881,7 +9205,17 @@ Same rules as the first run:
       8, exit 0 (want: the pact's copy removed, `use libx` unresolved).
       Confirmed Nov 27 (fb4 `fid ark`, Windows). compiler/ark.fd identical in
       fb4 and the repo. Confidence: high.
-- [ ] BG483. **`fid --help`, `fid help` and `fid -h` print "Unknown command"
+      Fixed Nov 27 (night): remove deletes ark_modules/<name>.fd and
+      ark_modules/<name>/ (a link to the cache's checkout is only unlinked —
+      checked: the cache checkout stays) in ark_modules/ and
+      ark_modules/.dev/, and drops its ark.lock entry; not in a workspace
+      member (shared copy). Files: compiler/ark.fd. Test:
+      tests/ark/ark-safety.sh. Run with the fid of Nov 27 01:25 on the tree's
+      sources (the fixed code is stdlib, a runtime, a script or a tool the old
+      fid runs): the test passes.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      ark-safety.sh passes.
+- [x] BG483. **`fid --help`, `fid help` and `fid -h` print "Unknown command"
       and exit 1; the usage text never lists `lsp`, `repl`, `ark`, `notebook`
       or `test-rules`.** compiler/main.fd main (command search skips every
       `--` argument, so `--help` leaves `start == n` and `command = p_argv(n)`
@@ -6897,7 +9231,14 @@ Same rules as the first run:
       2>&1 | grep -c 'fid lsp\|fid repl\|fid ark'` -> 0. Confirmed Nov 27 (fb4
       fid.exe). main's dispatch and print_usage unchanged since fb4 (main.fd
       differs from fb4 only in cmd_fmt and cmd_ccompile). Confidence: high.
-- [ ] BG484. **`fid fmt` writes `opt ??0` (no space after `??`) and `val(a, b)
+      Fix written Nov 27 (night), not run yet: `--help`/`-h` (first argument)
+      and `help` print the usage, exit 0; only global flags: usage, exit 1 (no
+      empty "Unknown command: "); usage lists lsp, repl, ark, notebook,
+      test-rules, help. Files: compiler/main.fd. To verify: build the compiler
+      and run the test. Watch: none
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      doc-cli-check.sh passes.
+- [x] BG484. **`fid fmt` writes `opt ??0` (no space after `??`) and `val(a, b)
       = ...` for a destructuring `val`, and that becomes the style `fmt
       --check` enforces.** compiler/fmt.fd token spacing (try_multi_punct
       knows `??` as one 2-char operator; where its right-hand space and the
@@ -6915,7 +9256,16 @@ Same rules as the first run:
       (BG211), not in operator spacing. (Also checked: 33 tests/bootstrap/*.fd
       copies formatted, run before/after and formatted twice: all identical
       and idempotent, one 60 s timeout under load.). Confidence: high.
-- [ ] BG485. **On the Linux release archive `fid explain-error E044` prints
+      Fix written Nov 27 (night), not run yet: `??` and `|>` are spaced on
+      both sides like binary operators; `val`/`var`/`let` followed by `(`
+      keeps the space (a destructuring, not a call). Files: compiler/fmt.fd.
+      To verify: build the compiler and run the test. Watch: STYLE CHANGE for
+      the tree: 67 lines `var(`/`val(` in compiler/debugger.fd, embedded.fd,
+      hotreload.fd, native_debugger.fd, stdlib/calendar.fd, datetime.fd,
+      physics.fd, time.fd, tools/site.fd will be "would reformat" under ...
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      fmt-guard-check.sh passes.
+- [~] BG485. **On the Linux release archive `fid explain-error E044` prints
       only "docs/reference/error-codes.md has its meaning": the archive ships
       no docs/, and that is the text explain-error reads.**
       .github/workflows/release.yml job `linux`, step "Pack
@@ -6937,7 +9287,15 @@ Same rules as the first run:
       example and Fix). Confirmed Nov 27 (fb4 fid.exe copied into that layout
       on Windows; the release.yml pack step read). explain_error_text
       unchanged since fb4. Confidence: high.
-- [ ] BG486. **`fid run p.fd --crash-report` reports the user program's own
+      Fix written Nov 27 (night), not run yet: the tarball ships
+      docs/reference/error-codes.md; the unpack step runs `fid explain-error
+      E044` from an empty dir without FID_HOME and greps '^## E044'. YAML
+      parses. Files: .github/workflows/release.yml. To verify: build the
+      compiler and run the test.
+      Not verifiable on this machine (Nov 28). Left: release.yml runs only on
+      a v* tag or a dispatch; the archive layout was simulated, not built by
+      the workflow.
+- [x] BG486. **`fid run p.fd --crash-report` reports the user program's own
       panic as a crash of fid ("=== fid crash report === ... Please report
       it"), and `--reduce` then shrinks the user's program.** compiler/main.fd
       crash_report_run (`panic_at` = the first stderr line containing
@@ -6957,7 +9315,18 @@ Same rules as the first run:
       main", "reduce: fid reduce p.fd --cmd ...", "Please report it ...", exit
       1 (want: the program's panic only; no fid crash). Confirmed Nov 27 (fb4
       fid.exe). crash_report_run unchanged since fb4. Confidence: high.
-- [ ] BG487. **`fid fmt --check` can never pass on a CRLF file with a
+      Fix written Nov 27 (night), not run yet: under FID_CRASH_TRACE cmd_run
+      lowers and runs in two steps with stage markers ("front end and lowering
+      (fid run)", then CRASH_STAGE_PROGRAM); once the program stage started,
+      crash_report_run reports a crash only if fid itself died (rc < 0 or >
+      255, Segmentation / Access violation, a C-runtime stack overflow not
+      prefixed "Panic") Files: compiler/main.fd, compiler/compiler.fd. To
+      verify: build the compiler and run the test. Watch: an interpreter bug
+      that panics in interp.fd (not a crash) during the program stage is no
+      longer reported as a fid crash
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      run-cli-check.sh passes.
+- [x] BG487. **`fid fmt --check` can never pass on a CRLF file with a
       multi-line string literal (and `-w` says "formatted" every time): the
       BG124 comparison strips the CRs inside the string too.**
       compiler/main.fd cmd_fmt (`var same: bool = formatted ==
@@ -6977,7 +9346,13 @@ Same rules as the first run:
       of the same file -> "already formatted". Confirmed Nov 27 (fb4 fid.exe).
       The `same` line is unchanged between fb4 and the repo (cmd_fmt differs
       only in its argument parsing, BG237). Confidence: high.
-- [ ] BG488. **The LSP server ignores the shutdown handshake: `exit` without a
+      Fix written Nov 27 (night), not run yet: `same` compares both sides with
+      every CR removed (the literal's own CR stays in `formatted`). Files:
+      compiler/main.fd. To verify: build the compiler and run the test. Watch:
+      none
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      fmt-guard-check.sh passes.
+- [x] BG488. **The LSP server ignores the shutdown handshake: `exit` without a
       prior `shutdown` ends with status 0, and requests after `shutdown` are
       still served.** compiler/lsp.fd lsp_run (method dispatch: `"shutdown"`
       only answers `null`; `"exit"` always `return 0`; no shutdown flag): the
@@ -6992,7 +9367,17 @@ Same rules as the first run:
       Confirmed Nov 27 (fb4 `fid lsp`, Python driver: "exit code: 0"); the
       after-shutdown half read only. compiler/lsp.fd identical in fb4 and the
       repo. Confidence: high.
-- [ ] BG489. **An enum-variant pattern against a scrutinee that is no enum
+      Fix written Nov 27 (night), not run yet: a shut_down flag. After
+      `shutdown`, a request (it has an id) gets error -32600 "the server is
+      shut down: only exit is accepted" and a notification is dropped. `exit`
+      returns 0 after shutdown, else 1. EOF still returns 0. Files:
+      compiler/lsp.fd. Test: scripts/tl/lsp_bug_fixes.py. To verify: build the
+      compiler and run the test. Watch: a client that sends exit without
+      shutdown now sees 1. Every existing probe (lsp_probe, lsp_tl4_features,
+      lsp_scope/uri/serve probes) sends shutdown first.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree:
+      lsp_bug_fixes.py passes.
+- [x] BG489. **An enum-variant pattern against a scrutinee that is no enum
       still checks clean and crashes at runtime — the BG129 guard only fires
       when the scrutinee is a known enum.** compiler/typechecker.fd
       TypeChecker_check_enum_pattern (~26038): the BG129 fix resolves the
@@ -7012,7 +9397,15 @@ Same rules as the first run:
       Confirmed Nov 27 (`fid check` clean, `fid run` crash, release
       fid.exe); TypeChecker_check_enum_pattern read in the current source
       and the `scrut == ""` path confirmed open. Confidence: high.
-- [ ] BG490. **A generic call whose argument is a method call takes the
+      The same bug as BG393 (filed again); its fix covers both: an enum
+      pattern against a scrutinee that is not an enum is a type error now
+      (tc-b, typechecker.fd TypeChecker_check_enum_pattern). Test:
+      test_bg489_result_pattern_on_str_fail.fd. Fix written Nov 27 (night),
+      not run yet.
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      test passes on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).
+- [x] BG490. **A generic call whose argument is a method call takes the
       type parameter from the method's receiver, not its result:
       `assert_eq(0, q.len())` with `q: Vec<str>` is instantiated as
       `assert_eq__Vec__str`.** compiler/mono.fd / compiler/typechecker.fd
@@ -7040,3 +9433,18 @@ Same rules as the first run:
       (the parameter taken from the wrong argument).
       Confirmed Nov 27 on release/fid-night.exe and release/stage0/fid.exe;
       the IR read with `fid explain --stages main`. Confidence: high.
+      Fix written Nov 27 (night), not run yet: infer_expr_type's MethodCall
+      arm fell back to the receiver's type for any method it did not list, and
+      infer_subst lets the last argument win, so `same(0, q.len())` bound T =
+      Vec<str>. A method whose result is known now gives that result: Vec
+      len/capacity/find/position/index_of -> i64,
+      is_empty/contains/any/all/contains_val -> bool. Files: compiler/mono.fd.
+      Test: test_bg490_assert_eq_args.fd,
+      test_bg490_generic_arg_method_call.fd. To verify: build the compiler and
+      run the tests. Watch: every infer_expr_type caller (collect/fixup of
+      generic calls, method_subst arg types, let-inference of `val n =
+      v.len()`, fixup_hinted_call) now sees i64/bool for these method calls
+      where it saw the receiver type;
+      Verified Nov 28 with a compiler built from the Nov 27 night tree: its
+      tests pass on run, ccompile, emit and --nat (the backends a test names,
+      where it names them).

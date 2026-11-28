@@ -1,0 +1,91 @@
+// BG405 (docs/roadmap/bugs-roadmap.md): an LwM2M Write writes only the
+// object instance / resource of its URI (OMA LwM2M 1.1 §6.3): a SenML
+// record or TLV entry naming another resource, instance or object makes the
+// request 4.00 Bad Request with nothing written; SenML values must match the
+// resource's defined type, and a pack that fails half-way applies nothing.
+//
+// Expected output:
+// evil pack to /3/0/14: 4.00 manufacturer=ACME /5/0/1 absent battery=80 type int
+// senml /3/0/14 by n: 2.04 utc=+02:00
+// senml /3/0/14 by bn+n: 2.04 utc=+03:00
+// senml string into Integer /3/0/9: 4.00 battery=80
+// half-failing pack: 4.00 utc=+03:00
+// good pack to /3/0: 2.04 battery=55 utc=Z
+// senml /3/0 record for /3/1/0: 4.00 /3/1 absent
+// tlv resource 0 to /3/0/14: 4.00 manufacturer=ACME
+// tlv resource 14 to /3/0/14: 2.04 utc=+06:00
+// tlv instance 1 to /3/0: 4.00 /3/1 absent manufacturer=ACME
+// tlv instance 0 to /3/0: 2.04 manufacturer=ABCD
+use lwm2m;
+use coap;
+use encoding;
+
+fn req(code: i64, path: str, cf: i64, payload: Vec<i64>) -> CoapMsg {
+    var m: CoapMsg = coap_msg(COAP_CON, code, 1);
+    coap_set_uri(&mut m, path);
+    coap_add_uint(&mut m, COAP_O_CONTENT_FORMAT, cf);
+    m.payload = payload;
+    return m;
+}
+
+fn senml(s: &mut Lwm2mStore, code: i64, path: str, text: str) -> str {
+    val r: CoapMsg = lwm2m_handle_request(s, &req(code, path, LWM2M_CF_SENML_JSON, str_bytes(text)));
+    return coap_code_str(r.code);
+}
+
+fn tlv(s: &mut Lwm2mStore, code: i64, path: str, hex: str) -> str {
+    val r: CoapMsg = lwm2m_handle_request(s, &req(code, path, LWM2M_CF_TLV, hex_decode_bytes(hex)));
+    return coap_code_str(r.code);
+}
+
+fn absent(s: &Lwm2mStore, obj: i64, inst: i64) -> str {
+    if lwm2m_has_instance(s, obj, inst) {
+        return "present";
+    }
+    return "absent";
+}
+
+fn main() {
+    var s: Lwm2mStore = lwm2m_store_new();
+    lwm2m_define_device(&mut s);
+    lwm2m_set_str(&mut s, 3, 0, 0, -1, "ACME");
+    lwm2m_set_int(&mut s, 3, 0, 9, -1, 80);
+    lwm2m_set_str(&mut s, 3, 0, 14, -1, "+01:00");
+
+    // the entry's trigger
+    val c1: str = senml(&mut s, COAP_PUT, "/3/0/14", "[{\"n\":\"/3/0/0\",\"vs\":\"EVIL\"},{\"n\":\"/5/0/1\",\"vs\":\"http://x/fw\"},{\"n\":\"/3/0/9\",\"vs\":\"str in int\"}]");
+    var fw: str = "absent";
+    if lwm2m_find(&s, 5, 0, 1, -1) >= 0 {
+        fw = "present";
+    }
+    var bt: str = "other";
+    val k9: i64 = lwm2m_find(&s, 3, 0, 9, -1);
+    if k9 >= 0 && s.types.get(k9) == LWM2M_INT {
+        bt = "int";
+    }
+    println("evil pack to /3/0/14: " + c1 + " manufacturer=" + lwm2m_get_str(&s, 3, 0, 0, -1) + " /5/0/1 " + fw + " battery=" + int_to_str(lwm2m_get_int(&s, 3, 0, 9, -1, -1)) + " type " + bt);
+
+    val c2: str = senml(&mut s, COAP_PUT, "/3/0/14", "[{\"n\":\"/3/0/14\",\"vs\":\"+02:00\"}]");
+    println("senml /3/0/14 by n: " + c2 + " utc=" + lwm2m_get_str(&s, 3, 0, 14, -1));
+    val c3: str = senml(&mut s, COAP_PUT, "/3/0/14", "[{\"bn\":\"/3/0/\",\"n\":\"14\",\"vs\":\"+03:00\"}]");
+    println("senml /3/0/14 by bn+n: " + c3 + " utc=" + lwm2m_get_str(&s, 3, 0, 14, -1));
+    val c4: str = senml(&mut s, COAP_PUT, "/3/0/9", "[{\"n\":\"/3/0/9\",\"vs\":\"x\"}]");
+    println("senml string into Integer /3/0/9: " + c4 + " battery=" + int_to_str(lwm2m_get_int(&s, 3, 0, 9, -1, -1)));
+    val c5: str = senml(&mut s, COAP_POST, "/3/0", "[{\"n\":\"/3/0/14\",\"vs\":\"+05:00\"},{\"n\":\"/3/0/9\",\"vb\":true}]");
+    println("half-failing pack: " + c5 + " utc=" + lwm2m_get_str(&s, 3, 0, 14, -1));
+    val c6: str = senml(&mut s, COAP_POST, "/3/0", "[{\"bn\":\"/3/0/\",\"n\":\"9\",\"v\":55},{\"n\":\"14\",\"vs\":\"Z\"}]");
+    println("good pack to /3/0: " + c6 + " battery=" + int_to_str(lwm2m_get_int(&s, 3, 0, 9, -1, -1)) + " utc=" + lwm2m_get_str(&s, 3, 0, 14, -1));
+    val c7: str = senml(&mut s, COAP_POST, "/3/0", "[{\"n\":\"/3/1/0\",\"vs\":\"X\"}]");
+    println("senml /3/0 record for /3/1/0: " + c7 + " /3/1 " + absent(&s, 3, 1));
+
+    // TLV: resource 0 = "EVIL" (c4 00 45 56 49 4c) sent to /3/0/14
+    val t1: str = tlv(&mut s, COAP_PUT, "/3/0/14", "c4004556494c");
+    println("tlv resource 0 to /3/0/14: " + t1 + " manufacturer=" + lwm2m_get_str(&s, 3, 0, 0, -1));
+    val t2: str = tlv(&mut s, COAP_PUT, "/3/0/14", "c60e2b30363a3030");
+    println("tlv resource 14 to /3/0/14: " + t2 + " utc=" + lwm2m_get_str(&s, 3, 0, 14, -1));
+    // object instance 1 holding resource 0 = "EVIL", sent to /3/0
+    val t3: str = tlv(&mut s, COAP_PUT, "/3/0", "0601c4004556494c");
+    println("tlv instance 1 to /3/0: " + t3 + " /3/1 " + absent(&s, 3, 1) + " manufacturer=" + lwm2m_get_str(&s, 3, 0, 0, -1));
+    val t4: str = tlv(&mut s, COAP_POST, "/3/0", "0600c40041424344");
+    println("tlv instance 0 to /3/0: " + t4 + " manufacturer=" + lwm2m_get_str(&s, 3, 0, 0, -1));
+}

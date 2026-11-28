@@ -1,0 +1,92 @@
+// BG448 (docs/roadmap/bugs-roadmap.md): ARINC 653 ports enforce the
+// configured message size (INVALID_CONFIG) and the port direction
+// (INVALID_MODE) as SEND_QUEUING_MESSAGE / WRITE_SAMPLING_MESSAGE say, and
+// arinc_queuing_port_receive_message removes the message it returns, so a
+// queue drains and its receiver sees each message once, in order.
+//
+// Expected output:
+// send on destination: INVALID_MODE
+// send 5 bytes, max 4: INVALID_CONFIG
+// send 4 bytes, max 4: NO_ERROR
+// sampling write on destination: INVALID_MODE
+// sampling write 3 bytes, max 2: INVALID_CONFIG
+// sampling still invalid: true
+// sampling write 2 bytes on source: NO_ERROR
+// queue full: PORT_FULL
+// moved to destination: 2
+// receive on source: INVALID_MODE
+// receive 1: NO_ERROR 1 1 1 1
+// receive 2: NO_ERROR 2 2 2
+// receive 3: PORT_EMPTY 0
+// send again after drain: NO_ERROR NO_ERROR count 2
+// moved 2, receive: 7 then 8
+// sampling channel: NO_ERROR read 9 9 valid true
+use arinc;
+
+fn msg(v: i64, n: i64) -> Vec<i64> {
+    var m: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        m.push(v);
+        i = i + 1;
+    }
+    return m;
+}
+
+fn vs(v: &Vec<i64>) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < v.len() {
+        s = s + " " + int_to_str(v.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    // the entry's triggers
+    var d: QueuingPort = arinc_queuing_port_create("cmd", 4, 2, ARINC_PORT_DESTINATION, ARINC_PORT_FIFO);
+    println("send on destination: " + arinc_error_name(arinc_queuing_port_send(&mut d, msg(1, 5))));
+    var src: QueuingPort = arinc_queuing_port_create("cmd", 2, 4, ARINC_PORT_SOURCE, ARINC_PORT_FIFO);
+    println("send 5 bytes, max 4: " + arinc_error_name(arinc_queuing_port_send(&mut src, msg(1, 5))));
+    println("send 4 bytes, max 4: " + arinc_error_name(arinc_queuing_port_send(&mut src, msg(1, 4))));
+    var sd: SamplingPort = arinc_sampling_port_create("s", 2, ARINC_PORT_DESTINATION, 100);
+    println("sampling write on destination: " + arinc_error_name(arinc_sampling_port_write(&mut sd, msg(3, 3), 10)));
+    var ss: SamplingPort = arinc_sampling_port_create("s", 2, ARINC_PORT_SOURCE, 100);
+    println("sampling write 3 bytes, max 2: " + arinc_error_name(arinc_sampling_port_write(&mut ss, msg(3, 3), 10)));
+    var inv: str = "false";
+    if !arinc_sampling_port_is_valid(ss, 10) {
+        inv = "true";
+    }
+    println("sampling still invalid: " + inv);
+    println("sampling write 2 bytes on source: " + arinc_error_name(arinc_sampling_port_write(&mut ss, msg(9, 2), 10)));
+
+    // drain: source (2 slots) -> channel -> destination (4 slots)
+    arinc_queuing_port_send(&mut src, msg(2, 3));
+    println("queue full: " + arinc_error_name(arinc_queuing_port_send(&mut src, msg(5, 1))));
+    var dst: QueuingPort = arinc_queuing_port_create("cmd", 4, 4, ARINC_PORT_DESTINATION, ARINC_PORT_FIFO);
+    println("moved to destination: " + int_to_str(arinc_queuing_channel_transfer(&mut src, &mut dst)));
+    var out: Vec<i64> = Vec::new();
+    println("receive on source: " + arinc_error_name(arinc_queuing_port_receive_message(&mut src, &mut out)));
+    val r1: i64 = arinc_queuing_port_receive_message(&mut dst, &mut out);
+    println("receive 1: " + arinc_error_name(r1) + vs(&out));
+    val r2: i64 = arinc_queuing_port_receive_message(&mut dst, &mut out);
+    println("receive 2: " + arinc_error_name(r2) + vs(&out));
+    val r3: i64 = arinc_queuing_port_receive_message(&mut dst, &mut out);
+    println("receive 3: " + arinc_error_name(r3) + " " + int_to_str(out.len()));
+    val a1: i64 = arinc_queuing_port_send(&mut src, msg(7, 1));
+    val a2: i64 = arinc_queuing_port_send(&mut src, msg(8, 1));
+    println("send again after drain: " + arinc_error_name(a1) + " " + arinc_error_name(a2) + " count " + int_to_str(arinc_queuing_port_count(src)));
+    val mv: i64 = arinc_queuing_channel_transfer(&mut src, &mut dst);
+    arinc_queuing_port_receive_message(&mut dst, &mut out);
+    val f1: i64 = out.get(0);
+    arinc_queuing_port_receive_message(&mut dst, &mut out);
+    println("moved " + int_to_str(mv) + ", receive: " + int_to_str(f1) + " then " + int_to_str(out.get(0)));
+
+    val st: i64 = arinc_sampling_channel_transfer(&ss, &mut sd);
+    var vd: str = "false";
+    if arinc_sampling_port_is_valid(sd, 50) {
+        vd = "true";
+    }
+    println("sampling channel: " + arinc_error_name(st) + " read" + vs(&arinc_sampling_port_read(sd)) + " valid " + vd);
+}

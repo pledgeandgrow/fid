@@ -270,6 +270,16 @@ pub struct Memory {
     // A host string's address -> the address of the copy Memory_store_cstr
     // made of it (checked before reuse: Memory_cstr_cached)
     pub cstr_cache: I64Table,
+    // BG436: the copies a string that is no longer used can give back
+    // (Interpreter_own_*). cstr_own: a host string that p_str_concat,
+    // p_str_concat_int or p_str_append made -> Value::Int(0) (no copy yet)
+    // or Value::Int(code) once one Store put its copy at one slot (code:
+    // copy address << 32 | slot | OWN_DROPPED | OWN_GONE); and copy address
+    // + OWN_REV_KEY -> Value::Int(host string). cstr_keep: the same host
+    // strings -> Value::Str (each stays alive, so its address names it, while
+    // it has an entry).
+    pub cstr_own: I64Table,
+    pub cstr_keep: I64Table,
     // roadmap P12, FID_MEM_LIMIT under `fid run` (interp_lim_setup): the
     // limit (0: none, and nothing below is kept), the live bytes of the
     // program's heap as the C runtime counts them (each block Memory_alloc
@@ -289,6 +299,34 @@ pub struct Memory {
     // caller that does not check it hands back as a fake address (a
     // string's bytes at 16). The instruction may still finish;
     // Interpreter_run_function stops the program once it does.
+    pub oom_hit: i64,
+    // BG229: the open txn blocks' write log (Memory_tx_begin). A txn used
+    // to keep a full copy of this memory; now each byte written while one
+    // is open has its old value noted once per txn (tx_seen: address -> the
+    // id of the txn that noted it), with the block table's and the free
+    // lists' changes, so a rollback puts back what was written and nothing
+    // else is copied. tx_serial is the innermost open txn's id (0: none).
+    pub tx_marks: Vec<MemTxMark>,
+    pub tx_serial: i64,
+    pub tx_next: i64,
+    pub tx_addr: Vec<i64>,
+    pub tx_old: Vec<i64>,
+    pub tx_seen: I64Table,
+    pub tx_blk_addr: Vec<i64>,
+    pub tx_blk_old: Vec<Value>,
+    pub tx_blk_had: Vec<bool>,
+    pub tx_head_cls: Vec<i64>,
+    pub tx_head_old: Vec<i64>,
+}
+
+/// BG229: where an open txn's part of Memory's write log starts, the
+/// enclosing txn's id, and the allocator's words when it began.
+pub struct MemTxMark {
+    pub serial: i64,
+    pub log_len: i64,
+    pub blk_len: i64,
+    pub head_len: i64,
+    pub next_alloc: i64,
     pub oom_hit: i64,
 }
 
@@ -493,8 +531,158 @@ pub fn Memory_new() -> Memory {
         hi = hi + 1;
     }
     return Memory {
-        data: data, next_alloc: 0x1000, blocks: I64Table_new(), free_heads: heads, cstr_cache: I64Table_new(), lim_max: 0, lim_used: 0, lim_sizes: I64Table_new(), lim_hit_used: 0, lim_hit_want: 0, oom_hit: 0
+        data: data, next_alloc: 0x1000, blocks: I64Table_new(), free_heads: heads, cstr_cache: I64Table_new(), cstr_own: I64Table_new(), cstr_keep: I64Table_new(), lim_max: 0, lim_used: 0, lim_sizes: I64Table_new(), lim_hit_used: 0, lim_hit_want: 0, oom_hit: 0, tx_marks: Vec::new(), tx_serial: 0, tx_next: 0, tx_addr: Vec::new(), tx_old: Vec::new(), tx_seen: I64Table_new(), tx_blk_addr: Vec::new(), tx_blk_old: Vec::new(), tx_blk_had: Vec::new(), tx_head_cls: Vec::new(), tx_head_old: Vec::new()
     };
+}
+
+/// BG229: byte `addr` (inside Memory.data) becomes `b`. Inside a txn the
+/// byte it held is noted first, once per txn (Memory_tx_rollback puts it
+/// back). Every write of Memory.data goes through here.
+pub fn Memory_put(self: &mut Memory, addr: i64, b: i64) {
+    if self.tx_serial != 0 {
+        Memory_tx_note(self, addr);
+    }
+    self.data.set(addr, b);
+}
+
+fn Memory_tx_note(self: &mut Memory, addr: i64) {
+    match I64Table_get(&self.tx_seen, addr) {
+        OptValue::Some(sv) => {
+            match sv {
+                Value::Int(sn) => {
+                    if sn == self.tx_serial {
+                        return;
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        OptValue::None => {
+        }
+    }
+    I64Table_set(&mut self.tx_seen, addr, Value::Int(self.tx_serial));
+    val ob: i64 = self.data.get(addr);
+    self.tx_addr.push(addr);
+    self.tx_old.push(ob);
+}
+
+/// BG229: the block table's entry for `addr` becomes `v` (noted inside a
+/// txn).
+pub fn Memory_set_block(self: &mut Memory, addr: i64, v: Value) {
+    if self.tx_serial != 0 {
+        self.tx_blk_addr.push(addr);
+        match I64Table_get(&self.blocks, addr) {
+            OptValue::Some(ov) => {
+                self.tx_blk_old.push(ov);
+                self.tx_blk_had.push(true);
+            }
+            OptValue::None => {
+                self.tx_blk_old.push(Value::Void);
+                self.tx_blk_had.push(false);
+            }
+        }
+    }
+    I64Table_set(&mut self.blocks, addr, v);
+}
+
+/// BG229: size class `cls`'s first free block becomes `v` (noted inside a
+/// txn).
+fn Memory_set_head(self: &mut Memory, cls: i64, v: i64) {
+    if self.tx_serial != 0 {
+        val oh: i64 = self.free_heads.get(cls);
+        self.tx_head_cls.push(cls);
+        self.tx_head_old.push(oh);
+    }
+    self.free_heads.set(cls, v);
+}
+
+/// BG229: how many txn blocks are open.
+pub fn Memory_tx_depth(self: &Memory) -> i64 {
+    return self.tx_marks.len();
+}
+
+/// BG229: a txn begins: from here every write is noted.
+pub fn Memory_tx_begin(self: &mut Memory) {
+    self.tx_next = self.tx_next + 1;
+    self.tx_marks.push(MemTxMark {
+        serial: self.tx_serial, log_len: self.tx_addr.len(), blk_len: self.tx_blk_addr.len(), head_len: self.tx_head_cls.len(), next_alloc: self.next_alloc, oom_hit: self.oom_hit
+    });
+    self.tx_serial = self.tx_next;
+}
+
+/// The log is empty once no txn is open.
+fn Memory_tx_clear_if_closed(self: &mut Memory) {
+    if self.tx_marks.len() > 0 {
+        return;
+    }
+    self.tx_serial = 0;
+    self.tx_addr = Vec::new();
+    self.tx_old = Vec::new();
+    self.tx_seen = I64Table_new();
+    self.tx_blk_addr = Vec::new();
+    self.tx_blk_old = Vec::new();
+    self.tx_blk_had = Vec::new();
+    self.tx_head_cls = Vec::new();
+    self.tx_head_old = Vec::new();
+}
+
+/// BG229: the innermost txn ends and keeps its writes (an enclosing txn
+/// still holds their old values).
+pub fn Memory_tx_commit(self: &mut Memory) {
+    if self.tx_marks.len() == 0 {
+        return;
+    }
+    var mk: MemTxMark = self.tx_marks.get(self.tx_marks.len() - 1);
+    self.tx_marks.pop();
+    self.tx_serial = mk.serial;
+    Memory_tx_clear_if_closed(self);
+}
+
+/// BG229: the innermost txn ends and its writes are put back, newest
+/// first: the bytes, the block table, the free lists and the heap's end.
+pub fn Memory_tx_rollback(self: &mut Memory) {
+    if self.tx_marks.len() == 0 {
+        return;
+    }
+    var mk: MemTxMark = self.tx_marks.get(self.tx_marks.len() - 1);
+    self.tx_marks.pop();
+    var i: i64 = self.tx_addr.len() - 1;
+    while i >= mk.log_len {
+        val ua: i64 = self.tx_addr.get(i);
+        val ub: i64 = self.tx_old.get(i);
+        self.data.set(ua, ub);
+        self.tx_addr.pop();
+        self.tx_old.pop();
+        i = i - 1;
+    }
+    var bi: i64 = self.tx_blk_addr.len() - 1;
+    while bi >= mk.blk_len {
+        val ba: i64 = self.tx_blk_addr.get(bi);
+        if self.tx_blk_had.get(bi) {
+            val bv: Value = self.tx_blk_old.get(bi);
+            I64Table_set(&mut self.blocks, ba, bv);
+        } else {
+            I64Table_remove(&mut self.blocks, ba);
+        }
+        self.tx_blk_addr.pop();
+        self.tx_blk_old.pop();
+        self.tx_blk_had.pop();
+        bi = bi - 1;
+    }
+    var hi: i64 = self.tx_head_cls.len() - 1;
+    while hi >= mk.head_len {
+        val hc: i64 = self.tx_head_cls.get(hi);
+        val hv: i64 = self.tx_head_old.get(hi);
+        self.free_heads.set(hc, hv);
+        self.tx_head_cls.pop();
+        self.tx_head_old.pop();
+        hi = hi - 1;
+    }
+    self.next_alloc = mk.next_alloc;
+    self.oom_hit = mk.oom_hit;
+    self.tx_serial = mk.serial;
+    Memory_tx_clear_if_closed(self);
 }
 
 /// A zeroed block of at least `size` bytes, 8-byte aligned: a freed block
@@ -572,14 +760,14 @@ fn Memory_alloc_in(self: &mut Memory, size: i64, counted: bool) -> i64 {
         var head: i64 = self.free_heads.get(cls);
         if head != 0 {
             var after: i64 = Memory_load_i64(self, head);
-            self.free_heads.set(cls, after);
+            Memory_set_head(self, cls, after);
             // zeroed, as new memory is (C's alloca slots are memset too)
             var zi: i64 = 0;
             while zi < csize {
-                self.data.set(head + zi, 0);
+                Memory_put(self, head + zi, 0);
                 zi = zi + 1;
             }
-            I64Table_set(&mut self.blocks, head, Value::Int(csize));
+            Memory_set_block(self, head, Value::Int(csize));
             if counted && self.lim_max > 0 {
                 Memory_lim_take(self, head, size);
             }
@@ -596,7 +784,7 @@ fn Memory_alloc_in(self: &mut Memory, size: i64, counted: bool) -> i64 {
         self.oom_hit = 1;
         return 0;
     }
-    I64Table_set(&mut self.blocks, addr, Value::Int(csize));
+    Memory_set_block(self, addr, Value::Int(csize));
     // blocks start 8-byte aligned, as malloc's do: core takes an unaligned
     // string pointer for one without a header (p_str_hdr_len)
     self.next_alloc = addr + csize;
@@ -645,7 +833,7 @@ fn Memory_free_in(self: &mut Memory, addr: i64, counted: bool) -> str {
         _ => {
         }
     }
-    I64Table_set(&mut self.blocks, addr, Value::Void);
+    Memory_set_block(self, addr, Value::Void);
     if counted && self.lim_max > 0 {
         match I64Table_get(&self.lim_sizes, addr) {
             OptValue::Some(lv) => {
@@ -667,7 +855,7 @@ fn Memory_free_in(self: &mut Memory, addr: i64, counted: bool) -> str {
         if cls < self.free_heads.len() {
             var next_free: i64 = self.free_heads.get(cls);
             Memory_store_i64(self, addr, next_free);
-            self.free_heads.set(cls, addr);
+            Memory_set_head(self, cls, addr);
         }
     }
     return "";
@@ -728,7 +916,7 @@ pub fn Memory_store_byte(self: &mut Memory, addr: i64, b: i64) {
             self.data.push(0);
         }
     }
-    self.data.set(addr, b & 0xFF);
+    Memory_put(self, addr, b & 0xFF);
 }
 
 // Load a single byte from addr
@@ -855,6 +1043,40 @@ pub fn f32_from_bits_i(bits: i64) -> f64 {
 
 /// BG66: an f64 rounded to single precision (the nearest f32), the value an
 /// f32 register holds after an operation or a conversion
+/// BG337: an integer as an f64 that rounds to the same f32 as the integer
+/// itself: bits below the 53 an f64 holds are folded into one sticky bit
+/// (round to odd), so the one rounding to f32 that follows is the only
+/// rounding. `uns`: the word is a u64 (at or above 2^63 when negative).
+pub fn interp_int_to_f32_exact(i: i64, uns: bool) -> f64 {
+    var neg: bool = false;
+    var m: i64 = i;
+    if !uns && i < 0 {
+        if i == (0 - 9223372036854775807 - 1) {
+            return -9223372036854775808.0;
+        }
+        neg = true;
+        m = 0 - i;
+    }
+    var scale: f64 = 1.0;
+    var sticky: i64 = 0;
+    if m < 0 {
+        // a u64 at or above 2^63: one logical shift first
+        sticky = m & 1;
+        m = (m >> 1) & 9223372036854775807;
+        scale = 2.0;
+    }
+    while m >= 9007199254740992 {
+        sticky = sticky | (m & 1);
+        m = m >> 1;
+        scale = scale * 2.0;
+    }
+    var f: f64 = ((m | sticky) as f64) * scale;
+    if neg {
+        f = 0.0 - f;
+    }
+    return f;
+}
+
 pub fn interp_round_f32(f: f64) -> f64 {
     if f != f {
         return f;
@@ -948,14 +1170,14 @@ pub fn Memory_copy(self: &mut Memory, dst: i64, src: i64, size: i64) {
     if dst > src && dst < src + size {
         var j: i64 = size - 1;
         while j >= 0 {
-            self.data.set(dst + j, Memory_load_byte(self, src + j));
+            Memory_put(self, dst + j, Memory_load_byte(self, src + j));
             j = j - 1;
         }
         return;
     }
     var i: i64 = 0;
     while i < size {
-        self.data.set(dst + i, Memory_load_byte(self, src + i));
+        Memory_put(self, dst + i, Memory_load_byte(self, src + i));
         i = i + 1;
     }
 }
@@ -964,6 +1186,17 @@ pub fn Memory_copy(self: &mut Memory, dst: i64, src: i64, size: i64) {
 // the bytes and a terminator. Returns the address of the bytes; zero bytes
 // inside the string are kept, and str_len reads the header.
 pub fn Memory_store_cstr(self: &mut Memory, s: str) -> i64 {
+    return Memory_store_cstr_at(self, s, 0);
+}
+
+/// Memory_store_cstr for a Store of `s` into the slot `holder` (0: any
+/// other use). BG436: the first copy of a string p_str_concat made, put at
+/// one slot, is that slot's alone (Memory_own_hold): it can be given back
+/// once the string is dropped and the slot no longer holds it. A copy made
+/// for anything else (a parameter, a Vec word) may be kept anywhere: that
+/// string is never given back (Memory_own_forget). Using a copy that is
+/// already there (a borrow) changes nothing.
+pub fn Memory_store_cstr_at(self: &mut Memory, s: str, holder: i64) -> i64 {
     var slen: i64 = str_len(s);
     // The same string stored before and still there unchanged: that copy
     // (stdlib-agent-bugs 20: a string passed to a `str` or i64 parameter was
@@ -972,10 +1205,20 @@ pub fn Memory_store_cstr(self: &mut Memory, s: str) -> i64 {
     if cached > 0 {
         return cached;
     }
+    var own_hold: bool = false;
+    if self.cstr_own.live > 0 {
+        own_hold = holder > 0 && Memory_own_state(self, s as i64) == 0;
+        if !own_hold {
+            Memory_own_forget(self, s as i64);
+        }
+    }
     var block: i64 = Memory_alloc(self, slen + 17);
     if block == 0 {
         // INTERP_MEM_LIMIT is used up (oom_hit): 0 here, not a block whose
         // bytes address (16) a later drop would read as a pointer
+        if own_hold {
+            Memory_own_forget(self, s as i64);
+        }
         return 0;
     }
     Memory_store_i64(self, block, 0x4649444553545201);
@@ -983,7 +1226,7 @@ pub fn Memory_store_cstr(self: &mut Memory, s: str) -> i64 {
     var addr: i64 = block + 16;
     // Freeing the bytes' address directly (not through p_str_free) is a
     // free of this string too
-    I64Table_set(&mut self.blocks, addr, Value::Int(1));
+    Memory_set_block(self, addr, Value::Int(1));
     var i: i64 = 0;
     while i < slen {
         // Read byte from string using pointer arithmetic
@@ -999,7 +1242,132 @@ pub fn Memory_store_cstr(self: &mut Memory, s: str) -> i64 {
     }
     Memory_store_byte(self, addr + slen, 0);
     I64Table_set(&mut self.cstr_cache, s as i64, Value::Int(addr));
+    if own_hold {
+        Memory_own_hold(self, s as i64, addr, holder);
+    }
     return addr;
+}
+
+// ---------------------------------------------------------------------------
+// BG436: giving back the copies of strings that are no longer used. The
+// compiled backends free a string when its last owner drops it (core's
+// Str_drop); the interpreter's strings are host values (Value::Str) whose
+// copies in its memory had no owner count, so none was ever freed and a
+// loop that keeps replacing a string ran out of the 127 MB heap. A string
+// p_str_concat / p_str_concat_int / p_str_append made (Memory_own_fresh)
+// whose copy one Store put at one slot (Memory_own_hold) is given back
+// (Interpreter_own_release) once both happened: its owner dropped it
+// (Str_drop, or p_str_append, which consumes its first operand) and the
+// slot stopped holding it (overwritten, or its frame or block freed:
+// Interpreter_own_gone, from the side table's set/remove). Anything else
+// that may keep the copy forgets the string, which is then never given
+// back (as before): a Str_dup of it or of its copy's address, a copy made
+// for any other use, p_to_str (which hands back the same string).
+// ---------------------------------------------------------------------------
+
+/// The low bits of a cstr_own code: dropped by its owner; its slot no
+/// longer holds it.
+const OWN_DROPPED: i64 = 1;
+const OWN_GONE: i64 = 2;
+/// cstr_own keys of the reverse entries (copy address -> host string):
+/// above every host address, below the sign bit.
+const OWN_REV_KEY: i64 = 0x4000000000000000;
+
+/// A string's cstr_own state: -1 none, 0 made with no copy yet, else its code.
+fn Memory_own_state(self: &Memory, p: i64) -> i64 {
+    match I64Table_get(&self.cstr_own, p) {
+        OptValue::Some(ov) => {
+            match ov {
+                Value::Int(c) => {
+                    return c;
+                }
+                _ => {
+                }
+            }
+        }
+        OptValue::None => {
+        }
+    }
+    return -1;
+}
+
+/// `r`, just made by a string operation, may be given back later: only a
+/// string with no copy and no entry yet (not one of its operands handed
+/// back as it is).
+pub fn Memory_own_fresh(self: &mut Memory, r: str) {
+    val rp: i64 = r as i64;
+    if rp <= 0 || rp >= OWN_REV_KEY {
+        return;
+    }
+    if I64Table_find(&self.cstr_cache, rp) >= 0 || I64Table_find(&self.cstr_own, rp) >= 0 {
+        return;
+    }
+    I64Table_set(&mut self.cstr_own, rp, Value::Int(0));
+    I64Table_set(&mut self.cstr_keep, rp, Value::Str(r));
+}
+
+/// The first copy of fresh string `p` is at `addr`, stored at slot `holder`.
+fn Memory_own_hold(self: &mut Memory, p: i64, addr: i64, holder: i64) {
+    if addr <= 0 || addr >= 0x80000000 || holder <= 0 || holder >= 0x100000000 || (holder & 3) != 0 {
+        Memory_own_forget(self, p);
+        return;
+    }
+    I64Table_set(&mut self.cstr_own, p, Value::Int((addr << 32) | holder));
+    I64Table_set(&mut self.cstr_own, addr + OWN_REV_KEY, Value::Int(p));
+}
+
+/// `p` is never given back: its entries go.
+pub fn Memory_own_forget(self: &mut Memory, p: i64) {
+    val c: i64 = Memory_own_state(self, p);
+    if c < 0 {
+        return;
+    }
+    if c > 0 {
+        I64Table_remove(&mut self.cstr_own, (c >> 32) + OWN_REV_KEY);
+    }
+    I64Table_remove(&mut self.cstr_own, p);
+    I64Table_remove(&mut self.cstr_keep, p);
+}
+
+/// Whether any string may be given back (cstr_own has an entry).
+fn Memory_own_any(self: &Memory) -> bool {
+    return self.cstr_own.live > 0;
+}
+
+/// Fresh string `p`'s state becomes code `c`.
+fn Memory_own_set(self: &mut Memory, p: i64, c: i64) {
+    I64Table_set(&mut self.cstr_own, p, Value::Int(c));
+}
+
+/// Fresh string `p` as a Value::Str (cstr_keep).
+fn Memory_own_keep_get(self: &Memory, p: i64) -> OptValue {
+    return I64Table_get(&self.cstr_keep, p);
+}
+
+/// The cache no longer names a copy of host string `p`.
+fn Memory_own_uncache(self: &mut Memory, p: i64) {
+    I64Table_remove(&mut self.cstr_cache, p);
+}
+
+/// The fresh string whose copy is at `addr` (0: none).
+fn Memory_own_by_copy(self: &Memory, addr: i64) -> i64 {
+    if addr <= 0 || addr >= 0x80000000 {
+        return 0;
+    }
+    match I64Table_get(&self.cstr_own, addr + OWN_REV_KEY) {
+        OptValue::Some(ov) => {
+            match ov {
+                Value::Int(p) => {
+                    return p;
+                }
+                _ => {
+                }
+            }
+        }
+        OptValue::None => {
+        }
+    }
+    return 0;
 }
 
 /// The copy Memory_store_cstr made of the host string `s` (`slen` bytes),
@@ -1147,10 +1515,6 @@ pub fn OpaqueEntry_new(addr: i64, value: Value) -> OpaqueEntry {
     return OpaqueEntry {
         addr: addr, value: value
     };
-}
-
-pub struct OpaqueSnapshot {
-    pub entries: I64Table,
 }
 
 // ---------------------------------------------------------------------------
@@ -1382,12 +1746,6 @@ pub fn StrTable_set(t: &mut StrTable, key: str, val: i64) {
     t.count = t.count + 1;
 }
 
-fn Memory_clone(m: &Memory) -> Memory {
-    return Memory {
-        data: m.data.clone(), next_alloc: m.next_alloc, blocks: I64Table_clone(&m.blocks), free_heads: m.free_heads.clone(), cstr_cache: I64Table_clone(&m.cstr_cache), lim_max: m.lim_max, lim_used: m.lim_used, lim_sizes: I64Table_clone(&m.lim_sizes), lim_hit_used: m.lim_hit_used, lim_hit_want: m.lim_hit_want, oom_hit: m.oom_hit
-    };
-}
-
 pub struct ArrayBoundEntry {
     pub addr: i64,
     pub size: i64,
@@ -1499,8 +1857,13 @@ pub struct Interpreter {
     pub pending_call_site: OptU64,
     pub panic_stack_trace: OptStr,
     pub interp_unsafe_depth: i64,
-    pub txn_mem_snapshots: Vec<Memory>,
-    pub txn_opaque_snapshots: Vec<OpaqueSnapshot>,
+    // BG229: the open txn blocks' log of opaque_values changes (the key,
+    // what it held, whether it held anything) and where each txn's part
+    // starts; Memory keeps the log of the memory's own writes
+    pub txn_op_addr: Vec<i64>,
+    pub txn_op_old: Vec<Value>,
+    pub txn_op_had: Vec<bool>,
+    pub txn_op_marks: Vec<i64>,
     pub max_recursion: i64,
     pub max_steps: i64,
     pub step_count: i64,
@@ -1563,7 +1926,7 @@ pub struct Interpreter {
 
 pub fn Interpreter_new(module: IrModule) -> Interpreter {
     var interp: Interpreter = Interpreter {
-        module: module, memory: Memory_new(), string_addrs: Vec::new(), global_addrs: Vec::new(), opaque_values: I64Table_new(), dyn_types: I64Table_new(), fn_cache: StrTable_new(1024), rt_cache: StrTable_new(256), cur_wrapping: false, vec_side_table: Vec::new(), vec_values: Vec::new(), map_values: Vec::new(), tensors: Vec::new(), tensor_side_table: Vec::new(), tensor_index: I64Table_new(), kv_caches: Vec::new(), verbose: false, debug_mode: true, cov_on: false, cov_seen: HashMap_new(), cov_fns: Vec::new(), cov_ids: Vec::new(), cov_br_seen: HashMap_new(), array_bounds: I64Table_new(), frame_allocas: Vec::new(), current_func_name: "", call_stack: Vec::new(), call_site_lines: Vec::new(), pending_call_site: OptU64::None, panic_stack_trace: OptStr::None, interp_unsafe_depth: 0, txn_mem_snapshots: Vec::new(), txn_opaque_snapshots: Vec::new(), max_recursion: 1000, max_steps: 0, step_count: 0, max_memory: 0, region_stack: Vec::new(), prng_state_a: 0x9E3779B97F4A7C15, prng_state_b: 0xBF58476D1CE4E5B9, dp_epsilon_budget: 0.0, dp_epsilon_limit: 0.0, thread_handle_count: 0, future_values: Vec::new(), future_exec: Vec::new(), executor_count: 0, shared_mem: I64Table_new(), next_shared_addr: 0x10000000, next_mutex_handle: 1, tls: I64Table_new(), next_tls_key: 0, chans: Vec::new(), dl_handles: I64Table_new(), next_dl_handle: 1, ecs_entity_count: 0, ecs_comps: Vec::new(), sb_strs: Vec::new(), db_rows: Vec::new(), next_db_handle: 1, closed_dbs: Vec::new(), alloc_ptr: 0x10000, persist_keys: Vec::new(), persist_vals: Vec::new(), ag_enabled: false, ag_checkpoint: false, ag_tape: Vec::new(), ag_grad_keys: Vec::new(), ag_grad_vals: Vec::new(), gt_scheduler: GreenThreadScheduler_new(), revoked_caps: Vec::new(), cap_marks: Vec::new(), itasks: Vec::new(), itask_cur: -1, itask_pending: Vec::new(), itask_pending_at: 0, itask_live: 0, itask_open: 0,
+        module: module, memory: Memory_new(), string_addrs: Vec::new(), global_addrs: Vec::new(), opaque_values: I64Table_new(), dyn_types: I64Table_new(), fn_cache: StrTable_new(1024), rt_cache: StrTable_new(256), cur_wrapping: false, vec_side_table: Vec::new(), vec_values: Vec::new(), map_values: Vec::new(), tensors: Vec::new(), tensor_side_table: Vec::new(), tensor_index: I64Table_new(), kv_caches: Vec::new(), verbose: false, debug_mode: true, cov_on: false, cov_seen: HashMap_new(), cov_fns: Vec::new(), cov_ids: Vec::new(), cov_br_seen: HashMap_new(), array_bounds: I64Table_new(), frame_allocas: Vec::new(), current_func_name: "", call_stack: Vec::new(), call_site_lines: Vec::new(), pending_call_site: OptU64::None, panic_stack_trace: OptStr::None, interp_unsafe_depth: 0, txn_op_addr: Vec::new(), txn_op_old: Vec::new(), txn_op_had: Vec::new(), txn_op_marks: Vec::new(), max_recursion: 1000, max_steps: 0, step_count: 0, max_memory: 0, region_stack: Vec::new(), prng_state_a: 0x9E3779B97F4A7C15, prng_state_b: 0xBF58476D1CE4E5B9, dp_epsilon_budget: 0.0, dp_epsilon_limit: 0.0, thread_handle_count: 0, future_values: Vec::new(), future_exec: Vec::new(), executor_count: 0, shared_mem: I64Table_new(), next_shared_addr: 0x10000000, next_mutex_handle: 1, tls: I64Table_new(), next_tls_key: 0, chans: Vec::new(), dl_handles: I64Table_new(), next_dl_handle: 1, ecs_entity_count: 0, ecs_comps: Vec::new(), sb_strs: Vec::new(), db_rows: Vec::new(), next_db_handle: 1, closed_dbs: Vec::new(), alloc_ptr: 0x10000, persist_keys: Vec::new(), persist_vals: Vec::new(), ag_enabled: false, ag_checkpoint: false, ag_tape: Vec::new(), ag_grad_keys: Vec::new(), ag_grad_vals: Vec::new(), gt_scheduler: GreenThreadScheduler_new(), revoked_caps: Vec::new(), cap_marks: Vec::new(), itasks: Vec::new(), itask_cur: -1, itask_pending: Vec::new(), itask_pending_at: 0, itask_live: 0, itask_open: 0,
     };
     // Function index (first definition wins, as IrModule_get_function)
     var fi: i64 = 0;
@@ -1635,11 +1998,232 @@ pub fn Interpreter_lookup_opaque(self: &Interpreter, addr: i64) -> OptValue {
 }
 
 pub fn Interpreter_set_opaque(self: &mut Interpreter, addr: i64, value: Value) {
+    if Memory_own_any(&self.memory) {
+        Interpreter_own_slot_change(self, addr, value);
+    }
+    Interpreter_opaque_note(self, addr);
     I64Table_set(&mut self.opaque_values, addr, value);
 }
 
 pub fn Interpreter_remove_opaque(self: &mut Interpreter, addr: i64) {
+    if Memory_own_any(&self.memory) {
+        Interpreter_own_slot_change(self, addr, Value::Void);
+    }
+    Interpreter_opaque_note(self, addr);
     I64Table_remove(&mut self.opaque_values, addr);
+}
+
+/// BG436: slot `addr`'s side-table value becomes `newv`: a string it held
+/// that is not `newv` is no longer held there (Interpreter_own_gone); a
+/// string stored again at its own slot is held there again.
+fn Interpreter_own_slot_change(self: &mut Interpreter, addr: i64, newv: Value) {
+    var np: i64 = 0;
+    match newv {
+        Value::Str(ns) => {
+            np = ns as i64;
+        }
+        _ => {
+        }
+    }
+    match Interpreter_lookup_opaque(self, addr) {
+        OptValue::Some(ov) => {
+            match ov {
+                Value::Str(os) => {
+                    if (os as i64) != np {
+                        Interpreter_own_gone(self, os as i64, addr);
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        OptValue::None => {
+        }
+    }
+    if np != 0 {
+        val c: i64 = Memory_own_state(&self.memory, np);
+        if c > 0 && (c & 0xFFFFFFFC) == addr && (c & OWN_GONE) != 0 && (c & OWN_DROPPED) == 0 {
+            Memory_own_set(&mut self.memory, np, c - OWN_GONE);
+        }
+    }
+}
+
+/// BG436: slot `h` no longer holds fresh string `p`: given back if its
+/// owner dropped it already, else noted.
+fn Interpreter_own_gone(self: &mut Interpreter, p: i64, h: i64) {
+    val c: i64 = Memory_own_state(&self.memory, p);
+    if c <= 0 || (c & 0xFFFFFFFC) != h || (c & OWN_GONE) != 0 {
+        return;
+    }
+    if (c & OWN_DROPPED) != 0 {
+        Interpreter_own_release(self, p, c);
+        return;
+    }
+    Memory_own_set(&mut self.memory, p, c | OWN_GONE);
+}
+
+/// BG436: the owner of string `v` dropped it (Str_drop; p_str_append's
+/// first operand): a fresh one with no copy is forgotten, one whose slot no
+/// longer holds it is given back, else noted.
+pub fn Interpreter_own_dropped(self: &mut Interpreter, v: Value) {
+    if !Memory_own_any(&self.memory) {
+        return;
+    }
+    var p: i64 = 0;
+    match v {
+        Value::Str(vs) => {
+            p = vs as i64;
+        }
+        _ => {
+            return;
+        }
+    }
+    val c: i64 = Memory_own_state(&self.memory, p);
+    if c < 0 {
+        return;
+    }
+    if c == 0 {
+        Memory_own_forget(&mut self.memory, p);
+        return;
+    }
+    if (c & OWN_DROPPED) != 0 {
+        return;
+    }
+    if (c & OWN_GONE) != 0 {
+        Interpreter_own_release(self, p, c);
+        return;
+    }
+    Memory_own_set(&mut self.memory, p, c | OWN_DROPPED);
+}
+
+/// BG436: `v` gets one more owner (a Str_dup of the string or of its
+/// copy's address): it is never given back.
+pub fn Interpreter_own_kept(self: &mut Interpreter, v: Value) {
+    if !Memory_own_any(&self.memory) {
+        return;
+    }
+    match v {
+        Value::Str(ks) => {
+            Memory_own_forget(&mut self.memory, ks as i64);
+        }
+        Value::Int(ka) => {
+            val kp: i64 = Memory_own_by_copy(&self.memory, ka);
+            if kp != 0 {
+                Memory_own_forget(&mut self.memory, kp);
+            }
+        }
+        Value::Ptr(ka) => {
+            val kp: i64 = Memory_own_by_copy(&self.memory, ka);
+            if kp != 0 {
+                Memory_own_forget(&mut self.memory, kp);
+            }
+        }
+        _ => {
+        }
+    }
+}
+
+/// BG436: free the copy of fresh string `p` (cstr_own code `c`), when the
+/// cache still names that block with the string's bytes; then forget it.
+fn Interpreter_own_release(self: &mut Interpreter, p: i64, c: i64) {
+    val a: i64 = c >> 32;
+    var ok: bool = false;
+    match Memory_own_keep_get(&self.memory, p) {
+        OptValue::Some(kv) => {
+            match kv {
+                Value::Str(ps) => {
+                    ok = Memory_cstr_cached(&self.memory, ps, str_len(ps)) == a;
+                }
+                _ => {
+                }
+            }
+        }
+        OptValue::None => {
+        }
+    }
+    Memory_own_forget(&mut self.memory, p);
+    if ok && a > 16 {
+        Memory_own_uncache(&mut self.memory, p);
+        var _fm: str = Interpreter_free_block(self, a - 16);
+    }
+}
+
+/// BG229: inside a txn, what opaque_values holds for `addr` is noted
+/// before it changes (Interpreter_txn_rollback puts it back).
+fn Interpreter_opaque_note(self: &mut Interpreter, addr: i64) {
+    if self.memory.tx_serial == 0 {
+        return;
+    }
+    self.txn_op_addr.push(addr);
+    match I64Table_get(&self.opaque_values, addr) {
+        OptValue::Some(ov) => {
+            self.txn_op_old.push(ov);
+            self.txn_op_had.push(true);
+        }
+        OptValue::None => {
+            self.txn_op_old.push(Value::Void);
+            self.txn_op_had.push(false);
+        }
+    }
+}
+
+/// BG229: a txn block begins (Inst::TxnBegin). Nothing is copied: from
+/// here the writes are logged (Memory_put, Interpreter_opaque_note).
+pub fn Interpreter_txn_begin(self: &mut Interpreter) {
+    Memory_tx_begin(&mut self.memory);
+    self.txn_op_marks.push(self.txn_op_addr.len());
+}
+
+/// BG229: the innermost txn ends and keeps its changes (Inst::TxnEnd).
+pub fn Interpreter_txn_commit(self: &mut Interpreter) {
+    if self.txn_op_marks.len() == 0 {
+        return;
+    }
+    self.txn_op_marks.pop();
+    Memory_tx_commit(&mut self.memory);
+    if self.txn_op_marks.len() == 0 {
+        self.txn_op_addr = Vec::new();
+        self.txn_op_old = Vec::new();
+        self.txn_op_had = Vec::new();
+    }
+}
+
+/// BG229: the innermost txn ends and what it changed is put back (a panic
+/// inside it).
+pub fn Interpreter_txn_rollback(self: &mut Interpreter) {
+    if self.txn_op_marks.len() == 0 {
+        return;
+    }
+    val om: i64 = self.txn_op_marks.get(self.txn_op_marks.len() - 1);
+    self.txn_op_marks.pop();
+    var i: i64 = self.txn_op_addr.len() - 1;
+    while i >= om {
+        val oa: i64 = self.txn_op_addr.get(i);
+        if self.txn_op_had.get(i) {
+            val ov: Value = self.txn_op_old.get(i);
+            I64Table_set(&mut self.opaque_values, oa, ov);
+        } else {
+            I64Table_remove(&mut self.opaque_values, oa);
+        }
+        self.txn_op_addr.pop();
+        self.txn_op_old.pop();
+        self.txn_op_had.pop();
+        i = i - 1;
+    }
+    Memory_tx_rollback(&mut self.memory);
+}
+
+/// BG229: close the txn blocks opened since `depth` were open: a call
+/// returning from inside one (a `return`, `break` or `continue` out of
+/// a txn skips its TxnEnd) keeps their changes; a panic puts them back.
+pub fn Interpreter_txn_unwind(self: &mut Interpreter, depth: i64, back: bool) {
+    while self.txn_op_marks.len() > depth {
+        if back {
+            Interpreter_txn_rollback(self);
+        } else {
+            Interpreter_txn_commit(self);
+        }
+    }
 }
 
 pub fn Interpreter_lookup_array_bound(self: &Interpreter, addr: i64) -> i64 {
@@ -1670,7 +2254,7 @@ fn Interpreter_clear_block_side(self: &mut Interpreter, addr: i64, size: i64) {
     if self.opaque_values.live > 0 {
         var w: i64 = 0;
         while w < size {
-            I64Table_remove(&mut self.opaque_values, addr + w);
+            Interpreter_remove_opaque(self, addr + w);
             w = w + 8;
         }
     }
@@ -1754,7 +2338,16 @@ pub fn Interpreter_init_globals(self: &mut Interpreter) {
                 Memory_store_i64(&mut self.memory, addr, v);
             }
             Value::Float(v) => {
-                Memory_store_f64(&mut self.memory, addr, v);
+                // BG298: an f32 global is read back as 4 bytes: store the
+                // f32, not the f64 (whose low half is 0 for 1.5)
+                match entry.ty {
+                    IrType::F32 => {
+                        Memory_store_f32(&mut self.memory, addr, v);
+                    }
+                    _ => {
+                        Memory_store_f64(&mut self.memory, addr, v);
+                    }
+                }
             }
             Value::Bool(v) => {
                 Memory_store_bool(&mut self.memory, addr, v);
@@ -1888,6 +2481,29 @@ pub fn Interpreter_value_to_string(self: &Interpreter, v: Value) -> str {
 /// RT2: the first `n` bytes at a (pointer) value, zero bytes included: a
 /// string's bytes (at most its length), or `n` bytes of interpreted memory
 /// at an address. Fewer than `n` when the value holds fewer.
+/// BG426: is `a` the address of a string copy Memory_store_cstr made
+/// ([P_STR_MAGIC][len] before it) holding a zero byte within its length?
+fn Interpreter_magic_copy_has_nul(self: &Interpreter, a: i64) -> bool {
+    if a < 16 || (a & 7) != 0 || !Memory_is_valid_addr(&self.memory, a - 16) {
+        return false;
+    }
+    if Memory_load_i64(&self.memory, a - 16) != 0x4649444553545201 {
+        return false;
+    }
+    val n: i64 = Memory_load_i64(&self.memory, a - 8);
+    if n < 0 || a + n > self.memory.data.len() {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        if (Memory_load_byte(&self.memory, a + i) & 255) == 0 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
 /// BG81: does `s` hold a zero byte within its counted length?
 fn interp_has_nul(s: str) -> bool {
     var n: i64 = str_len(s);
@@ -2110,6 +2726,14 @@ pub fn Interpreter_print_via(self: &mut Interpreter, fname: str, v: Value) -> Ex
 // ===========================================================================
 
 pub fn Interpreter_format_call_stack(self: &Interpreter) -> str {
+    return Interpreter_format_call_stack_at(self, 0);
+}
+
+/// BG362: each frame with the line it is at. call_site_lines[i] is the line
+/// in frame i-1 where frame i was called, so frame i's own line is
+/// call_site_lines[i+1]; the innermost frame's is `top_line` (the panicking
+/// instruction's, 0 when not known: no line rather than its caller's).
+pub fn Interpreter_format_call_stack_at(self: &Interpreter, top_line: i64) -> str {
     if self.call_stack.len() == 0 {
         return "";
     }
@@ -2119,11 +2743,14 @@ pub fn Interpreter_format_call_stack(self: &Interpreter) -> str {
     while i >= 0 {
         var name: str = self.call_stack.get(i);
         var suffix: str = "";
-        if i < self.call_site_lines.len() {
-            var line: i64 = self.call_site_lines.get(i);
-            if line > 0 {
-                suffix = " at line " + int_to_str(line);
-            }
+        var line: i64 = 0;
+        if i == self.call_stack.len() - 1 {
+            line = top_line;
+        } else if i + 1 < self.call_site_lines.len() {
+            line = self.call_site_lines.get(i + 1);
+        }
+        if line > 0 {
+            suffix = " at line " + int_to_str(line);
         }
         if idx == 0 {
             out = out + "    → " + name + suffix + "\n";
@@ -2198,6 +2825,9 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
         }
     }
     self.call_site_lines.push(call_line);
+    // BG229: the txn blocks open when the call began (those it opens end
+    // when it does)
+    val txn_entry: i64 = self.txn_op_marks.len();
 
     var saved_region_depth: i64 = self.region_stack.len();
     // this call's allocas are the ones pushed after this mark
@@ -2389,11 +3019,17 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
             }
             // roadmap P12: FID_CPU_LIMIT, read every INTERP_LIM_CPU_EVERY
             // instructions (interp_lim_cpu_check stops the program past it)
-            if g_ilim_cpu_ms > 0 {
+            // (BG329: and `fid run --timeout`'s wall-clock deadline)
+            if g_ilim_cpu_ms > 0 || g_ilim_wall_end > 0 {
                 g_ilim_cpu_tick = g_ilim_cpu_tick + 1;
                 if g_ilim_cpu_tick >= INTERP_LIM_CPU_EVERY {
                     g_ilim_cpu_tick = 0;
-                    Interpreter_lim_cpu_check(self);
+                    if g_ilim_cpu_ms > 0 {
+                        Interpreter_lim_cpu_check(self);
+                    }
+                    if g_ilim_wall_end > 0 {
+                        interp_lim_wall_check();
+                    }
                 }
             }
 
@@ -2502,22 +3138,30 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
                             // Capture stack trace
                             match self.panic_stack_trace {
                                 OptStr::None => {
-                                    self.panic_stack_trace = OptStr::Some(Interpreter_format_call_stack(self));
+                                    // BG362: the innermost frame at the
+                                    // panicking instruction's line
+                                    var top_line: i64 = 0;
+                                    match IrFunction_get_meta(&func, inst_id) {
+                                        OptValueMeta::Some(tm) => {
+                                            match tm.source_line {
+                                                OptU64::Some(tl) => {
+                                                    top_line = tl;
+                                                }
+                                                OptU64::None => {
+                                                }
+                                            }
+                                        }
+                                        OptValueMeta::None => {
+                                        }
+                                    }
+                                    self.panic_stack_trace = OptStr::Some(Interpreter_format_call_stack_at(self, top_line));
                                 }
                                 OptStr::Some(_) => {
                                 }
                             }
-                            // Transaction rollback
-                            if self.txn_mem_snapshots.len() > 0 {
-                                var snap_mem: Memory = self.txn_mem_snapshots.get(self.txn_mem_snapshots.len() - 1);
-                                self.memory = snap_mem;
-                                self.txn_mem_snapshots.pop();
-                            }
-                            if self.txn_opaque_snapshots.len() > 0 {
-                                var snap_opaque: OpaqueSnapshot = self.txn_opaque_snapshots.get(self.txn_opaque_snapshots.len() - 1);
-                                self.opaque_values = snap_opaque.entries;
-                                self.txn_opaque_snapshots.pop();
-                            }
+                            // Transaction rollback: the txn blocks this
+                            // call opened (BG229: from their write logs)
+                            Interpreter_txn_unwind(self, txn_entry, true);
                             // The panicking instruction's source line (as
                             // src/interp.rs), unless the message has one
                             var pmsg: str = msg;
@@ -2584,6 +3228,12 @@ pub fn Interpreter_run_function(self: &mut Interpreter, func: IrFunction, args: 
             _ => {
             }
         }
+    }
+    // BG229: a txn the call left without its TxnEnd (a `return`, `break`
+    // or `continue` out of it) ends with it, keeping its changes; a panic
+    // put them back above
+    if self.txn_op_marks.len() > txn_entry {
+        Interpreter_txn_unwind(self, txn_entry, false);
     }
     self.call_stack.pop();
     self.call_site_lines.pop();
@@ -2960,7 +3610,7 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                         Interpreter_clear_block_side(self, again, asz);
                         var azi: i64 = 0;
                         while azi < asz {
-                            self.memory.data.set(again + azi, 0);
+                            Memory_put(&mut self.memory, again + azi, 0);
                             azi = azi + 1;
                         }
                         match ty {
@@ -3272,6 +3922,20 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                 // into an i8 slot wrote over 7 bytes past it
                 sty = pointee_ty;
             }
+            // BG300: an explicit float store type is the width written (a
+            // closure environment stores an f32 capture with Some(F32) into
+            // a slot typed i64; the closure reads it back as 4 f32 bytes)
+            var explicit_f32: bool = false;
+            match sty_opt {
+                OptIrType::Some(fst) => {
+                    if ir_type_is_float(fst) {
+                        sty = fst;
+                        explicit_f32 = ir_type_eq(fst, IrType::F32);
+                    }
+                }
+                OptIrType::None => {
+                }
+            }
             if is_opaque {
                 // Opaque-typed slots always use the side table (and byte
                 // memory for primitives, as a fallback)
@@ -3281,7 +3945,11 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                         Memory_store_i64(&mut self.memory, addr, oi);
                     }
                     Value::Float(of) => {
-                        Memory_store_f64(&mut self.memory, addr, of);
+                        if explicit_f32 {
+                            Memory_store_f32(&mut self.memory, addr, of);
+                        } else {
+                            Memory_store_f64(&mut self.memory, addr, of);
+                        }
                     }
                     Value::Bool(ob) => {
                         Memory_store_bool(&mut self.memory, addr, ob);
@@ -3380,7 +4048,27 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                     }
                 }
                 Value::Str(s) => {
-                    var str_addr: i64 = Memory_store_cstr(&mut self.memory, s);
+                    // BG436: the copy's slot (Memory_store_cstr_at), when it
+                    // is a variable's own (an alloca or a global): a field or
+                    // a Vec element can be copied word for word elsewhere
+                    var own_slot: i64 = 0;
+                    match IrFunction_get_inst(func, ptr) {
+                        OptInst::Some(pinst) => {
+                            match pinst {
+                                Inst::Alloca(_, _) => {
+                                    own_slot = addr;
+                                }
+                                Inst::GlobalAddr(_, _) => {
+                                    own_slot = addr;
+                                }
+                                _ => {
+                                }
+                            }
+                        }
+                        OptInst::None => {
+                        }
+                    }
+                    var str_addr: i64 = Memory_store_cstr_at(&mut self.memory, s, own_slot);
                     Memory_store_i64(&mut self.memory, addr, str_addr);
                     Interpreter_set_opaque(self, addr, Value::Str(s));
                 }
@@ -3594,7 +4282,46 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
             if name == "Str_drop" && arg_vals.len() == 2 {
                 match arg_vals.get(1) {
                     Value::Str(_) => {
+                        // BG436: its copy is given back once no slot holds it
+                        Interpreter_own_dropped(self, arg_vals.get(1));
                         return ExecOutcome::Value(Value::Void);
+                    }
+                    _ => {
+                    }
+                }
+            }
+            // BG436: a string (or its copy's address) with one more owner is
+            // never given back; core's Str_dup still runs
+            if name == "Str_dup" && arg_vals.len() == 2 {
+                Interpreter_own_kept(self, arg_vals.get(1));
+            }
+            // BG426: core's p_str_adopt / p_str_take keep a counted string
+            // or a literal as it is and copy anything else up to its first
+            // zero byte (p_str_from_ptr). The copy Memory_store_cstr makes of
+            // a string the interpreter holds has the [P_STR_MAGIC][len]
+            // header, which is neither to them: read_file / env_var /
+            // arg_at / read_line of text with a zero byte were cut there.
+            // Such a string, zero bytes included, is the result as it is;
+            // one without a zero byte still runs core (unchanged).
+            if arg_vals.len() == 2 && (name == "p_str_adopt" || name == "p_str_take") {
+                match arg_vals.get(1) {
+                    Value::Str(bs) => {
+                        if interp_has_nul(bs) {
+                            if name == "p_str_take" {
+                                Interpreter_own_kept(self, arg_vals.get(1));
+                            }
+                            return ExecOutcome::Value(arg_vals.get(1));
+                        }
+                    }
+                    Value::Int(ba) => {
+                        if Interpreter_magic_copy_has_nul(self, ba) {
+                            return ExecOutcome::Value(Value::Str(Memory_load_cstr(&self.memory, ba)));
+                        }
+                    }
+                    Value::Ptr(ba) => {
+                        if Interpreter_magic_copy_has_nul(self, ba) {
+                            return ExecOutcome::Value(Value::Str(Memory_load_cstr(&self.memory, ba)));
+                        }
                     }
                     _ => {
                     }
@@ -3629,13 +4356,13 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                 if zw_p > 0 && zw_n >= 0 && Memory_is_valid_addr(&self.memory, zw_p + zw_n * 8 - 1) {
                     var zwi: i64 = 0;
                     while zwi < zw_n * 8 {
-                        self.memory.data.set(zw_p + zwi, 0);
+                        Memory_put(&mut self.memory, zw_p + zwi, 0);
                         zwi = zwi + 1;
                     }
                     if self.opaque_values.live > 0 {
                         var zwk: i64 = 0;
                         while zwk < zw_n {
-                            I64Table_remove(&mut self.opaque_values, zw_p + zwk * 8);
+                            Interpreter_remove_opaque(self, zw_p + zwk * 8);
                             zwk = zwk + 1;
                         }
                     }
@@ -3670,6 +4397,55 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                 }
                 if name == "vec_elem_dup" && plain_e && (plain_tid || null_e) {
                     return ExecOutcome::Value(arg_vals.get(2));
+                }
+            }
+            // test_lex_par / test_parse_par (Nov 28): core's str_byte_at
+            // and str_len (env, s[, idx]) of a string the interpreter holds
+            // (Value::Str) ran as three or four interpreted calls
+            // (String_byte_at, p_str_hdr_len, p_str_len_word) on the copy
+            // Memory_store_cstr makes and checks byte by byte: about 0.4 ms
+            // a call. The lexer reads every byte so: lexing compiler/lexer.fd
+            // took minutes and the two tests ran past their 1200 s limit.
+            // Answered here from the string itself: that copy holds the
+            // string's bytes with str_len as its length, so the result is
+            // the one core gives (-1 out of range, else the byte 0..255).
+            if name == "str_byte_at" || name == "String_byte_at" || name == "str_len" || name == "String_len" {
+                val sfp_len: bool = name == "str_len" || name == "String_len";
+                var sfp_at: i64 = -1;
+                if sfp_len {
+                    if arg_vals.len() == 2 {
+                        sfp_at = 1;
+                    } else if arg_vals.len() == 1 {
+                        sfp_at = 0;
+                    }
+                } else {
+                    if arg_vals.len() == 3 {
+                        sfp_at = 1;
+                    } else if arg_vals.len() == 2 {
+                        sfp_at = 0;
+                    }
+                }
+                if sfp_at >= 0 {
+                    match arg_vals.get(sfp_at) {
+                        Value::Str(sfp_s) => {
+                            val sfp_n: i64 = str_len(sfp_s);
+                            if sfp_len {
+                                return ExecOutcome::Value(Value::Int(sfp_n));
+                            }
+                            match arg_vals.get(sfp_at + 1) {
+                                Value::Int(sfp_i) => {
+                                    if sfp_i < 0 || sfp_i >= sfp_n {
+                                        return ExecOutcome::Value(Value::Int(-1));
+                                    }
+                                    return ExecOutcome::Value(Value::Int(str_byte_at(sfp_s, sfp_i) & 255));
+                                }
+                                _ => {
+                                }
+                            }
+                        }
+                        _ => {
+                        }
+                    }
                 }
             }
             // Check if it's a user function
@@ -4042,9 +4818,10 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
                         var uhalf: i64 = (i >> 1) & 9223372036854775807;
                         f = ((uhalf | (i & 1)) as f64) * 2.0;
                     }
-                    // BG66: an f32 holds a single's value
+                    // BG66: an f32 holds a single's value; BG337: rounded
+                    // once, from the integer (not from its f64)
                     if ir_type_eq(to_ty, IrType::F32) {
-                        f = interp_round_f32(f);
+                        f = interp_round_f32(interp_int_to_f32_exact(i, ir_type_eq(from_ty, IrType::U64)));
                     }
                     return ExecOutcome::Value(Value::Float(f));
                 }
@@ -4249,21 +5026,13 @@ pub fn Interpreter_execute_inst(self: &mut Interpreter, inst: Inst, inst_id: i64
 
         // ─── Transaction Blocks ───
         Inst::TxnBegin => {
-            // Deep snapshot — a struct copy would share the Vec backing, so
-            // post-snapshot writes would already be visible in the "snapshot".
-            self.txn_mem_snapshots.push(Memory_clone(&self.memory));
-            self.txn_opaque_snapshots.push(OpaqueSnapshot {
-                entries: I64Table_clone(&self.opaque_values)
-            });
+            // BG229: a write log, not a copy of the whole memory (each txn
+            // entered kept one, ~one copy per txn even after TxnEnd)
+            Interpreter_txn_begin(self);
             return ExecOutcome::Continue;
         }
         Inst::TxnEnd => {
-            if self.txn_mem_snapshots.len() > 0 {
-                self.txn_mem_snapshots.pop();
-            }
-            if self.txn_opaque_snapshots.len() > 0 {
-                self.txn_opaque_snapshots.pop();
-            }
+            Interpreter_txn_commit(self);
             return ExecOutcome::Continue;
         }
 
@@ -5903,7 +6672,12 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
         if args.len() > 1 {
             right = Interpreter_value_to_string(self, args.get(1));
         }
-        return ExecOutcome::Value(Value::Str(Interpreter_lim_str(self, left + right)));
+        val cres: str = Interpreter_lim_str(self, left + right);
+        // BG436: a new string, whose copy can be given back
+        if (cres as i64) != (left as i64) && (cres as i64) != (right as i64) {
+            Memory_own_fresh(&mut self.memory, cres);
+        }
+        return ExecOutcome::Value(Value::Str(cres));
     }
     // SL15: the profiler a program drives (stdlib/profiler.fd prof_*). The
     // interpreter has no sampler: it counts calls (interp_prof_count)
@@ -5959,7 +6733,14 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
             al = Interpreter_value_to_string(self, args.get(args.len() - 2));
             ar = Interpreter_value_to_string(self, args.get(args.len() - 1));
         }
-        return ExecOutcome::Value(Value::Str(Interpreter_lim_str(self, al + ar)));
+        val ares: str = Interpreter_lim_str(self, al + ar);
+        // BG436: core's p_str_append consumes its first operand (Str_drop)
+        // and makes a new string
+        if args.len() >= 2 && (ares as i64) != (al as i64) && (ares as i64) != (ar as i64) {
+            Interpreter_own_dropped(self, args.get(args.len() - 2));
+            Memory_own_fresh(&mut self.memory, ares);
+        }
+        return ExecOutcome::Value(Value::Str(ares));
     }
     // `s + int_to_str(n)` fused by the lowering (core's p_str_concat_int):
     // on the interpreter's own strings, as p_str_concat
@@ -5976,7 +6757,12 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                 }
             }
         }
-        return ExecOutcome::Value(Value::Str(Interpreter_lim_str(self, cl + int_to_str(cn))));
+        val cires: str = Interpreter_lim_str(self, cl + int_to_str(cn));
+        // BG436: a new string, whose copy can be given back
+        if (cires as i64) != (cl as i64) {
+            Memory_own_fresh(&mut self.memory, cires);
+        }
+        return ExecOutcome::Value(Value::Str(cires));
     }
     if name == "p_to_str" {
         if args.len() > 0 {
@@ -5994,6 +6780,8 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
                     return ExecOutcome::Value(Value::Str("false"));
                 }
                 Value::Str(ts) => {
+                    // BG436: the same string handed back: a second owner
+                    Memory_own_forget(&mut self.memory, ts as i64);
                     return ExecOutcome::Value(Value::Str(ts));
                 }
                 Value::Vec(tvh) => {
@@ -6138,7 +6926,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
         self.vec_values.push(VecValueEntry_new(handle));
         self.vec_side_table.push(VecSideEntry_new(vec_addr, handle));
         // known by address to the side table: never reused
-        I64Table_set(&mut self.memory.blocks, vec_addr, Value::Int(1));
+        Memory_set_block(&mut self.memory, vec_addr, Value::Int(1));
         return ExecOutcome::Value(Value::Int(vec_addr));
     }
     if name == "p_vec_push" {
@@ -8317,8 +9105,18 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
             if !fread__ok {
                 return ExecOutcome::Value(Value::Int(0));
             }
-            if str_len(fread) == 0 {
+            if str_len(fread) == 0 && p_file_size(fpath) <= 0 {
                 return ExecOutcome::Value(Value::Str(interp_empty_read()));
+            }
+            // BG426: the whole file, zero bytes included. A host built by
+            // an older stage 0 may hand back the text cut at the first zero
+            // (its C runtime took strlen): read the bytes then, as
+            // p_file_write's BG81 path writes them.
+            if str_len(fread) < p_file_size(fpath) {
+                var fbytes: Vec<i64> = p_file_read_bytes(fpath);
+                if fbytes.len() > str_len(fread) {
+                    return ExecOutcome::Value(Value::Str(str_from_bytes(fbytes)));
+                }
             }
             return ExecOutcome::Value(Value::Str(fread));
         }
@@ -8417,10 +9215,11 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
             return ExecOutcome::Value(Value::Int(p_file_write_vec(fpath, wbytes)));
         }
         // roadmap L4B (stdlib/fs.fd File's streaming reads): up to n bytes
-        // from byte `offset`, as the C runtime's p_file_read_at. The host
-        // compiler's runtime may predate p_file_read_at (the first stage of
-        // a bootstrap), so the host reads the file and the slice is taken
-        // here: the same bytes, at the cost of reading the whole file.
+        // from byte `offset`, through the host's own p_file_read_at (every
+        // runtime has it since Nov 20: both C generators, pe_runtime,
+        // linux_runtime). BG467: it read the whole file with
+        // p_file_read_bytes and sliced it, 8 bytes of memory per file byte,
+        // so a read near the end of a 3 GiB file ran out of memory.
         if name == "p_file_read_at" {
             var at_off: i64 = 0;
             var at_n: i64 = 0;
@@ -8430,10 +9229,10 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
             }
             var at_bytes: Vec<i64> = Vec::new();
             if at_off >= 0 && at_n > 0 {
-                var whole: Vec<i64> = p_file_read_bytes(fpath);
-                var ai: i64 = at_off;
-                while ai < whole.len() && ai < at_off + at_n {
-                    at_bytes.push(whole.get(ai) & 255);
+                val part: Vec<i64> = p_file_read_at(fpath, at_off, at_n);
+                var ai: i64 = 0;
+                while ai < part.len() {
+                    at_bytes.push(part.get(ai) & 255);
                     ai = ai + 1;
                 }
             }
@@ -8497,7 +9296,7 @@ pub fn Interpreter_call_runtime(self: &mut Interpreter, name: str, args: &mut Ve
             self.vec_values.push(VecValueEntry_new(rhandle));
             self.vec_side_table.push(VecSideEntry_new(raddr, rhandle));
             // known by address to the side table: never reused
-            I64Table_set(&mut self.memory.blocks, raddr, Value::Int(1));
+            Memory_set_block(&mut self.memory, raddr, Value::Int(1));
             return ExecOutcome::Value(Value::Int(raddr));
         }
     }
@@ -8674,7 +9473,7 @@ fn Interpreter_new_byte_vec(self: &mut Interpreter, bytes: Vec<i64>) -> i64 {
     self.vec_values.push(VecValueEntry_new(handle));
     self.vec_side_table.push(VecSideEntry_new(addr, handle));
     // known by address to the side table: never reused
-    I64Table_set(&mut self.memory.blocks, addr, Value::Int(1));
+    Memory_set_block(&mut self.memory, addr, Value::Int(1));
     return addr;
 }
 
@@ -8824,7 +9623,7 @@ fn Interpreter_rr_new_bytes_vec(self: &mut Interpreter, bytes: Vec<i64>) -> i64 
     self.vec_values.push(VecValueEntry_new(rhandle));
     self.vec_side_table.push(VecSideEntry_new(raddr, rhandle));
     // known by address to the side table: never reused
-    I64Table_set(&mut self.memory.blocks, raddr, Value::Int(1));
+    Memory_set_block(&mut self.memory, raddr, Value::Int(1));
     return raddr;
 }
 
@@ -9217,6 +10016,10 @@ pub fn interp_set_program_args(arg0: i64, first: i64) {
 /// file and arguments, found as main.fd's dispatch finds the command (after
 /// a `--` when there is one, past the `--` flags). Any other command keeps
 /// the process's arguments.
+/// BG331: as main.fd's main_args_start, a `--` restarts the command line
+/// only under the Rust interpreter (argv[0] fidesc); `fid run x.fd -- a b`
+/// gives the program `x.fd a b` (the `--` right after the file dropped, as
+/// `cargo run -- a b`), where the `--` used to make `a` fid's command.
 fn interp_args_detect() {
     if g_interp_args_known {
         return;
@@ -9224,18 +10027,32 @@ fn interp_args_detect() {
     g_interp_args_known = true;
     val n: i64 = p_argc();
     var start: i64 = 1;
-    var i: i64 = 0;
-    while i < n {
-        if p_argv(i) == "--" {
-            start = i + 1;
-            break;
+    var a0: str = "";
+    if n > 0 {
+        a0 = str_replace(p_argv(0), "\\", "/");
+    }
+    var sl: i64 = str_len(a0) - 1;
+    while sl >= 0 && str_byte_at(a0, sl) != 47 {
+        sl = sl - 1;
+    }
+    if str_starts_with(str_slice(a0, sl + 1, str_len(a0)), "fidesc") {
+        var i: i64 = 0;
+        while i < n {
+            if p_argv(i) == "--" {
+                start = i + 1;
+                break;
+            }
+            i = i + 1;
         }
-        i = i + 1;
     }
     var c: i64 = start;
     while c < n {
         if !str_starts_with(p_argv(c), "--") {
             break;
+        }
+        // a global flag's value (`fid --timeout 5 run x.fd`)
+        if (p_argv(c) == "--timeout" || p_argv(c) == "--profile-use") && c + 1 < n {
+            c = c + 1;
         }
         c = c + 1;
     }
@@ -9245,6 +10062,9 @@ fn interp_args_detect() {
         }
         g_interp_arg0 = c + 1;
         g_interp_arg_from = c + 2;
+        if c + 2 < n && p_argv(c + 2) == "--" {
+            g_interp_arg_from = c + 3;
+        }
     }
 }
 
@@ -9767,7 +10587,7 @@ pub fn Interpreter_alloc_tensor(self: &mut Interpreter, t: TensorData) -> Value 
     self.tensor_side_table.push(TensorSideEntry_new(addr, handle));
     I64Table_set(&mut self.tensor_index, addr, Value::Int(handle));
     // known by address to the tensor tables: never reused
-    I64Table_set(&mut self.memory.blocks, addr, Value::Int(1));
+    Memory_set_block(&mut self.memory, addr, Value::Int(1));
     Memory_store_i64(&mut self.memory, addr, handle);
     return Value::Ptr(addr);
 }
@@ -10261,6 +11081,8 @@ var g_ilim_cpu_text: str = "";  // the limit as the message gives it
 var g_ilim_cpu_tick: i64 = 0;  // instructions since the last reading
 var g_ilim_def_mem: i64 = 0;  // `fid run --max-mem` in bytes; 0: none
 var g_ilim_def_cpu_ms: i64 = 0;  // `fid run --cpu-limit` in ms; 0: none
+var g_ilim_def_wall_s: i64 = 0;  // BG329: `fid run --timeout` in seconds; 0: none
+var g_ilim_wall_end: i64 = 0;  // its deadline (p_clock_now_ms); 0: none
 
 // SAFETY: declared by the headers every generated C file includes
 // (<windows.h> on Windows, <time.h> elsewhere; `<stdint.h>` only keeps
@@ -10278,6 +11100,23 @@ extern "C" include "<stdint.h>" {
 pub fn interp_limit_defaults(mem_bytes: i64, cpu_ms: i64) {
     g_ilim_def_mem = mem_bytes;
     g_ilim_def_cpu_ms = cpu_ms;
+}
+
+/// BG329: `fid run --timeout <seconds>` (0: none): the next interpreted
+/// run stops once that much wall-clock time has passed since it started
+/// (interp_lim_setup sets the deadline, interp_lim_wall_check tests it
+/// every INTERP_LIM_CPU_EVERY instructions).
+pub fn interp_wall_timeout(secs: i64) {
+    g_ilim_def_wall_s = secs;
+}
+
+/// The `--timeout` deadline has passed: the message, exit 124 (as
+/// timeout(1) and FID_CPU_LIMIT).
+fn interp_lim_wall_check() {
+    if p_clock_now_ms() >= g_ilim_wall_end {
+        p_eprint_str("fid: timeout of " + int_to_str(g_ilim_def_wall_s) + " seconds exceeded (--timeout)\n");
+        p_exit(124);
+    }
 }
 
 /// The CPU time of the fid process in ms (user plus kernel, every
@@ -10471,6 +11310,11 @@ fn interp_lim_env(name: str) -> str {
 pub fn interp_lim_setup(self: &mut Interpreter) {
     g_ilim_cpu_ms = 0;
     g_ilim_cpu_tick = 0;
+    // BG329: `fid run --timeout`, counted from the program's start
+    g_ilim_wall_end = 0;
+    if g_ilim_def_wall_s > 0 {
+        g_ilim_wall_end = p_clock_now_ms() + g_ilim_def_wall_s * 1000;
+    }
     var m: str = interp_lim_env("FID_MEM_LIMIT");
     if str_len(m) == 0 && g_ilim_def_mem > 0 {
         m = int_to_str(g_ilim_def_mem);
@@ -11213,6 +12057,26 @@ pub fn Interpreter_itask_others(self: &Interpreter) -> bool {
     return self.itask_open - own > 0;
 }
 
+/// BG225: whether mutex `mk` (a p_mutex_init handle) is locked.
+pub fn Interpreter_mutex_held(self: &Interpreter, mk: i64) -> bool {
+    match I64Table_get(&self.shared_mem, mk) {
+        OptValue::Some(mv) => {
+            match mv {
+                Value::Int(n) => {
+                    return n != 0;
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+        OptValue::None => {
+            return false;
+        }
+    }
+    return false;
+}
+
 /// A new task of `func` with `targs`; not started.
 pub fn Interpreter_itask_new(self: &mut Interpreter, func: str, targs: Vec<Value>, what: str) -> i64 {
     self.itasks.push(ITask {
@@ -11893,7 +12757,7 @@ pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: &mut V
         }
         self.next_shared_addr = self.next_shared_addr + swords * 8;
         I64Table_set(&mut self.shared_mem, saddr, Value::Int(0));
-        I64Table_set(&mut self.memory.blocks, saddr, Value::Int(1));
+        Memory_set_block(&mut self.memory, saddr, Value::Int(1));
         return ExecOutcome::Value(Value::Int(saddr));
     }
     // The address may be a p_malloc block (Value::Ptr: stdlib/http2's job
@@ -11955,7 +12819,17 @@ pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: &mut V
         return ExecOutcome::Value(Value::Int(mh));
     }
     if name == "p_mutex_lock" {
-        I64Table_set(&mut self.shared_mem, arg_int(args, 0, 0), Value::Int(1));
+        // BG225: a mutex another task holds (across a sleep, a yield) is
+        // waited for: the others run until it is unlocked. Only when no
+        // other task could still unlock it is it taken anyway (the old
+        // behaviour: one call chain, nothing to wait for).
+        val mk: i64 = arg_int(args, 0, 0);
+        var mspins: i64 = 0;
+        while Interpreter_mutex_held(self, mk) && Interpreter_itask_others(self) {
+            Interpreter_itask_wait_turn(self, mspins);
+            mspins = mspins + 1;
+        }
+        I64Table_set(&mut self.shared_mem, mk, Value::Int(1));
         return ExecOutcome::Continue;
     }
     if name == "p_mutex_unlock" {
@@ -11993,10 +12867,17 @@ pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: &mut V
         });
         return ExecOutcome::Value(Value::Int(self.chans.len()));
     }
-    if name == "p_chan_send" || name == "p_chan_recv" || name == "p_chan_try_recv" || name == "p_chan_close" || name == "p_chan_is_closed" {
+    if name == "p_chan_send" || name == "p_chan_recv" || name == "p_chan_try_recv" || name == "p_chan_try_recv_into" || name == "p_chan_close" || name == "p_chan_is_closed" {
         var ch: i64 = arg_int(args, 0, 0);
         var pending: i64 = 0 - 9223372036854775807;
+        // BG241: `select`'s receive, p_chan_try_recv_into(ch, slot): 1 with
+        // the value (0 for a closed channel) written to *slot, 0 when
+        // nothing is ready (no sentinel a sent value could equal)
+        val into: bool = name == "p_chan_try_recv_into";
         if ch < 1 || ch > self.chans.len() {
+            if into {
+                return ExecOutcome::Value(Value::Int(0));
+            }
             if name == "p_chan_send" {
                 return ExecOutcome::Value(Value::Bool(false));
             }
@@ -12011,7 +12892,7 @@ pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: &mut V
         // LG11: a receive that has to wait lets the other tasks run until a
         // value comes, the channel is closed or no task is left that could
         // send; a try_recv that finds nothing gives them one turn first
-        if name == "p_chan_recv" || name == "p_chan_try_recv" {
+        if name == "p_chan_recv" || name == "p_chan_try_recv" || into {
             var wspins: i64 = 0;
             // CA7: a receive that waits stops once the slot's token is
             // cancelled, with what a closed, empty channel gives
@@ -12022,7 +12903,7 @@ pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: &mut V
                 }
                 Interpreter_itask_wait_turn(self, wspins);
                 wspins = wspins + 1;
-                if name == "p_chan_try_recv" {
+                if name == "p_chan_try_recv" || into {
                     break;
                 }
             }
@@ -12063,9 +12944,20 @@ pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: &mut V
             var cv: i64 = cs.buf.get(cs.head);
             cs.head = cs.head + 1;
             self.chans.set(ch - 1, cs);
+            if into {
+                Memory_store_i64(&mut self.memory, arg_int_or_ptr(args, 1), cv);
+                return ExecOutcome::Value(Value::Int(1));
+            }
             return ExecOutcome::Value(Value::Int(cv));
         }
-        if name == "p_chan_try_recv" && cs.closed {
+        if (name == "p_chan_try_recv" || into) && cs.closed {
+            if into {
+                Memory_store_i64(&mut self.memory, arg_int_or_ptr(args, 1), 0);
+                return ExecOutcome::Value(Value::Int(1));
+            }
+            return ExecOutcome::Value(Value::Int(0));
+        }
+        if into {
             return ExecOutcome::Value(Value::Int(0));
         }
         return ExecOutcome::Value(Value::Int(pending));
@@ -12977,6 +13869,10 @@ pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: &mut V
         var eoi: i64 = 0;
         while eoi < g_interp_env_names.len() {
             if g_interp_env_names.get(eoi) == en2 {
+                // BG428: a variable set to "" is set (Some("")), not null
+                if str_len(g_interp_env_vals.get(eoi)) == 0 {
+                    return ExecOutcome::Value(Value::Str(interp_empty_read()));
+                }
                 return ExecOutcome::Value(Value::Str(g_interp_env_vals.get(eoi)));
             }
             eoi = eoi + 1;
@@ -12985,6 +13881,12 @@ pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: &mut V
             var ev2: str = p_getenv(en2);
             var evp: i64 = ev2 + 0;
             if evp != 0 {
+                // BG428: a Str "" compares equal to 0, so core's env_var took
+                // a variable set to the empty string for unset: give the
+                // empty text interp_empty_read's string (as p_file_read, 2g.42)
+                if str_len(ev2) == 0 {
+                    return ExecOutcome::Value(Value::Str(interp_empty_read()));
+                }
                 return ExecOutcome::Value(Value::Str(ev2));
             }
         }
@@ -12999,7 +13901,13 @@ pub fn Interpreter_call_runtime2(self: &mut Interpreter, name: str, args: &mut V
                 // 2g.60: the program's own arguments (interp_set_program_args)
                 var real_ai: i64 = interp_prog_argv_index(ai2);
                 if real_ai >= 0 && real_ai < p_argc() {
-                    return ExecOutcome::Value(Value::Str(p_argv(real_ai)));
+                    // BG428: an empty argument is Some(""), not None (core's
+                    // arg_at tests `r == 0`, which a Str "" passes)
+                    val av: str = p_argv(real_ai);
+                    if str_len(av) == 0 {
+                        return ExecOutcome::Value(Value::Str(interp_empty_read()));
+                    }
+                    return ExecOutcome::Value(Value::Str(av));
                 }
             }
             _ => {

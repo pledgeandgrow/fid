@@ -371,7 +371,7 @@ The same on the interpreter, the C backend and native Windows executables:
 - `+`, `-`, `*` and negation are checked at the declared width: overflow panics.
 - In a `@wrapping` function they wrap at that width.
 - `/` and `%` by zero always panic, even in `@wrapping` code. `MIN / -1` panics,
-  unless `@wrapping`.
+  unless `@wrapping`; `MIN % -1` is 0 (the remainder fits).
 - A bare literal takes the other operand's type when it fits; otherwise the
   wider type wins, and the unsigned one at equal width.
 - `u64` is unsigned for division, modulo, comparison, `>>` and `print`.

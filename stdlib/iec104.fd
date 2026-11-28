@@ -139,7 +139,9 @@ fn f_err(msg: str) -> Iec104Frame {
     };
 }
 
-/// Parse one APCI frame starting at the front of `b`.
+/// Parse one APCI frame starting at the front of `b`. IEC 60870-5-104 §5:
+/// the APDU length is 4..253, S- and U-frames are exactly 4 control octets,
+/// and a U-frame has exactly one function bit set.
 pub fn iec104_parse(b: &Vec<i64>) -> Iec104Frame {
     if b.len() < 6 {
         return f_err("frame too short");
@@ -148,6 +150,9 @@ pub fn iec104_parse(b: &Vec<i64>) -> Iec104Frame {
         return f_err("bad start byte");
     }
     val length: i64 = b.get(1);
+    if length < 4 || length > 253 {
+        return f_err("bad length");
+    }
     val total: i64 = 2 + length;
     if b.len() < total {
         return f_err("incomplete frame");
@@ -171,12 +176,21 @@ pub fn iec104_parse(b: &Vec<i64>) -> Iec104Frame {
         };
     } else if (c0 & 3) == 1 {
         // S-format
+        if length != 4 {
+            return f_err("bad S-frame length");
+        }
         val nr: i64 = ((c2 | (c3 << 8)) >> 1) & 0x7FFF;
         return Iec104Frame {
             ok: true, error: "", format: APCI_S, ns: 0, nr: nr, ufunc: 0, asdu: Vec::new(), total_len: total
         };
     } else {
         // U-format
+        if length != 4 {
+            return f_err("bad U-frame length");
+        }
+        if c0 != U_STARTDT_ACT && c0 != U_STARTDT_CON && c0 != U_STOPDT_ACT && c0 != U_STOPDT_CON && c0 != U_TESTFR_ACT && c0 != U_TESTFR_CON {
+            return f_err("bad U-frame function");
+        }
         return Iec104Frame {
             ok: true, error: "", format: APCI_U, ns: 0, nr: 0, ufunc: c0, asdu: Vec::new(), total_len: total
         };
@@ -444,6 +458,9 @@ pub fn iec104_interrogation(cot: i64, common_addr: i64, qoi: i64) -> Vec<i64> {
 /// `vs` = send sequence, `va` = count acked by the peer, `vr` = receive
 /// sequence (next expected). `unacked_at` holds the send time of each
 /// outstanding I-frame for t1. All times are caller-supplied ticks.
+/// `seq_error` is set (and stays set) when a received N(S) is not the
+/// expected `vr` or an N(R) acknowledges frames never sent; IEC 60870-5-104
+/// §5.1 says the connection must then be closed.
 pub struct Iec104State {
     pub vs: i64,  // next N(S) to send
     pub va: i64,  // peer has acked up to this N(S)
@@ -458,11 +475,12 @@ pub struct Iec104State {
     pub last_recv_tick: i64,
     pub oldest_unacked_tick: i64,
     pub has_unacked: bool,
+    pub seq_error: bool,
 }
 
 pub fn iec104_state_new(k: i64, w: i64, t1: i64, t2: i64, t3: i64) -> Iec104State {
     return Iec104State {
-        vs: 0, va: 0, vr: 0, k: k, w: w, recv_since_ack: 0, t1: t1, t2: t2, t3: t3, last_send_tick: 0, last_recv_tick: 0, oldest_unacked_tick: 0, has_unacked: false,
+        vs: 0, va: 0, vr: 0, k: k, w: w, recv_since_ack: 0, t1: t1, t2: t2, t3: t3, last_send_tick: 0, last_recv_tick: 0, oldest_unacked_tick: 0, has_unacked: false, seq_error: false,
     };
 }
 
@@ -483,11 +501,22 @@ pub fn iec104_on_send(s: &mut Iec104State, tick: i64) -> i64 {
     return ns;
 }
 
+/// Is `nr` a valid N(R): va <= nr <= vs (mod 2^15)?
+pub fn iec104_nr_valid(s: &Iec104State, nr: i64) -> bool {
+    return ((nr - s.va) & 0x7FFF) <= ((s.vs - s.va) & 0x7FFF);
+}
+
 /// Record that we received an I-frame with sequence `ns` carrying N(R)
 /// `nr`, at `tick`. Returns true if we now owe an S-frame ack (w reached).
+/// An `ns` other than the expected `vr`, or an invalid `nr`, sets
+/// `seq_error`, leaves the sequence state as it was and returns false.
 pub fn iec104_on_recv_i(s: &mut Iec104State, ns: i64, nr: i64, tick: i64) -> bool {
+    if (ns & 0x7FFF) != s.vr || !iec104_nr_valid(s, nr) {
+        s.seq_error = true;
+        return false;
+    }
     s.vr = (ns + 1) & 0x7FFF;
-    s.va = nr;
+    s.va = nr & 0x7FFF;
     if ((s.vs - s.va) & 0x7FFF) == 0 {
         s.has_unacked = false;
     } else {
@@ -506,9 +535,14 @@ pub fn iec104_on_send_ack(s: &mut Iec104State) {
     s.recv_since_ack = 0;
 }
 
-/// Record a peer S-frame acking up to N(R).
+/// Record a peer S-frame acking up to N(R). An `nr` outside va..vs sets
+/// `seq_error` and changes nothing else.
 pub fn iec104_on_recv_s(s: &mut Iec104State, nr: i64, tick: i64) {
-    s.va = nr;
+    if !iec104_nr_valid(s, nr) {
+        s.seq_error = true;
+        return;
+    }
+    s.va = nr & 0x7FFF;
     if ((s.vs - s.va) & 0x7FFF) == 0 {
         s.has_unacked = false;
     }

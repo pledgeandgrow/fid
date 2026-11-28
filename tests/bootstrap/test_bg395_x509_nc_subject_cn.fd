@@ -1,0 +1,132 @@
+// BG395 (docs/roadmap/bugs-roadmap.md): name constraints apply to the
+// subject CN of a leaf without DNS or IP SANs, since x509_matches_host
+// takes the CN as the host name then. An intermediate constrained to
+// permitted DNS:.example.test can no longer issue a SAN-less leaf with
+// CN=bank.test that x509_verify_chain accepts. openssl verify gives the
+// same answers for these certificates (made with openssl 3.5): bank and
+// banksan "permitted subtree violation", good and humansp OK.
+// Not on run: the ECDSA verifications take minutes in the interpreter.
+//@ backends: ccompile,emit
+//
+// Expected output:
+// parsed true true true true true true
+// bank (CN=bank.test, no SAN): ok false, name not permitted: dns:bank.test
+// bank matches bank.test: true
+// banksan (SAN bank.test): ok false, name not permitted: dns:bank.test
+// good (CN=www.example.test, no SAN): ok true
+// humansp (CN=Device in room 42, no SAN): ok true
+use x509;
+use string;
+
+fn root_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+        "MIIBajCCARCgAwIBAgIUa3PPIkzPm+6unRMJTcwu76rkRdgwCgYIKoZIzj0EAwIw\n" +
+        "EjEQMA4GA1UEAwwHTkMgUm9vdDAgFw0yNjExMjcxOTM1MTdaGA8yMTI2MTEwMzE5\n" +
+        "MzUxN1owEjEQMA4GA1UEAwwHTkMgUm9vdDBZMBMGByqGSM49AgEGCCqGSM49AwEH\n" +
+        "A0IABBWU/jVNhorg85AVpm1sxy321ThK+gfQgxKFBn7DmhRYObPSYRxFEpeWboCt\n" +
+        "C7QrW0OWhl+1uFB2EXVsVpCxlvKjQjBAMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0P\n" +
+        "AQH/BAQDAgEGMB0GA1UdDgQWBBQyczKaQudfVYa2/CVsOMGsnOKv/jAKBggqhkjO\n" +
+        "PQQDAgNIADBFAiAstKibWdbGKw8udWL+1TVRy/iE55IUGrk82zg2970j7wIhAIvF\n" +
+        "lYGE/eG+usgXZjsm58sGd5pGLaWkiDB5tw98Mh9n\n" +
+        "-----END CERTIFICATE-----\n";
+}
+
+fn inter_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+        "MIIBpDCCAUmgAwIBAgIBCjAKBggqhkjOPQQDAjASMRAwDgYDVQQDDAdOQyBSb290\n" +
+        "MCAXDTI2MTEyNzE5MzUxN1oYDzIxMjYwNzI2MTkzNTE3WjAaMRgwFgYDVQQDDA9O\n" +
+        "QyBJbnRlcm1lZGlhdGUwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASUgSSmOHwu\n" +
+        "yVIqTD0GLFX5YTNAxuoOCDr4YtPx7si3pDtOfDMdDU21pofbcRIf0vHUDQtVpr+F\n" +
+        "TguvpClXGGFYo4GFMIGCMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEG\n" +
+        "MB8GA1UdHgEB/wQVMBOgETAPgg0uZXhhbXBsZS50ZXN0MB0GA1UdDgQWBBTJC/2I\n" +
+        "rP+2/oJAECjxhWE4bt70RzAfBgNVHSMEGDAWgBQyczKaQudfVYa2/CVsOMGsnOKv\n" +
+        "/jAKBggqhkjOPQQDAgNJADBGAiEAmjcL8SELJd5RfCqaO29VlCoEKjPD8Nd6KfKW\n" +
+        "jby3KXACIQCH9LXDJmJ7UamCzTuaewVqH0GzwjyfTQEEbBPGGFdBvg==\n" +
+        "-----END CERTIFICATE-----\n";
+}
+
+fn bank_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+        "MIIBbTCCARKgAwIBAgIBCzAKBggqhkjOPQQDAjAaMRgwFgYDVQQDDA9OQyBJbnRl\n" +
+        "cm1lZGlhdGUwIBcNMjYxMTI3MTkzNTE3WhgPMjEyNTA2MjExOTM1MTdaMBQxEjAQ\n" +
+        "BgNVBAMMCWJhbmsudGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABCyE4m4r\n" +
+        "atMDR4P7R1IYR+6Ba3vOosV5ZcXWfEC5WChPxjfUkcAehd+2uVHSmdv8vVkXdbVw\n" +
+        "yjt3kBYHiA46pBqjTTBLMAkGA1UdEwQCMAAwHQYDVR0OBBYEFAdJlYJdOB+Rb7Gw\n" +
+        "cZ+dEvJ293ZWMB8GA1UdIwQYMBaAFMkL/Yis/7b+gkAQKPGFYThu3vRHMAoGCCqG\n" +
+        "SM49BAMCA0kAMEYCIQDhOVoi7gR7CKXPhnoNqjCHqJmetfxgJq73bV5fPcbiYAIh\n" +
+        "AJlWqLu2M5itkPmw1G2r3xr5/gfMr6VRh3UgX4bJUQTN\n" +
+        "-----END CERTIFICATE-----\n";
+}
+
+fn banksan_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+        "MIIBgTCCASigAwIBAgIBDTAKBggqhkjOPQQDAjAaMRgwFgYDVQQDDA9OQyBJbnRl\n" +
+        "cm1lZGlhdGUwIBcNMjYxMTI3MTkzNTE4WhgPMjEyNTA2MjExOTM1MThaMBQxEjAQ\n" +
+        "BgNVBAMMCWJhbmsudGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMSbDocH\n" +
+        "uxQZlqcMj5S2fd+OL/7TJ446Yu31YzRBjRXpMFIDsmUQcfo9C6G0+wBz2sfJ2/gU\n" +
+        "D5aTzbc1GZ7cYE+jYzBhMAkGA1UdEwQCMAAwFAYDVR0RBA0wC4IJYmFuay50ZXN0\n" +
+        "MB0GA1UdDgQWBBR40oNKIV+Oo2xGT/75zvyeMAzrBzAfBgNVHSMEGDAWgBTJC/2I\n" +
+        "rP+2/oJAECjxhWE4bt70RzAKBggqhkjOPQQDAgNHADBEAiAtbE7skyHWgwmUaaUc\n" +
+        "O9Xtm6xFx2uD7bo4TSJkKFCG6QIgCtN+EcSSjJQ5H/tRX5QweHCrllUYANhaQEuW\n" +
+        "uMa+wTA=\n" +
+        "-----END CERTIFICATE-----\n";
+}
+
+fn good_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+        "MIIBczCCARmgAwIBAgIBCzAKBggqhkjOPQQDAjAaMRgwFgYDVQQDDA9OQyBJbnRl\n" +
+        "cm1lZGlhdGUwIBcNMjYxMTI3MTkzNTE3WhgPMjEyNTA2MjExOTM1MTdaMBsxGTAX\n" +
+        "BgNVBAMMEHd3dy5leGFtcGxlLnRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC\n" +
+        "AAS9o49fWvBkb9k9JO9AUi9N6VCnjWlYdviva37vANCNbuXpTN7tsbmOOE4oP8WL\n" +
+        "ZE2miKg8y6kkFreWmUnD4WbMo00wSzAJBgNVHRMEAjAAMB0GA1UdDgQWBBRVg8sR\n" +
+        "cUqJifi6tl2zqtvxBSEbrTAfBgNVHSMEGDAWgBTJC/2IrP+2/oJAECjxhWE4bt70\n" +
+        "RzAKBggqhkjOPQQDAgNIADBFAiEAocMPmW1i1ijCfEw70jV2JDcwoJPixMdoF/aH\n" +
+        "YViJm4YCIHMPVf6VAjqt121U6ALXTeK0U/aCeTG598XC9aPj/Pwh\n" +
+        "-----END CERTIFICATE-----\n";
+}
+
+fn humansp_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+        "MIIBdDCCARqgAwIBAgIBDDAKBggqhkjOPQQDAjAaMRgwFgYDVQQDDA9OQyBJbnRl\n" +
+        "cm1lZGlhdGUwIBcNMjYxMTI3MTkzNTE4WhgPMjEyNTA2MjExOTM1MThaMBwxGjAY\n" +
+        "BgNVBAMMEURldmljZSBpbiByb29tIDQyMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcD\n" +
+        "QgAEROjO37zW+Ap3xlXswQBxpBOfuUGpJ/+Fid6s3aZCXjG5eVqC0dIu4rdCS8rO\n" +
+        "xZg/Tsl4IRTiYzibf2qv+/w3jqNNMEswCQYDVR0TBAIwADAdBgNVHQ4EFgQUl9MM\n" +
+        "DImq5GEeCyl2kaxZtdIoSkYwHwYDVR0jBBgwFoAUyQv9iKz/tv6CQBAo8YVhOG7e\n" +
+        "9EcwCgYIKoZIzj0EAwIDSAAwRQIhAI1i+f20x2AV6SJ9mQ5HzgOMtO8kaQlcSAkX\n" +
+        "8lLi1twqAiBOB/vGa+iatgIwvemBRJQFV7IVEOfT62013w3PjNeP3g==\n" +
+        "-----END CERTIFICATE-----\n";
+}
+
+fn check(label: str, leaf: X509Cert, inter: X509Cert, root: X509Cert) -> void {
+    var chain: Vec<X509Cert> = Vec::new();
+    chain.push(leaf);
+    chain.push(inter);
+    var anchors: Vec<X509Cert> = Vec::new();
+    anchors.push(root);
+    val r: X509ChainResult = x509_verify_chain(chain, anchors, 1800000000);
+    if r.ok {
+        println(label + ": ok true");
+    } else {
+        println(label + ": ok false, " + r.err);
+    }
+}
+
+fn main() -> i64 {
+    val root: X509Cert = x509_parse_pem(root_pem());
+    val inter: X509Cert = x509_parse_pem(inter_pem());
+    val bank: X509Cert = x509_parse_pem(bank_pem());
+    val banksan: X509Cert = x509_parse_pem(banksan_pem());
+    val good: X509Cert = x509_parse_pem(good_pem());
+    val humansp: X509Cert = x509_parse_pem(humansp_pem());
+    println("parsed " + bool_to_str(root.ok) + " " + bool_to_str(inter.ok) + " " + bool_to_str(bank.ok) + " " + bool_to_str(banksan.ok) + " " + bool_to_str(good.ok) + " " + bool_to_str(humansp.ok));
+    // the entry's trigger
+    check("bank (CN=bank.test, no SAN)", bank, inter, root);
+    println("bank matches bank.test: " + bool_to_str(x509_matches_host(bank, "bank.test")));
+    // the same name as a SAN (rejected before the fix too)
+    check("banksan (SAN bank.test)", banksan, inter, root);
+    // a CN inside the permitted subtree, and a CN that is not a host name
+    check("good (CN=www.example.test, no SAN)", good, inter, root);
+    check("humansp (CN=Device in room 42, no SAN)", humansp, inter, root);
+    return 0;
+}

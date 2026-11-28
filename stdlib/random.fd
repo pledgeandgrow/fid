@@ -171,7 +171,37 @@ pub fn random_int_range(min: i64, max: i64) -> i64 {
     if max < min {
         return min;
     }
+    // max - min + 1 is past i64::MAX when the range holds 2^63 values or
+    // more (BG466): those take the unsigned span.
+    val imax: i64 = 9223372036854775807;
+    var wide: bool = false;
+    if min < 0 {
+        wide = max >= imax + min;
+    } else {
+        wide = max - min == imax;
+    }
+    if wide {
+        return random_range_wide(min, max);
+    }
     return min + RNG_DEFAULT.next_bounded(max - min + 1);
+}
+
+/// random_int_range of a range of 2^63 or more values: max - min, read as
+/// unsigned, is the count less one (-1: every i64), resampled on rejection.
+@wrapping
+fn random_range_wide(min: i64, max: i64) -> i64 {
+    val span: i64 = max - min;
+    if span == -1 {
+        return RNG_DEFAULT.next();
+    }
+    if span == 9223372036854775807 {
+        return min + (RNG_DEFAULT.next() & span);
+    }
+    var r: i64 = RNG_DEFAULT.next();
+    while (r as u64) > (span as u64) {
+        r = RNG_DEFAULT.next();
+    }
+    return min + r;
 }
 
 /// Generate a random i64 over the whole range (any bits may be set).

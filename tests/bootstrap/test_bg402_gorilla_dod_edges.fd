@@ -1,0 +1,72 @@
+// BG402 (docs/roadmap/bugs-roadmap.md): Gorilla timestamps whose
+// delta-of-delta is exactly 64, 256 or 2048 (the top of the paper's 7-,
+// 9- and 12-bit buckets [-63, 64], [-255, 256], [-2047, 2048]) decoded as
+// -64, -256, -2048, and every later time was off. Each bucket's ends now
+// round-trip, as do the values one past them (the next bucket).
+//
+// Expected output:
+// ok true count 6
+// 0 10 84 414 2792 5170
+// ok true count 13
+// 0 100 137 238 275 567 604 897 934 3018 3055 5140 5177
+// ok true count 10
+// 0 1 67 68 326 327 2377 2378 1099511630155 1099511630156
+// 1.5 2.5 -3 0 7.25 1000000.5
+use timeseries;
+
+fn show(d: &TsDecoded) {
+    println(f"ok {d.ok} count {d.series.times.len()}");
+    var line: str = "";
+    var i: i64 = 0;
+    while i < d.series.times.len() {
+        if i > 0 {
+            line = line + " ";
+        }
+        line = line + int_to_str(d.series.times.get(i));
+        i = i + 1;
+    }
+    println(line);
+}
+
+fn main() {
+    // the entry's trigger: dods 10, 64, 256, 2048, 0
+    var s: TsSeries = ts_series_new();
+    ts_series_push(&mut s, 0, 1.5);
+    ts_series_push(&mut s, 10, 2.5);
+    ts_series_push(&mut s, 84, 0.0 - 3.0);
+    ts_series_push(&mut s, 414, 0.0);
+    ts_series_push(&mut s, 2792, 7.25);
+    ts_series_push(&mut s, 5170, 1000000.5);
+    val d: TsDecoded = ts_gorilla_decode(ts_gorilla_encode(&s));
+    show(&d);
+    // each bucket's ends and -2^(n-1), which is in the next bucket:
+    // dods 100, -63, 64, -64, 255, -255, 256, -256, 2047, -2047, 2048, -2048
+    var t: TsSeries = ts_series_new();
+    val times: [i64; 13] = [0, 100, 137, 238, 275, 567, 604, 897, 934, 3018, 3055, 5140, 5177];
+    var i: i64 = 0;
+    while i < 13 {
+        ts_series_push(&mut t, times[i], 1.0);
+        i = i + 1;
+    }
+    show(&ts_gorilla_decode(ts_gorilla_encode(&t)));
+    // one past each top end, and a 64-bit dod:
+    // dods 1, 65, -65, 257, -257, 2049, -2049, 2^40, -2^40
+    var u: TsSeries = ts_series_new();
+    val ut: [i64; 10] = [0, 1, 67, 68, 326, 327, 2377, 2378, 1099511630155, 1099511630156];
+    i = 0;
+    while i < 10 {
+        ts_series_push(&mut u, ut[i], 2.0);
+        i = i + 1;
+    }
+    show(&ts_gorilla_decode(ts_gorilla_encode(&u)));
+    var vals: str = "";
+    i = 0;
+    while i < d.series.values.len() {
+        if i > 0 {
+            vals = vals + " ";
+        }
+        vals = vals + float_to_str(d.series.values.get(i));
+        i = i + 1;
+    }
+    println(vals);
+}

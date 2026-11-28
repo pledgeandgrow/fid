@@ -857,6 +857,10 @@ fn sm_crlf(s: str) -> str {
 }
 
 // A text part: 7bit when ASCII with short lines, else quoted-printable.
+// Every boundary mail_build makes starts with "=_", which quoted-printable
+// (it writes "=" as "=3D") and base64 never produce, so a text that holds
+// "=_" goes quoted-printable too: no part's content can then contain a
+// boundary line and close its part or add parts (RFC 2046 §5.1.1).
 fn sm_text_part(ctype: str, body: str) -> str {
     var long_line: bool = false;
     val lines: Vec<str> = str_split(body, "\n");
@@ -867,7 +871,7 @@ fn sm_text_part(ctype: str, body: str) -> str {
         }
         i = i + 1;
     }
-    if sm_ascii(body) && !long_line {
+    if sm_ascii(body) && !long_line && str_find(body, "=_") < 0 {
         return "Content-Type: " + ctype + "; charset=us-ascii\r\nContent-Transfer-Encoding: 7bit\r\n\r\n" + sm_crlf(body);
     }
     return "Content-Type: " + ctype + "; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n" + mail_quoted_printable(body);

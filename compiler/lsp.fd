@@ -54,6 +54,10 @@ pub fn lsp_run() -> i64 {
     // CB2: imported modules unchanged since the last check are not lexed
     // or parsed again (compiler.fd modcache_get)
     modcache_enable();
+    // BG488: the shutdown handshake. After `shutdown`, a request gets an
+    // InvalidRequest error and a notification is dropped; `exit` ends with
+    // 0 after a shutdown, else with 1 (the LSP specification's exit codes)
+    var shut_down: bool = false;
 
     // Main message loop
     loop {
@@ -108,19 +112,41 @@ pub fn lsp_run() -> i64 {
                 var method: str = json_get_str(msg, "method");
                 var id: Json = json_get(msg, "id");
                 var params: Json = json_get(msg, "params");
+                // BG330: the document the positions of this message's
+                // answer are in (lsp_out_positions), its lines read again
+                g_lsp_cur_uri = json_get_str(json_get(params, "textDocument"), "uri");
+                g_lsp_lines_ok = false;
 
+                if shut_down && method != "exit" {
+                    match id {
+                        Json::Null => {
+                        }
+                        _ => {
+                            var sd_err: JsonObject = JsonObject::new();
+                            sd_err.insert("code", Json::Num(-32600.0));
+                            sd_err.insert("message", Json::Str("the server is shut down: only exit is accepted"));
+                            send_error(id, Json::Obj(sd_err));
+                        }
+                    }
+                    continue;
+                }
                 if method == "initialize" {
                     handle_initialize(id);
                 } else if method == "initialized" {  // No response needed
                 } else if method == "shutdown" {
+                    shut_down = true;
                     send_response(id, Json::Null);
                 } else if method == "exit" {
-                    return 0;
+                    if shut_down {
+                        return 0;
+                    }
+                    return 1;
                 } else if method == "textDocument/didOpen" {
                     var text_doc: Json = json_get(params, "textDocument");
                     var uri: str = json_get_str(text_doc, "uri");
                     var text: str = json_get_str(text_doc, "text");
                     doc_set(&mut documents, uri, text);
+                    lsp_note_docs(documents);
                     publish_diagnostics(uri, text);
                 } else if method == "textDocument/didChange" {
                     var text_doc: Json = json_get(params, "textDocument");
@@ -132,6 +158,7 @@ pub fn lsp_run() -> i64 {
                                 var first: Json = arr.get(0);
                                 var text: str = json_get_str(first, "text");
                                 doc_set(&mut documents, uri, text);
+                                lsp_note_docs(documents);
                                 publish_diagnostics(uri, text);
                             }
                         }
@@ -142,31 +169,32 @@ pub fn lsp_run() -> i64 {
                     var text_doc: Json = json_get(params, "textDocument");
                     var uri: str = json_get_str(text_doc, "uri");
                     doc_remove(&mut documents, uri);
+                    lsp_note_docs(documents);
                 } else if method == "textDocument/completion" {
                     var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
                     var line: i64 = json_get_int(json_get(params, "position"), "line");
-                    var character: i64 = json_get_int(json_get(params, "position"), "character");
+                    var character: i64 = lsp_in_char(params);
                     var text: str = doc_get(documents, uri);
                     var result: Json = handle_completion(text, uri, line, character);
                     send_response(id, result);
                 } else if method == "textDocument/hover" {
                     var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
                     var line: i64 = json_get_int(json_get(params, "position"), "line");
-                    var character: i64 = json_get_int(json_get(params, "position"), "character");
+                    var character: i64 = lsp_in_char(params);
                     var text: str = doc_get(documents, uri);
-                    var result: Json = handle_hover(text, line, character);
+                    var result: Json = handle_hover(text, uri, line, character);
                     send_response(id, result);
                 } else if method == "textDocument/definition" {
                     var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
                     var line: i64 = json_get_int(json_get(params, "position"), "line");
-                    var character: i64 = json_get_int(json_get(params, "position"), "character");
+                    var character: i64 = lsp_in_char(params);
                     var text: str = doc_get(documents, uri);
                     var result: Json = handle_definition(text, uri, line, character, documents);
                     send_response(id, result);
                 } else if method == "textDocument/rename" {
                     var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
                     var line: i64 = json_get_int(json_get(params, "position"), "line");
-                    var character: i64 = json_get_int(json_get(params, "position"), "character");
+                    var character: i64 = lsp_in_char(params);
                     var new_name: str = json_get_str(params, "newName");
                     var text: str = doc_get(documents, uri);
                     var result: Json = handle_rename(text, uri, line, character, new_name, documents);
@@ -174,7 +202,7 @@ pub fn lsp_run() -> i64 {
                 } else if method == "textDocument/references" {
                     var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
                     var line: i64 = json_get_int(json_get(params, "position"), "line");
-                    var character: i64 = json_get_int(json_get(params, "position"), "character");
+                    var character: i64 = lsp_in_char(params);
                     var include_decl: bool = json_get_bool(json_get(params, "context"), "includeDeclaration", true);
                     var text: str = doc_get(documents, uri);
                     var result: Json = handle_references(text, uri, line, character, include_decl, documents);
@@ -187,9 +215,9 @@ pub fn lsp_run() -> i64 {
                 } else if method == "textDocument/signatureHelp" {
                     var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
                     var line: i64 = json_get_int(json_get(params, "position"), "line");
-                    var character: i64 = json_get_int(json_get(params, "position"), "character");
+                    var character: i64 = lsp_in_char(params);
                     var text: str = doc_get(documents, uri);
-                    var result: Json = handle_signature_help(text, line, character);
+                    var result: Json = handle_signature_help(text, uri, line, character);
                     send_response(id, result);
                 } else if method == "textDocument/inlayHint" {
                     // TL4: parameter names at the arguments of calls
@@ -352,6 +380,10 @@ fn doc_remove(documents: &mut Vec<DocEntry>, uri: str) -> void {
 
 fn handle_initialize(id: Json) -> void {
     var caps: JsonObject = JsonObject::new();
+    // BG330: positions are UTF-16 code units (the LSP default, which every
+    // client supports): converted from and to the byte columns the server
+    // works in (lsp_in_char, lsp_out_positions)
+    caps.insert("positionEncoding", Json::Str("utf-16"));
     caps.insert("textDocumentSync", Json::Num(1.0));
     // Full sync
     var diag_provider: JsonObject = JsonObject::new();
@@ -413,10 +445,210 @@ fn send_error(id: Json, error: Json) -> void {
 }
 
 fn send_notification(msg: Json) -> void {
-    var json_str: str = json_dump(msg, false);
+    // BG330: every position sent, from a byte column to UTF-16 units
+    var out_msg: Json = lsp_out_positions(msg, g_lsp_cur_uri, false);
+    var json_str: str = json_dump(out_msg, false);
     var output: str = "Content-Length: " + int_to_str(str_len(json_str)) + "\r\n\r\n" + json_str;
     p_print_str(output);
     p_flush_stdout();
+}
+
+// --- BG330: UTF-16 positions ---------------------------------------------
+// LSP positions count UTF-16 code units (positionEncoding "utf-16", which
+// initialize announces); the server works in byte columns of the UTF-8
+// text. A request's position is converted once (lsp_in_char), and every
+// position of every message sent once (lsp_out_positions, from
+// send_notification): before, a byte column went out as `character`, so
+// after a non-ASCII character a range landed too far right and a rename
+// rewrote the wrong characters.
+
+/// The open documents (lsp_note_docs), the document of the message being
+/// answered, and the lines of the last document looked at.
+var g_lsp_doc_uris: Vec<str> = Vec::new();
+var g_lsp_doc_texts: Vec<str> = Vec::new();
+var g_lsp_cur_uri: str = "";
+var g_lsp_lines_uri: str = "";
+var g_lsp_lines: Vec<str> = Vec::new();
+var g_lsp_lines_ok: bool = false;
+
+/// The open documents changed: note their texts.
+fn lsp_note_docs(documents: Vec<DocEntry>) {
+    g_lsp_doc_uris = Vec::new();
+    g_lsp_doc_texts = Vec::new();
+    var i: i64 = 0;
+    while i < documents.len() {
+        g_lsp_doc_uris.push(documents.get(i).uri);
+        g_lsp_doc_texts.push(documents.get(i).text);
+        i = i + 1;
+    }
+    g_lsp_lines_ok = false;
+}
+
+/// Line `line` of document `uri`: its open text, else its file's; "" when
+/// there is none.
+fn lsp_line_text(uri: str, line: i64) -> str {
+    if !g_lsp_lines_ok || g_lsp_lines_uri != uri {
+        var text: str = "";
+        var found: bool = false;
+        var i: i64 = 0;
+        while i < g_lsp_doc_uris.len() && !found {
+            if g_lsp_doc_uris.get(i) == uri {
+                text = g_lsp_doc_texts.get(i);
+                found = true;
+            }
+            i = i + 1;
+        }
+        if !found && str_starts_with(uri, "file://") {
+            match read_file(lsp_uri_path(uri)) {
+                Option::Some(ft) => {
+                    text = ft;
+                }
+                Option::None => {
+                }
+            }
+        }
+        g_lsp_lines = split_lines(text);
+        g_lsp_lines_uri = uri;
+        g_lsp_lines_ok = true;
+    }
+    if line >= 0 && line < g_lsp_lines.len() {
+        return g_lsp_lines.get(line);
+    }
+    return "";
+}
+
+/// The length of the UTF-8 sequence lead byte `b` starts (1 for ASCII and
+/// for a stray continuation byte).
+fn lsp_u8_width(b: i64) -> i64 {
+    if b >= 240 {
+        return 4;
+    }
+    if b >= 224 {
+        return 3;
+    }
+    if b >= 192 {
+        return 2;
+    }
+    return 1;
+}
+
+/// The UTF-16 column of byte column `bc` of line `l` (a character of 4
+/// UTF-8 bytes is 2 units, any other 1; past the line's end a byte is a
+/// unit).
+fn lsp_byte_to_u16(l: str, bc: i64) -> i64 {
+    var n: i64 = str_len(l);
+    var i: i64 = 0;
+    var u: i64 = 0;
+    while i < bc && i < n {
+        var w: i64 = lsp_u8_width(str_byte_at(l, i));
+        if w == 4 {
+            u = u + 2;
+        } else {
+            u = u + 1;
+        }
+        i = i + w;
+    }
+    if bc > i {
+        u = u + (bc - i);
+    }
+    return u;
+}
+
+/// The byte column of UTF-16 column `uc` of line `l` (a column inside a
+/// surrogate pair is the character's start).
+fn lsp_u16_to_byte(l: str, uc: i64) -> i64 {
+    var n: i64 = str_len(l);
+    var i: i64 = 0;
+    var u: i64 = 0;
+    while u < uc && i < n {
+        var w: i64 = lsp_u8_width(str_byte_at(l, i));
+        var du: i64 = 1;
+        if w == 4 {
+            du = 2;
+        }
+        if u + du > uc {
+            return i;
+        }
+        u = u + du;
+        i = i + w;
+    }
+    if u < uc {
+        i = i + (uc - u);
+    }
+    return i;
+}
+
+/// The byte column of character column `cc` (0-based) of line `l`.
+fn lsp_cp_to_byte(l: str, cc: i64) -> i64 {
+    var n: i64 = str_len(l);
+    var i: i64 = 0;
+    var c: i64 = 0;
+    while c < cc && i < n {
+        i = i + lsp_u8_width(str_byte_at(l, i));
+        c = c + 1;
+    }
+    if c < cc {
+        i = i + (cc - c);
+    }
+    return i;
+}
+
+/// The byte column of a request's `position` (in its textDocument).
+fn lsp_in_char(params: Json) -> i64 {
+    var pos: Json = json_get(params, "position");
+    var uri: str = json_get_str(json_get(params, "textDocument"), "uri");
+    return lsp_u16_to_byte(lsp_line_text(uri, json_get_int(pos, "line")), json_get_int(pos, "character"));
+}
+
+/// `v` with each position ({line, character}) made UTF-16 units: in
+/// document `uri`, or the `uri` of an object around it (a Location, the
+/// params of publishDiagnostics), or the key of a WorkspaceEdit's
+/// `changes` (`in_changes`: `v` is that map).
+fn lsp_out_positions(v: Json, uri: str, in_changes: bool) -> Json {
+    match v {
+        Json::Arr(items) => {
+            var out: Vec<Json> = Vec::new();
+            var i: i64 = 0;
+            while i < items.len() {
+                out.push(lsp_out_positions(items.get(i), uri, false));
+                i = i + 1;
+            }
+            return Json::Arr(out);
+        }
+        Json::Obj(obj) => {
+            if obj.len() == 2 && obj.contains("line") && obj.contains("character") {
+                var pl: i64 = json_get_int(v, "line");
+                var pc: i64 = json_get_int(v, "character");
+                var p: JsonObject = JsonObject::new();
+                p.insert("line", Json::Num(pl as f64));
+                p.insert("character", Json::Num(lsp_byte_to_u16(lsp_line_text(uri, pl), pc) as f64));
+                return Json::Obj(p);
+            }
+            var here: str = uri;
+            match obj.get("uri") {
+                Json::Str(ou) => {
+                    here = ou;
+                }
+                _ => {
+                }
+            }
+            var o2: JsonObject = JsonObject::new();
+            var k: i64 = 0;
+            while k < obj.len() {
+                var key: str = obj.key_at(k);
+                var child_uri: str = here;
+                if in_changes {
+                    child_uri = key;
+                }
+                o2.insert(key, lsp_out_positions(obj.value_at(k), child_uri, key == "changes"));
+                k = k + 1;
+            }
+            return Json::Obj(o2);
+        }
+        _ => {
+        }
+    }
+    return v;
 }
 
 // --- Diagnostics --------------------------------------------------------
@@ -433,6 +665,16 @@ fn publish_diagnostics(uri: str, text: str) -> void {
     send_notification(Json::Obj(notification));
 }
 
+/// BG461: the path of document `uri` for a build (its `use`s resolve
+/// against it), as diagnostics_json takes it; None for a URI that is not a
+/// file.
+fn lsp_doc_path(uri: str) -> OptStr {
+    if str_starts_with(uri, "file://") {
+        return OptStr::Some(lsp_uri_path(uri));
+    }
+    return OptStr::None;
+}
+
 /// The LSP Diagnostic objects of `text` (the document `uri`): pushed by
 /// publish_diagnostics, pulled by textDocument/diagnostic.
 fn diagnostics_json(uri: str, text: str) -> Vec<Json> {
@@ -445,18 +687,26 @@ fn diagnostics_json(uri: str, text: str) -> Vec<Json> {
     }
 
     var diags: Vec<StrTriple> = get_diagnostics(text, source_path);
+    // BG330: a diagnostic's column counts characters (the lexer's); the
+    // positions here are byte columns, as everywhere in this server
+    // (send_notification makes them UTF-16 units)
+    var dlines: Vec<str> = split_lines(text);
 
     var diag_array: Vec<Json> = Vec::new();
     var i: i64 = 0;
     while i < diags.len() {
         var d: StrTriple = diags.get(i);
+        var dline: str = "";
+        if d.line >= 1 && d.line <= dlines.len() {
+            dline = dlines.get(d.line - 1);
+        }
         var range: JsonObject = JsonObject::new();
         var start: JsonObject = JsonObject::new();
         start.insert("line", Json::Num((d.line - 1) as f64));
-        start.insert("character", Json::Num((d.col - 1) as f64));
+        start.insert("character", Json::Num(lsp_cp_to_byte(dline, d.col - 1) as f64));
         var end: JsonObject = JsonObject::new();
         end.insert("line", Json::Num((d.line - 1) as f64));
-        end.insert("character", Json::Num(d.col as f64));
+        end.insert("character", Json::Num(lsp_cp_to_byte(dline, d.col) as f64));
         range.insert("start", Json::Obj(start));
         range.insert("end", Json::Obj(end));
 
@@ -741,8 +991,9 @@ fn lsp_receiver_type(lines: Vec<str>, receiver: str, line: i64, character: i64, 
 
 /// Handle textDocument/completion.
 fn handle_completion(text: str, uri: str, line: i64, character: i64) -> Json {
-    // Build program to get symbol info
-    var result: ResultProgram = build_program_with_path(text, OptStr::None);
+    // Build program to get symbol info (BG461: with the document's path, so
+    // its `use`s resolve)
+    var result: ResultProgram = build_program_with_path(text, lsp_doc_path(uri));
     var program: Program = program_new();
     var has_program: bool = false;
     match result {
@@ -930,13 +1181,16 @@ fn handle_completion(text: str, uri: str, line: i64, character: i64) -> Json {
 }
 
 /// Handle textDocument/hover.
-fn handle_hover(text: str, line: i64, character: i64) -> Json {
+fn handle_hover(text: str, uri: str, line: i64, character: i64) -> Json {
     var word: str = word_at_position(text, line, character);
     if str_len(word) == 0 {
         return Json::Null;
     }
 
-    var result: ResultProgram = build_program_with_path(text, OptStr::None);
+    // BG461: built with the document's path, as its diagnostics are: without
+    // it a `use` could not be resolved, the build failed, and the parsed
+    // fallback holds neither the imported functions nor core's
+    var result: ResultProgram = build_program_with_path(text, lsp_doc_path(uri));
     var program: Program = program_new();
     var has_program: bool = false;
     match result {
@@ -1731,6 +1985,19 @@ fn handle_formatting(text: str) -> Json {
     if formatted == text {
         return Json::Arr(edits);
     }
+    // BG364: as `fid fmt`: no edit for a document that does not parse (a
+    // format-on-save in the middle of an edit), nor one that would change
+    // the tokens, not only their spacing (a formatter bug)
+    match parse_program_only(text) {
+        OptProgram::Some(_) => {
+        }
+        OptProgram::None => {
+            return Json::Arr(edits);
+        }
+    }
+    if !fmt_same_tokens(text, formatted) {
+        return Json::Arr(edits);
+    }
     var lines: Vec<str> = split_lines(text);
     var last_line: i64 = lines.len() - 1;
     if last_line < 0 {
@@ -1759,7 +2026,7 @@ fn handle_formatting(text: str) -> Json {
 /// Handle textDocument/signatureHelp — walk back from the cursor to the
 /// nearest unmatched `(`, take the callee name before it, and report its
 /// signature plus the active argument index (commas before the cursor).
-fn handle_signature_help(text: str, line: i64, character: i64) -> Json {
+fn handle_signature_help(text: str, uri: str, line: i64, character: i64) -> Json {
     // Byte offset of the cursor.
     var lines: Vec<str> = split_lines(text);
     var off: i64 = 0;
@@ -1836,8 +2103,9 @@ fn handle_signature_help(text: str, line: i64, character: i64) -> Json {
         j = j + 1;
     }
 
-    // Look up the callee in the parsed program.
-    var result: ResultProgram = build_program_with_path(text, OptStr::None);
+    // Look up the callee in the parsed program (BG461: built with the
+    // document's path, so its `use`s resolve).
+    var result: ResultProgram = build_program_with_path(text, lsp_doc_path(uri));
     var program: Program = program_new();
     var has_program: bool = false;
     match result {
@@ -2877,6 +3145,37 @@ fn fix_rename_line(l: str, old: str, new: str, keys: bool) -> str {
             while i < n && is_ident_char(str_byte_at(l, i)) {
                 i = i + 1;
             }
+            if lsp_is_fstr_start(l, s0, i) {
+                // BG325: the uses in the f-string's `{...}` (no struct
+                // literal there: the `keys` rule)
+                var fr: Vec<i64> = lsp_fstr_code(l, s0);
+                var fi: i64 = 0;
+                while fi + 1 < fr.len() {
+                    var q: i64 = fr.get(fi);
+                    var qe: i64 = fr.get(fi + 1);
+                    while q < qe {
+                        var cq: i64 = str_byte_at(l, q);
+                        if cq == 34 || cq == 39 {
+                            q = ih_skip_literal(l, q);
+                        } else if is_ident_char(cq) {
+                            var q2: i64 = q;
+                            while q2 < qe && is_ident_char(str_byte_at(l, q2)) {
+                                q2 = q2 + 1;
+                            }
+                            if q2 - q == olen && str_slice(l, q, q2) == old && fix_rename_here(l, q, q2, true) {
+                                out = out + str_slice(l, last, q) + new;
+                                last = q2;
+                            }
+                            q = q2;
+                        } else {
+                            q = q + 1;
+                        }
+                    }
+                    fi = fi + 2;
+                }
+                i = fr.get(fr.len() - 1);
+                continue;
+            }
             if i - s0 == olen && str_slice(l, s0, i) == old && fix_rename_here(l, s0, i, keys) {
                 out = out + str_slice(l, last, s0) + new;
                 last = i;
@@ -3476,6 +3775,81 @@ fn lsp_occ_ok(l: str, k: i64, e: i64, in_body: bool, skip_dot: bool, is_local: b
     return true;
 }
 
+/// BG325: is the identifier at [k, e) of `l` the `f` of an f-string?
+fn lsp_is_fstr_start(l: str, k: i64, e: i64) -> bool {
+    return e - k == 1 && str_byte_at(l, k) == 102 && e < str_len(l) && str_byte_at(l, e) == 34;
+}
+
+/// BG325: the code inside the f-string whose `f` is at column `i` of `l`
+/// (f-strings are on one line): [start, end) of each `{...}` expression,
+/// its format spec (after a top-level `:`, compiler/lexer.fd
+/// lex_fstr_expr_end's rule) left out, then the column just past the
+/// closing quote (the line's length when it has none). A rename or
+/// references search looks at the names in these ranges: before, the whole
+/// f-string was skipped as a string, so `f"{count}"` kept the old name.
+fn lsp_fstr_code(l: str, i: i64) -> Vec<i64> {
+    var r: Vec<i64> = Vec::new();
+    var n: i64 = str_len(l);
+    var k: i64 = i + 2;
+    while k < n {
+        var c: i64 = str_byte_at(l, k);
+        if c == 92 {
+            k = k + 2;
+        } else if c == 34 {
+            r.push(k + 1);
+            return r;
+        } else if c == 123 {
+            var st: i64 = k + 1;
+            var stop: i64 = -1;
+            var depth: i64 = 1;
+            var pb: i64 = 0;
+            var j: i64 = st;
+            while j < n && depth > 0 {
+                var cj: i64 = str_byte_at(l, j);
+                if cj == 34 || cj == 39 {
+                    j = ih_skip_literal(l, j);
+                } else if cj == 123 {
+                    depth = depth + 1;
+                    j = j + 1;
+                } else if cj == 125 {
+                    depth = depth - 1;
+                    if depth > 0 {
+                        j = j + 1;
+                    }
+                } else if cj == 40 || cj == 91 {
+                    pb = pb + 1;
+                    j = j + 1;
+                } else if cj == 41 || cj == 93 {
+                    pb = pb - 1;
+                    j = j + 1;
+                } else if cj == 58 && depth == 1 && pb == 0 && !(j > st && str_byte_at(l, j - 1) == 58) && !(j + 1 < n && str_byte_at(l, j + 1) == 58) {
+                    // the format spec: text up to the `}`
+                    stop = j;
+                    while j < n && str_byte_at(l, j) != 125 {
+                        j = j + 1;
+                    }
+                    depth = 0;
+                } else {
+                    j = j + 1;
+                }
+            }
+            if stop < 0 {
+                stop = j;
+            }
+            if stop > n {
+                stop = n;
+            }
+            r.push(st);
+            r.push(stop);
+            k = j + 1;
+        } else {
+            k = k + 1;
+        }
+    }
+    r.push(n);
+    return r;
+}
+
 /// The occurrences of `name` in code (not in strings or comments) on the
 /// lines [l0, l1], as (line, column, length); on line l0 only those at or
 /// before column `first_max` (when it is 0 or more). Lines after
@@ -3516,6 +3890,37 @@ fn lsp_code_occ(lines: Vec<str>, name: str, l0: i64, l1: i64, first_max: i64, bo
                 var e: i64 = k;
                 while e < n && is_ident_char(str_byte_at(l, e)) {
                     e = e + 1;
+                }
+                if lsp_is_fstr_start(l, k, e) {
+                    // BG325: the names in the f-string's `{...}` (a struct
+                    // literal's `x:` rule does not apply there)
+                    var fr: Vec<i64> = lsp_fstr_code(l, k);
+                    var fi: i64 = 0;
+                    while fi + 1 < fr.len() {
+                        var q: i64 = fr.get(fi);
+                        var qe: i64 = fr.get(fi + 1);
+                        while q < qe {
+                            var cq: i64 = str_byte_at(l, q);
+                            if cq == 34 || cq == 39 {
+                                q = ih_skip_literal(l, q);
+                            } else if is_ident_char(cq) {
+                                var q2: i64 = q;
+                                while q2 < qe && is_ident_char(str_byte_at(l, q2)) {
+                                    q2 = q2 + 1;
+                                }
+                                var f_in_range: bool = li != l0 || first_max < 0 || q <= first_max;
+                                if f_in_range && q2 - q == nlen && str_slice(l, q, q2) == name && lsp_occ_ok(l, q, q2, false, skip_dot, is_local) {
+                                    r.push(I64Triple_new(li, q, nlen));
+                                }
+                                q = q2;
+                            } else {
+                                q = q + 1;
+                            }
+                        }
+                        fi = fi + 2;
+                    }
+                    k = fr.get(fr.len() - 1);
+                    continue;
                 }
                 var in_range: bool = li != l0 || first_max < 0 || k <= first_max;
                 if in_range && e - k == nlen && str_slice(l, k, e) == name && lsp_occ_ok(l, k, e, li > body_from, skip_dot, is_local) {

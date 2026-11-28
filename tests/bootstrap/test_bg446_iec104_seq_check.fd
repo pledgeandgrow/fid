@@ -1,0 +1,66 @@
+// BG446 (docs/roadmap/bugs-roadmap.md): the iec104 sequence state checks
+// N(S) against the expected V(R) and N(R) against va..vs (mod 2^15); a
+// sequence error sets seq_error (IEC 60870-5-104 §5.1: close the
+// connection) and leaves the window state as it was, so an ack of unsent
+// frames no longer jams the send window.
+//
+// Expected output:
+// ack of unsent: seq_error=true va=0 vs=1 can_send=true has_unacked=true
+// valid ack: seq_error=false va=1 vs=1 can_send=true has_unacked=false
+// in order: seq_error=false vr=1
+// gap ns=7: seq_error=true vr=1
+// next in order: vr=2
+// i-frame nr beyond vs: seq_error=true vr=0
+// wrap: ack 32767 ok=true ack 1 ok=true ack 3 error=true va=1
+// ns wrap: seq_error=false vr=0
+use iec104;
+
+fn b(x: bool) -> str {
+    if x {
+        return "true";
+    }
+    return "false";
+}
+
+fn main() {
+    // the entry's trigger: one frame sent, the peer acks five
+    var s: Iec104State = iec104_state_new(12, 8, 15, 10, 20);
+    iec104_on_send(&mut s, 0);
+    iec104_on_recv_s(&mut s, 5, 1);
+    println("ack of unsent: seq_error=" + b(s.seq_error) + " va=" + int_to_str(s.va) + " vs=" + int_to_str(s.vs) + " can_send=" + b(iec104_can_send(&s)) + " has_unacked=" + b(s.has_unacked));
+    var s1: Iec104State = iec104_state_new(12, 8, 15, 10, 20);
+    iec104_on_send(&mut s1, 0);
+    iec104_on_recv_s(&mut s1, 1, 1);
+    println("valid ack: seq_error=" + b(s1.seq_error) + " va=" + int_to_str(s1.va) + " vs=" + int_to_str(s1.vs) + " can_send=" + b(iec104_can_send(&s1)) + " has_unacked=" + b(s1.has_unacked));
+
+    // the entry's second trigger: N(S) 0 then 7
+    var s2: Iec104State = iec104_state_new(12, 8, 15, 10, 20);
+    iec104_on_recv_i(&mut s2, 0, 0, 1);
+    println("in order: seq_error=" + b(s2.seq_error) + " vr=" + int_to_str(s2.vr));
+    iec104_on_recv_i(&mut s2, 7, 0, 2);
+    println("gap ns=7: seq_error=" + b(s2.seq_error) + " vr=" + int_to_str(s2.vr));
+    iec104_on_recv_i(&mut s2, 1, 0, 3);
+    println("next in order: vr=" + int_to_str(s2.vr));
+
+    // an I-frame whose N(R) acks frames we never sent
+    var s3: Iec104State = iec104_state_new(12, 8, 15, 10, 20);
+    iec104_on_recv_i(&mut s3, 0, 2, 1);
+    println("i-frame nr beyond vs: seq_error=" + b(s3.seq_error) + " vr=" + int_to_str(s3.vr));
+
+    // modulo 2^15: va = 32766, vs = 2 (4 outstanding)
+    var s4: Iec104State = iec104_state_new(12, 8, 15, 10, 20);
+    s4.va = 32766;
+    s4.vs = 2;
+    s4.has_unacked = true;
+    iec104_on_recv_s(&mut s4, 32767, 1);
+    val e1: bool = s4.seq_error;
+    iec104_on_recv_s(&mut s4, 1, 2);
+    val e2: bool = s4.seq_error;
+    iec104_on_recv_s(&mut s4, 3, 3);
+    println("wrap: ack 32767 ok=" + b(!e1) + " ack 1 ok=" + b(!e2) + " ack 3 error=" + b(s4.seq_error) + " va=" + int_to_str(s4.va));
+
+    var s5: Iec104State = iec104_state_new(12, 8, 15, 10, 20);
+    s5.vr = 32767;
+    iec104_on_recv_i(&mut s5, 32767, 0, 1);
+    println("ns wrap: seq_error=" + b(s5.seq_error) + " vr=" + int_to_str(s5.vr));
+}

@@ -1,0 +1,27 @@
+// expect-error: Deadlock error: locks are taken in an inconsistent order
+// Bugs roadmap BG235: the lock-order checks (typechecker.fd lo_summary,
+// lockcheck.fd) did not look inside a closure body: main takes a then b,
+// the closure f takes b then a and is called, and `fid check` passed; the
+// same code as a named or spawned function was rejected. A closure's body
+// is now walked in its function's lock names (a captured lock is the
+// enclosing function's local) and a call of it takes what it takes.
+//! error: Deadlock error
+
+fn main() -> i64 {
+    val a = p_mutex_init();
+    val b = p_mutex_init();
+    p_mutex_lock(a);
+    p_mutex_lock(b);
+    p_mutex_unlock(b);
+    p_mutex_unlock(a);
+    val f = fn() -> i64 {
+        p_mutex_lock(b);
+        p_mutex_lock(a);
+        p_mutex_unlock(a);
+        p_mutex_unlock(b);
+        return 0;
+    };
+    f();
+    println("ran");
+    return 0;
+}

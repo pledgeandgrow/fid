@@ -874,25 +874,36 @@ pub fn x509_verify_chain(chain: Vec<X509Cert>, anchors: Vec<X509Cert>, now: i64)
                 }
                 k = k + 1;
             }
+            // Several anchors can share the issuer's name (a re-keyed or
+            // renewed root next to the old one): try each, and fail with
+            // the first one's reason only when none of them works.
+            var first: X509ChainResult = x509_fail("no trust anchor", i);
+            var tried: bool = false;
             k = 0;
             while k < anchors.len() {
                 val a2: X509Cert = anchors.get(k);
                 if x509_names_chain(c, a2) {
+                    var why2: X509ChainResult = x509_fail("", i);
                     if !x509_valid_at(a2, now) {
-                        return x509_fail("trust anchor expired", i + 1);
+                        why2 = x509_fail("trust anchor expired", i + 1);
+                    } else {
+                        val ca2: str = x509_check_ca(a2, below);
+                        if str_len(ca2) > 0 {
+                            why2 = x509_fail(ca2, i + 1);
+                        } else if x509_verify_signed_by(c, a2) {
+                            return x509_nc_chain(&chain, &a2, i + 1);
+                        } else {
+                            why2 = x509_fail("bad signature", i);
+                        }
                     }
-                    val why2: str = x509_check_ca(a2, below);
-                    if str_len(why2) > 0 {
-                        return x509_fail(why2, i + 1);
+                    if !tried {
+                        first = why2;
+                        tried = true;
                     }
-                    if x509_verify_signed_by(c, a2) {
-                        return x509_nc_chain(&chain, &a2, i + 1);
-                    }
-                    return x509_fail("bad signature", i);
                 }
                 k = k + 1;
             }
-            return x509_fail("no trust anchor", i);
+            return first;
         }
         i = i + 1;
     }
@@ -1000,7 +1011,33 @@ fn x509_nc_form(s: str) -> str {
     return str_slice(s, 0, str_find(s, ":") + 1);
 }
 
-/// The names of a certificate that name constraints apply to.
+/// Whether a subject CN looks like a DNS name, as OpenSSL decides it for
+/// name constraints: letters, digits, '-', '_', '*' and at least one '.'
+/// between two labels (no leading, trailing or doubled dot). A CN such as
+/// "mail" or "Jane Doe" is not taken for a host name.
+fn x509_cn_hostlike(cn: str) -> bool {
+    val n: i64 = str_len(cn);
+    if n == 0 || str_byte_at(cn, 0) == 46 || str_byte_at(cn, n - 1) == 46 || str_find(cn, ".") < 0 || str_find(cn, "..") >= 0 {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val b: i64 = str_byte_at(cn, i);
+        val ok: bool = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 46 || b == 95 || b == 42;
+        if !ok {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The names of a certificate that name constraints apply to. A leaf
+/// (not a CA) with no DNS or IP SAN has its subject CN checked as a
+/// dNSName too when it looks like one, since x509_matches_host takes the
+/// CN as the host name then (OpenSSL does the same): otherwise a CA
+/// constrained to one domain could issue a SAN-less certificate for any
+/// host.
 fn x509_nc_names(c: &X509Cert) -> Vec<str> {
     var out: Vec<str> = Vec::new();
     var i: i64 = 0;
@@ -1022,6 +1059,9 @@ fn x509_nc_names(c: &X509Cert) -> Vec<str> {
     while i < c.san_ip_raw.len() {
         out.push("ip:" + c.san_ip_raw.get(i));
         i = i + 1;
+    }
+    if !c.is_ca && c.san_dns.len() == 0 && c.san_ip.len() == 0 && x509_cn_hostlike(c.common_name) {
+        out.push("dns:" + c.common_name);
     }
     val t: Asn1Tlv = asn1_read_der(&c.subject_raw, 0, c.subject_raw.len());
     if t.ok && t.len > 0 {
@@ -1381,10 +1421,12 @@ pub fn x509_verify_chain_crl(chain: Vec<X509Cert>, anchors: Vec<X509Cert>, now: 
         if i + 1 < chain.len() {
             issuer = chain.get(i + 1);
         } else {
+            // the anchor x509_verify_chain took: of those with the
+            // issuer's name, a valid one whose key verifies the certificate
             var a: i64 = 0;
             while a < anchors.len() {
                 val an: X509Cert = anchors.get(a);
-                if x509_names_chain(c, an) && !issuer.ok {
+                if !issuer.ok && x509_names_chain(c, an) && x509_valid_at(an, now) && x509_verify_signed_by(c, an) {
                     issuer = an;
                 }
                 a = a + 1;
@@ -1428,16 +1470,162 @@ fn x509_label_match(pattern: str, host: str) -> bool {
     return false;
 }
 
-/// Whether the certificate names `host` (RFC 6125): a DNS SAN (one
-/// leftmost wildcard label allowed) or an IP SAN for an address; the
-/// subject CN is used only when there is no SAN at all.
-pub fn x509_matches_host(c: X509Cert, host: str) -> bool {
+/// The value of one hex digit, -1 when `b` is not one.
+fn x509_hex_val(b: i64) -> i64 {
+    if b >= 48 && b <= 57 {
+        return b - 48;
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87;
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55;
+    }
+    return 0 - 1;
+}
+
+/// The 4 bytes of a dotted-decimal IPv4 address (no leading zeros), or
+/// empty when `s` is not one.
+fn x509_ip4_parse(s: str) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    val parts: Vec<str> = str_split(s, ".");
+    if parts.len() != 4 {
+        return Vec::new();
+    }
     var i: i64 = 0;
-    while i < c.san_ip.len() {
-        if str_equal(c.san_ip.get(i), host) {
-            return true;
+    while i < 4 {
+        val p: str = parts.get(i);
+        val n: i64 = str_len(p);
+        if n == 0 || n > 3 || (n > 1 && str_byte_at(p, 0) == 48) {
+            return Vec::new();
+        }
+        var v: i64 = 0;
+        var j: i64 = 0;
+        while j < n {
+            val b: i64 = str_byte_at(p, j);
+            if b < 48 || b > 57 {
+                return Vec::new();
+            }
+            v = v * 10 + (b - 48);
+            j = j + 1;
+        }
+        if v > 255 {
+            return Vec::new();
+        }
+        out.push(v);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// The 16-bit groups of one side of an IPv6 address ("" has none); a
+/// dotted IPv4 tail is two groups when `v4_tail`. False when malformed.
+fn x509_ip6_groups(part: str, v4_tail: bool, out: &mut Vec<i64>) -> bool {
+    if str_len(part) == 0 {
+        return true;
+    }
+    val gs: Vec<str> = str_split(part, ":");
+    var i: i64 = 0;
+    while i < gs.len() {
+        val g: str = gs.get(i);
+        val n: i64 = str_len(g);
+        if v4_tail && i == gs.len() - 1 && str_find(g, ".") >= 0 {
+            val v4: Vec<i64> = x509_ip4_parse(g);
+            if v4.len() != 4 {
+                return false;
+            }
+            out.push(v4.get(0) * 256 + v4.get(1));
+            out.push(v4.get(2) * 256 + v4.get(3));
+        } else {
+            if n == 0 || n > 4 {
+                return false;
+            }
+            var v: i64 = 0;
+            var j: i64 = 0;
+            while j < n {
+                val d: i64 = x509_hex_val(str_byte_at(g, j));
+                if d < 0 {
+                    return false;
+                }
+                v = v * 16 + d;
+                j = j + 1;
+            }
+            out.push(v);
         }
         i = i + 1;
+    }
+    return true;
+}
+
+/// The bytes of an IP address literal: dotted IPv4 (4 bytes), or IPv6
+/// (16 bytes) in any RFC 4291 §2.2 text form ("::" for a run of zero
+/// groups, an IPv4 tail), optionally in brackets; empty when `host` is
+/// not an address (a zone index "%..." is not accepted).
+pub fn x509_ip_parse(host: str) -> Vec<i64> {
+    var s: str = host;
+    if str_len(s) >= 2 && str_byte_at(s, 0) == 91 && str_byte_at(s, str_len(s) - 1) == 93 {
+        s = str_slice(s, 1, str_len(s) - 1);
+    }
+    if str_find(s, ":") < 0 {
+        return x509_ip4_parse(s);
+    }
+    var head: Vec<i64> = Vec::new();
+    var tail: Vec<i64> = Vec::new();
+    val dc: i64 = str_find(s, "::");
+    if dc >= 0 {
+        val rest: str = str_slice(s, dc + 2, str_len(s));
+        if str_find(rest, "::") >= 0 {
+            return Vec::new();
+        }
+        if !x509_ip6_groups(str_slice(s, 0, dc), false, &mut head) || !x509_ip6_groups(rest, true, &mut tail) {
+            return Vec::new();
+        }
+        if head.len() + tail.len() > 7 {
+            return Vec::new();
+        }
+    } else {
+        if !x509_ip6_groups(s, true, &mut head) || head.len() != 8 {
+            return Vec::new();
+        }
+    }
+    var groups: Vec<i64> = head;
+    while groups.len() + tail.len() < 8 {
+        groups.push(0);
+    }
+    var i: i64 = 0;
+    while i < tail.len() {
+        groups.push(tail.get(i));
+        i = i + 1;
+    }
+    var out: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 8 {
+        out.push(groups.get(i) >> 8);
+        out.push(groups.get(i) & 255);
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Whether the certificate names `host` (RFC 6125): a DNS SAN (one
+/// leftmost wildcard label allowed) or an IP SAN for an address; the
+/// subject CN is used only when there is no SAN at all. An address is
+/// compared as bytes, so "2001:db8::1", "[::1]" and "::ffff:192.0.2.1"
+/// match the SAN however it is written. A host that is an IP address is
+/// matched against iPAddress SANs only, never against a dNSName or the CN
+/// (RFC 6125 §6.2.1, RFC 9525 §6.3: "*.0.0.1" does not name 1.0.0.1).
+pub fn x509_matches_host(c: X509Cert, host: str) -> bool {
+    val ip: Vec<i64> = x509_ip_parse(host);
+    var i: i64 = 0;
+    if ip.len() > 0 {
+        val ip_hex: str = str_to_lower(hex_encode_bytes(ip));
+        while i < c.san_ip_raw.len() {
+            if str_equal(str_to_lower(c.san_ip_raw.get(i)), ip_hex) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
     }
     i = 0;
     while i < c.san_dns.len() {

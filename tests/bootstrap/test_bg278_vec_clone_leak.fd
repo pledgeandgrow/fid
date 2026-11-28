@@ -1,0 +1,38 @@
+// Bugs roadmap BG278: every `v.clone()` (and `v.map(f)`) of a Vec leaked
+// the new Vec: core's Vec_clone returns an i64 handle, so the call was no
+// temporary of its statement (a `let` took a second owner with Vec_share
+// and the clone's own owner was never dropped; as a temporary nothing
+// dropped it), and `map` (core's `impl Vec`) was looked up under its bare
+// name only (BG392). compiler/lower.fd Lowerer_lower_method_call types a
+// Vec receiver's clone as the receiver, Lowerer_reg_method_ret registers
+// `Vec_map`.
+// Leak gate: `fid run tests/bootstrap/test_bg278_vec_clone_leak.fd --leaks`
+// must report "every block was freed".
+//
+// Expected output:
+// 1
+// 2
+// p1
+// 2
+
+struct P { name: str, n: i64 }
+
+fn dbl(x: i64) -> i64 {
+    return x * 2;
+}
+
+fn main() {
+    var a: Vec<i64> = Vec::new();
+    a.push(1);
+    var b = a.clone();
+    println(f"{b.len()}");
+    val e: i64 = a.clone().len();
+    val m: i64 = a.map(dbl).len();
+    println(e + m);
+    var v: Vec<P> = Vec::new();
+    v.push(P { name: f"p{1}", n: 1 });
+    var w: Vec<P> = v.clone();
+    println(w.get(0).name);
+    b.extend(a.clone());
+    println(b.len());
+}

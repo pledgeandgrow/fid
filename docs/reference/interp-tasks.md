@@ -20,6 +20,7 @@ checkpoints of `stdlib/task.fd`, the same on every backend:
 | a channel receive with nothing to receive | `p_chan_recv` | until a value comes, the channel is closed, or nobody is left to send |
 | `p_chan_try_recv`, `p_task_is_ready`, `p_task_poll_nonblocking` that find nothing | | one turn for the others |
 | `task_wait_read/_write` | `p_co_wait_fd` | one turn (the interpreter's sockets are simulated and always ready) |
+| locking a mutex another task holds (BG225) | `p_mutex_lock` | until it is unlocked (taken at once when no other task is left that could unlock it) |
 
 `task_go` (`p_co_go`) queues the task: it starts at the next switch, as the
 C runtime starts it. An `async fn` call (`p_co_async`) and `spawn f(x)`

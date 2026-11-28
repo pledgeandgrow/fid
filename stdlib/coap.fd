@@ -474,9 +474,33 @@ pub fn coap_block_szx(v: i64) -> i64 {
     return v & 7;
 }
 
-/// Block size for SZX (0..6): 16 .. 1024 bytes.
+/// Block size for SZX (0..6): 16 .. 1024 bytes. (SZX 7 is reserved, RFC
+/// 7959 §2.2: coap_block_ok rejects it.)
 pub fn coap_block_size(szx: i64) -> i64 {
     return 16 << szx;
+}
+
+/// RFC 7959 §2.2: a block number has at most 20 bits (the option is 0-3
+/// bytes).
+pub const COAP_BLOCK_NUM_LIMIT: i64 = 1048576;
+
+/// Whether `num` and `szx` are a valid block: 0 <= NUM < 2^20, SZX 0..6.
+pub fn coap_block_ok(num: i64, szx: i64) -> bool {
+    return num >= 0 && num < COAP_BLOCK_NUM_LIMIT && szx >= 0 && szx <= 6;
+}
+
+/// Whether the Block1/Block2 option `num` of `m` (from the wire) is valid:
+/// absent, or 0-3 bytes with SZX not 7 (RFC 7959 §2.2; a request with a
+/// bad one is answered 4.00 Bad Request).
+pub fn coap_block_option_ok(m: &CoapMsg, num: i64) -> bool {
+    if !coap_has_option(m, num) {
+        return true;
+    }
+    val raw: Vec<i64> = coap_get_option(m, num);
+    if raw.len() > 3 {
+        return false;
+    }
+    return coap_block_szx(coap_bytes_uint(raw)) != 7;
 }
 
 /// The RFC's notation "NUM/M/SIZE", e.g. "2/0/64".
@@ -488,10 +512,14 @@ pub fn coap_block_str(v: i64) -> str {
     return int_to_str(coap_block_num(v)) + "/" + m + "/" + int_to_str(coap_block_size(coap_block_szx(v)));
 }
 
-/// Bytes of block `num` of `body` with blocks of 2^(szx+4).
+/// Bytes of block `num` of `body` with blocks of 2^(szx+4); empty when
+/// the block is not valid (coap_block_ok).
 pub fn coap_block_slice(body: &Vec<i64>, num: i64, szx: i64) -> Vec<i64> {
-    val size: i64 = coap_block_size(szx);
     var out: Vec<i64> = Vec::new();
+    if !coap_block_ok(num, szx) {
+        return out;
+    }
+    val size: i64 = coap_block_size(szx);
     var i: i64 = num * size;
     while i < body.len() && i < (num + 1) * size {
         out.push(body.get(i));
@@ -502,8 +530,13 @@ pub fn coap_block_slice(body: &Vec<i64>, num: i64, szx: i64) -> Vec<i64> {
 
 /// Server side of Block2: put block `num` of `body` in response `resp`
 /// (payload, Block2, and Size2 on the first block). False when `num` is
-/// past the end (answer 4.02 Bad Option, RFC 7959 2.4).
+/// past the end (answer 4.02 Bad Option, RFC 7959 2.4), and when the
+/// block is not valid (NUM >= 2^20, negative, or SZX 7: answer 4.00 Bad
+/// Request, RFC 7959 2.2; coap_block_option_ok checks the request).
 pub fn coap_block2_respond(resp: &mut CoapMsg, body: &Vec<i64>, num: i64, szx: i64) -> bool {
+    if !coap_block_ok(num, szx) {
+        return false;
+    }
     val size: i64 = coap_block_size(szx);
     if num * size >= body.len() && !(num == 0 && body.len() == 0) {
         return false;
@@ -533,13 +566,18 @@ pub fn coap_block_asm_new() -> CoapBlockAsm {
     };
 }
 
-/// Add a response. False on a block out of order or an ETag change (the
-/// representation changed: start again).
+/// Add a response. False on a block out of order, an ETag change (the
+/// representation changed: start again), or a Block2 option that is not
+/// valid (over 3 bytes or SZX 7, RFC 7959 2.2).
 pub fn coap_block_asm_add(a: &mut CoapBlockAsm, resp: &CoapMsg) -> bool {
     if !coap_has_option(resp, COAP_O_BLOCK2) {
         a.data = resp.payload;
         a.done = true;
         return true;
+    }
+    if !coap_block_option_ok(resp, COAP_O_BLOCK2) {
+        a.ok = false;
+        return false;
     }
     val v: i64 = coap_get_uint(resp, COAP_O_BLOCK2, 0);
     val size: i64 = coap_block_size(coap_block_szx(v));

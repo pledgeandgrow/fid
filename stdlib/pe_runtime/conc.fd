@@ -293,6 +293,41 @@ fn pe_rnd_jitter() {
     }
 }
 
+/// BG227 test hook: FIDES_TEST_WAKE_DELAY=<ms> (a decimal number, not 0)
+/// makes a worker wait that long after a task it resumed came back to it
+/// blocked, before it looks at how the task left. A blocked task can be
+/// woken, run and finished on another worker meanwhile; the delay makes
+/// that the common case instead of a window of a few instructions, so
+/// tests/bootstrap/test_bg227_wake_delay.fd catches a scheduler that reads
+/// the task's block (its done flag) after the switch, not the word the
+/// task wrote when it left. Off (unset or 0), it costs one load.
+var pert_wake_delay: i64 = 0 - 1;  // -1 not read yet, else the ms (0 off)
+
+fn pe_test_wake_delay(why: i64) {
+    if pert_wake_delay == 0 || why != 0 {
+        return;
+    }
+    if pert_wake_delay < 0 {
+        var s: i64 = pe_c_getenv("FIDES_TEST_WAKE_DELAY") as i64;
+        var ms: i64 = 0;
+        if s != 0 {
+            var i: i64 = 0;
+            var b: i64 = pe_rnd_byte(s);
+            while b >= 48 && b <= 57 && i < 6 {
+                ms = ms * 10 + (b - 48);
+                i = i + 1;
+                b = pe_rnd_byte(s + i);
+            }
+        }
+        // two threads may read it at once: each finds the same number
+        pert_wake_delay = ms;
+        if ms == 0 {
+            return;
+        }
+    }
+    pe_k_sleep(pert_wake_delay);
+}
+
 // ─── The thread table ───────────────────────────────────────────────────
 // Per thread i: its handle (0 once joined), its start block, its result.
 // Start block: [0] function, [1] nargs, [2..10) args, [10] done flag,
@@ -1822,6 +1857,7 @@ pub fn pert_worker_main(id: i64) -> i64 {
         // run, or have finished, on another worker
         t = pe_load(sched + 32);
         var why: i64 = pe_load(sched + 24);
+        pe_test_wake_delay(why);
         if why == 2 {
             pe_co_finish_task(t);
         } else if why != 0 {
@@ -2290,6 +2326,7 @@ pub fn pert_co_spawn_v(name: str, nargs: i64, argv: i64) -> i64 {
 pub fn pert_co_async_v(name: str, nargs: i64, argv: i64) -> i64 {
     var block: i64 = pe_co_new_block(name, nargs, argv);
     var runnable: i64 = pe_co_enter(block);
+    pe_test_wake_delay(runnable);
     // BG227: 2 finished (its block may be running again elsewhere if not)
     if runnable == 2 {
         pe_co_finish_task(block);
@@ -3256,6 +3293,29 @@ pub fn pert_chan_try_recv(ch: i64) -> i64 {
     var value: i64 = pe_chan_take(ch);
     pe_k_unlock(ch);
     return value;
+}
+
+/// BG241: select's receive, "a value was taken" out of band: 1 with the
+/// value (0 from a closed, empty channel) stored at `out`, 0 when nothing
+/// is ready (a value equal to the pending word is a value).
+pub fn pert_chan_try_recv_into(ch: i64, out: i64) -> i64 {
+    if ch == 0 {
+        return 0;
+    }
+    pe_k_lock(ch);
+    if pe_load(ch + 40) == 0 {
+        var closed: i64 = pe_load(ch + 56);
+        pe_k_unlock(ch);
+        if closed == 0 {
+            return 0;
+        }
+        pe_store(out, 0);
+        return 1;
+    }
+    var value: i64 = pe_chan_take(ch);
+    pe_k_unlock(ch);
+    pe_store(out, value);
+    return 1;
 }
 
 pub fn pert_chan_close(ch: i64) {

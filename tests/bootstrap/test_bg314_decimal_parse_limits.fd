@@ -1,0 +1,65 @@
+// BG314 (docs/roadmap/bugs-roadmap.md): dec_parse refuses an exponent
+// beyond DEC_MAX_EXPONENT (10000): "1e999999" built a million-digit BigInt
+// (37 s of CPU for 8 bytes of text). Anything that is not
+// "[-+]digits[.digits][e[-+]digits]" is refused too, as the doc says
+// ("12abc" gave 12, "1.2.3" gave 1.2). A refused text is 0 from dec_parse
+// and None from dec_try_parse. (Python's decimal.Decimal refuses the same
+// malformed texts.)
+//
+// Expected output:
+// 0 None
+// 0 None
+// 0 None
+// 0 None
+// 0 None
+// 0 None
+// 0 None
+// 0 None
+// 0 None
+// 150 ok
+// -3.140 ok
+// 0.5 ok
+// 1 ok
+// 1000.50 ok
+// 0 ok
+// 0.000001 ok
+// 1 1
+// 0
+use decimal;
+
+fn show(text: str) {
+    var tag: str = "None";
+    match dec_try_parse(text) {
+        Option::Some(d) => { tag = "ok"; }
+        Option::None => { tag = "None"; }
+    }
+    println(dec_to_str(dec_parse(text)) + " " + tag);
+}
+
+fn main() -> i64 {
+    // the entry's trigger: refused at once, not a million-digit number
+    show("1e999999");
+    show("1e-999999");
+    show("1e10001");
+    // malformed text the doc calls 0
+    show("12abc");
+    show("1.2.3");
+    show("1e");
+    show("1e+");
+    show(".");
+    show("-");
+    // well-formed text
+    show("1.5e2");
+    show("-3.140");
+    show(".5");
+    show("1.");
+    show("1_000.50");
+    show("0");
+    show("1e-6");
+    // the limit itself: 10^-10000 is kept (a scale of 10000), one more is not
+    val tiny = dec_parse("1e-10000");
+    println(f"{dec_sign(tiny)} {tiny.scale / 10000}");
+    val past = dec_parse("1e-10001");
+    println(f"{dec_sign(past)}");
+    return 0;
+}

@@ -1,0 +1,44 @@
+// Bugs roadmap BG385: `spawn f(p)` with a plain struct argument handed the
+// thread the address of the caller's local: a later write by the caller
+// showed in the thread, and a task started by a function that then
+// returned read a dead frame. compiler/lower.fd Lowerer_spawn_call passes
+// a heap copy of a struct (or fixed-array) argument, freed by the thread's
+// wrapper after the call (Lowerer_spawn_ir_wrapper).
+//
+// Expected output:
+// 3
+// 18
+// 10
+
+struct P { x: i64, y: i64 }
+
+fn slowsum(p: P) -> i64 {
+    var s = 0;
+    var i = 0;
+    while i < 2000000 {
+        s = s + i % 3;
+        i = i + 1;
+    }
+    return p.x + p.y + (s - s);
+}
+
+fn start(k: i64) -> Future<i64> {
+    val p = P { x: k, y: k };
+    val t = spawn slowsum(p);
+    return t;
+}
+
+fn clob() -> i64 {
+    var z: [i64; 16] = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9];
+    return z[0] + z[15];
+}
+
+fn main() {
+    var p = P { x: 1, y: 2 };
+    val t = spawn slowsum(p);
+    p.x = 100;
+    println(await t);
+    val t2 = start(5);
+    println(clob());
+    println(await t2);
+}

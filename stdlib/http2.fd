@@ -1326,8 +1326,10 @@ fn h2_header_list_too_large(c: &mut H2Conn, k: i64, end_stream: bool) {
 // A complete header block for stream `id`.
 fn h2_on_header_block(c: &mut H2Conn, id: i64, flags: i64, block: Vec<i64>) {
     val end_stream: bool = (flags & H2_FLAG_END_STREAM) != 0;
-    // Decode first, whatever happens to the stream: the table is shared
-    val hl: HpackHeaders = hpack_decode(&mut c.dec, block);
+    // Decode first, whatever happens to the stream: the table is shared.
+    // The header list limit is applied while decoding (no field is copied
+    // past it: an HPACK bomb costs nothing), the 431 comes below.
+    val hl: HpackHeaders = hpack_decode_limit(&mut c.dec, block, H2_OUR_MAX_HEADER_LIST);
     if !hl.ok {
         h2_conn_error(c, H2_COMPRESSION_ERROR, hl.error);
         return;
@@ -1359,7 +1361,7 @@ fn h2_on_header_block(c: &mut H2Conn, id: i64, flags: i64, block: Vec<i64>) {
         h2_stream_error(c, id, H2_STREAM_CLOSED);
         return;
     }
-    if h2_header_list_size(hl.names, hl.vals) > H2_OUR_MAX_HEADER_LIST {
+    if hl.too_large || h2_header_list_size(hl.names, hl.vals) > H2_OUR_MAX_HEADER_LIST {
         h2_header_list_too_large(c, k, end_stream);
         return;
     }

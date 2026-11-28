@@ -1,0 +1,135 @@
+// BG406 (docs/roadmap/bugs-roadmap.md): the GOOSE/SV decoders check every
+// BER length against the buffer and against the enclosing TLV, so a
+// truncated or lying length is a decode error, not a panic; ber_read fails
+// on a cut-short long-form or indefinite length; goose_decode_checked /
+// sv_decode_checked report the error (goose_decode_pdu / sv_decode keep
+// their signatures and return what was decoded before it).
+//
+// Expected output:
+// gocbRef claims 16, 2 present: ok=false
+// goose_decode_pdu of it: ref ''
+// long-form length cut: ok=false
+// indefinite length: ok=false
+// t with 2 bytes: ok=false
+// member past its PDU: ok=false
+// boolean of 2 bytes: ok=false
+// empty buffer: ok=false
+// not 0x61: ok=false
+// round trip: ok=true ref SIED/LLN0$GO$gcb01 stnum 7 sqnum 3 t 1700000000
+// truncated by 3: ok=false
+// ber_read 80 05 41: ok=false
+// ber_read 80 81 02 41 42: ok=true len=2 next=5
+// sv round trip: ok=true id MU01 smpcnt 1234 seqdata 8
+// sv truncated by 1: ok=false
+// sv entry past its container: ok=false
+// sv without ASDU: ok=false
+use iec61850;
+
+fn bv(s: str) -> Vec<i64> {
+    // hex pairs separated by spaces
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i + 1 < str_len(s) + 1 {
+        if i + 2 > str_len(s) {
+            break;
+        }
+        out.push(hexv(str_byte_at(s, i)) * 16 + hexv(str_byte_at(s, i + 1)));
+        i = i + 3;
+    }
+    return out;
+}
+
+fn hexv(c: i64) -> i64 {
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55;
+    }
+    return c - 87;
+}
+
+fn cut(v: &Vec<i64>, n: i64) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < v.len() - n {
+        out.push(v.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn g(name: str, b: &Vec<i64>) {
+    val r: GooseDecode = goose_decode_checked(b);
+    if r.ok {
+        println(name + ": ok=true ref " + r.pdu.gocb_ref + " stnum " + int_to_str(r.pdu.st_num) + " sqnum " + int_to_str(r.pdu.sq_num) + " t " + int_to_str(r.pdu.t_seconds));
+    } else {
+        println(name + ": ok=false");
+    }
+}
+
+fn sv(name: str, b: &Vec<i64>) {
+    val r: SvDecode = sv_decode_checked(b);
+    if r.ok {
+        println(name + ": ok=true id " + r.asdu.sv_id + " smpcnt " + int_to_str(r.asdu.smp_cnt) + " seqdata " + int_to_str(r.asdu.seq_data.len()));
+    } else {
+        println(name + ": ok=false");
+    }
+}
+
+fn br(name: str, b: &Vec<i64>) {
+    val t: BerTlv = ber_read(b, 0);
+    if t.ok {
+        println(name + ": ok=true len=" + int_to_str(t.length) + " next=" + int_to_str(t.next));
+    } else {
+        println(name + ": ok=false");
+    }
+}
+
+fn main() {
+    // the entry's trigger
+    val trig: Vec<i64> = bv("61 04 80 10 41 42");
+    g("gocbRef claims 16, 2 present", &trig);
+    val gp: GoosePdu = goose_decode_pdu(&trig);
+    println("goose_decode_pdu of it: ref '" + gp.gocb_ref + "'");
+    g("long-form length cut", &bv("61 82 01"));
+    g("indefinite length", &bv("61 80 80 01 41 00 00"));
+    g("t with 2 bytes", &bv("61 04 84 02 00 00"));
+    g("member past its PDU", &bv("61 03 80 03 41 42 43"));
+    g("boolean of 2 bytes", &bv("61 04 87 02 01 01"));
+    g("empty buffer", &Vec::new());
+    g("not 0x61", &bv("30 03 80 01 41"));
+
+    var all: Vec<i64> = Vec::new();
+    val bt: Vec<i64> = ber_bool(0x83, true);
+    var i: i64 = 0;
+    while i < bt.len() {
+        all.push(bt.get(i));
+        i = i + 1;
+    }
+    val pdu: GoosePdu = GoosePdu {
+        gocb_ref: "SIED/LLN0$GO$gcb01", time_allowed_to_live: 2000,
+        dat_set: "SIED/LLN0$DS", go_id: "gcb01",
+        t_seconds: 1700000000, t_fraction: 0, t_quality: 0,
+        st_num: 7, sq_num: 3, test: true, conf_rev: 1, nds_com: false,
+        num_dataset_entries: 1, all_data: all,
+    };
+    val enc: Vec<i64> = goose_encode_pdu(&pdu);
+    g("round trip", &enc);
+    g("truncated by 3", &cut(&enc, 3));
+    br("ber_read 80 05 41", &bv("80 05 41"));
+    br("ber_read 80 81 02 41 42", &bv("80 81 02 41 42"));
+
+    var samples: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 8 {
+        samples.push(k);
+        k = k + 1;
+    }
+    val a: SvAsdu = SvAsdu { sv_id: "MU01", smp_cnt: 1234, conf_rev: 1, smp_synch: 2, seq_data: samples };
+    val svenc: Vec<i64> = sv_encode(&a);
+    sv("sv round trip", &svenc);
+    sv("sv truncated by 1", &cut(&svenc, 1));
+    sv("sv entry past its container", &bv("62 05 A2 03 30 05 80"));
+    sv("sv without ASDU", &bv("62 03 80 01 01"));
+}

@@ -31,7 +31,11 @@
 //      its parameters become edges between the caller's arguments. This is
 //      propagated over the call graph to a fixed point (BG64: it inherited
 //      edges from no call, and p_mutex_lock, one argument and no env, was
-//      never seen).
+//      never seen). BG235: a call through a closure value bound once in
+//      the function (`val c = fn() { .. }; c()`, a CallPtr) counts as a
+//      call to the closure's function (lc_callptr_target). A lock the
+//      closure reaches through a capture is no named lock here; the type
+//      checker's lo_summary names it as the enclosing function's local.
 //
 // A cycle in the final edge set is the error. Functions with loops that
 // lock the same variable in both directions are fine — the slot is the
@@ -95,12 +99,15 @@ pub struct LcFn {
 
 /// Is `name` a lock-acquire call?
 fn lc_is_lock(name: str) -> bool {
-    return name == "p_mutex_lock" || name == "sync_mutex_lock";
+    // BG413: stdlib/sync.fd's SyncMutex locks through `self.handle`, a
+    // field: `m.lock()` is the acquire of the lock m holds (its last
+    // argument, the struct, names it: lc_name_of)
+    return name == "p_mutex_lock" || name == "sync_mutex_lock" || name == "SyncMutex_lock";
 }
 
 /// Is `name` a lock-release call?
 fn lc_is_unlock(name: str) -> bool {
-    return name == "p_mutex_unlock" || name == "sync_mutex_unlock";
+    return name == "p_mutex_unlock" || name == "sync_mutex_unlock" || name == "SyncMutex_unlock";
 }
 
 /// The number of lock name `name`, made when new.
@@ -228,8 +235,21 @@ fn lc_name_of(t: &mut LcNames, f: &IrFunction, pslots: &Vec<i64>, handle: i64) -
         return lc_intern(t, f.name + "$p" + int_to_str(k), f.name, k);
     }
     match peir_inst_of(f, handle) {
+        Inst::Alloca(_, _) => {
+            // BG413: a struct held in a local slot (`val m =
+            // SyncMutex::new(); m.lock()` passes the slot): the struct names
+            // the lock it holds
+            return lc_intern(t, f.name + "#" + int_to_str(handle), "", 0 - 1);
+        }
         Inst::Load(p, _) => {
             match peir_inst_of(f, p) {
+                Inst::GetFieldPtr(fb, _, _) => {
+                    // BG413: a handle read from a field (`self.handle`) is
+                    // the lock of the struct holding it (conservative: two
+                    // mutex fields of one struct are one lock, which can
+                    // only hide a cycle, never make one)
+                    return lc_name_of(t, f, pslots, fb);
+                }
                 Inst::GlobalAddr(gn, _) => {
                     return lc_intern(t, "g:" + gn, "", 0 - 1);
                 }
@@ -301,6 +321,146 @@ fn lc_line(f: &IrFunction, id: i64) -> i64 {
     return 0 - 1;
 }
 
+/// BG235: the one value stored to slot `p` in `f` (-1: none, or more
+/// than one).
+fn lc_only_store(f: &IrFunction, p: i64) -> i64 {
+    var found: i64 = 0 - 1;
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        match f.insts.get(i).inst {
+            Inst::Store(sp, sv, _) => {
+                if sp == p {
+                    if found >= 0 && found != sv {
+                        return 0 - 1;
+                    }
+                    found = sv;
+                }
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+/// BG235: the function a closure object `obj` of `f` calls: the one
+/// ConstFnRef stored to its first word ("" when there is not exactly one).
+fn lc_fnref_at(f: &IrFunction, obj: i64) -> str {
+    var name: str = "";
+    var i: i64 = 0;
+    while i < f.insts.len() {
+        match f.insts.get(i).inst {
+            Inst::Store(sp, sv, _) => {
+                var first: bool = sp == obj;
+                match peir_inst_of(f, sp) {
+                    Inst::GetElemPtr(gb, gi, _) => {
+                        if gb == obj {
+                            match peir_inst_of(f, gi) {
+                                Inst::ConstInt(gk, _) => {
+                                    first = gk == 0;
+                                }
+                                _ => {
+                                }
+                            }
+                        }
+                    }
+                    Inst::GetFieldPtr(fb, fk, _) => {
+                        if fb == obj && fk == 0 {
+                            first = true;
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                if first {
+                    match peir_inst_of(f, sv) {
+                        Inst::ConstFnRef(fname) => {
+                            if str_len(name) > 0 && name != fname {
+                                return "";
+                            }
+                            name = fname;
+                        }
+                        _ => {
+                        }
+                    }
+                }
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    return name;
+}
+
+/// BG235: the function a call through a function value `v` of `f` (a
+/// CallPtr) reaches, when the value is a closure or function reference
+/// bound once in `f` (`val c = fn() { .. }; c()`): its name, else "".
+/// (A call through a closure value added no edges: the locks taken in a
+/// closure body were not checked against the locks held at its call.)
+fn lc_callptr_target(f: &IrFunction, v0: i64) -> str {
+    var v: i64 = v0;
+    var hops: i64 = 0;
+    while hops < 6 {
+        hops = hops + 1;
+        match peir_inst_of(f, v) {
+            Inst::ConstFnRef(fname) => {
+                return fname;
+            }
+            Inst::BitCast(bv, _, _) => {
+                v = bv;
+            }
+            Inst::Load(p, _) => {
+                match peir_inst_of(f, p) {
+                    Inst::Alloca(_, _) => {
+                        val sv: i64 = lc_only_store(f, p);
+                        if sv < 0 {
+                            return "";
+                        }
+                        v = sv;
+                    }
+                    _ => {
+                        return "";
+                    }
+                }
+            }
+            Inst::Alloca(_, _) => {
+                return lc_fnref_at(f, v);
+            }
+            Inst::GlobalAddr(_, _) => {
+                return lc_fnref_at(f, v);
+            }
+            _ => {
+                return "";
+            }
+        }
+    }
+    return "";
+}
+
+/// A call from `f` to function `name` with locks `cur` held: noted in
+/// `out` when the callee locks (directly or through its calls).
+fn lc_note_call(t: &mut LcNames, f: &IrFunction, pslots: &Vec<i64>, name: str, cargs: &Vec<i64>, cur: &Vec<i64>, fidx: i64, relevant: &Vec<bool>, out: &mut LcFn, id: i64) {
+    val gi: i64 = lc_fn_index(fidx, name);
+    if gi < 0 || !relevant.get(gi) {
+        return;
+    }
+    var anames: Vec<i64> = Vec::new();
+    var ai: i64 = 0;
+    while ai < cargs.len() {
+        anames.push(lc_name_of(t, f, pslots, cargs.get(ai)));
+        ai = ai + 1;
+    }
+    var held_now: Vec<i64> = Vec::new();
+    var hi: i64 = 0;
+    while hi < cur.len() {
+        held_now.push(cur.get(hi));
+        hi = hi + 1;
+    }
+    out.calls.push(LcCall { callee: gi, held: held_now, args: anames, line: lc_line(f, id) });
+}
+
 /// One block of `f` from the held set `entry`: the held set at its end.
 /// With `record`, its edges, locks and calls to functions that lock go
 /// to `out`.
@@ -342,21 +502,15 @@ fn lc_walk_block(t: &mut LcNames, f: &IrFunction, pslots: &Vec<i64>, b: i64, ent
                         }
                     }
                 } else if record && !str_starts_with(name, "p_") && !str_starts_with(name, "__") {
-                    val gi: i64 = lc_fn_index(fidx, name);
-                    if gi >= 0 && relevant.get(gi) {
-                        var anames: Vec<i64> = Vec::new();
-                        var ai: i64 = 0;
-                        while ai < cargs.len() {
-                            anames.push(lc_name_of(t, f, pslots, cargs.get(ai)));
-                            ai = ai + 1;
-                        }
-                        var held_now: Vec<i64> = Vec::new();
-                        var hi: i64 = 0;
-                        while hi < cur.len() {
-                            held_now.push(cur.get(hi));
-                            hi = hi + 1;
-                        }
-                        out.calls.push(LcCall { callee: gi, held: held_now, args: anames, line: lc_line(f, id) });
+                    lc_note_call(t, f, pslots, name, &cargs, &cur, fidx, relevant, out, id);
+                }
+            }
+            Inst::CallPtr(cp, pargs, _, _, _) => {
+                // BG235: a call through a closure value bound in `f`
+                if record {
+                    val tn: str = lc_callptr_target(f, cp);
+                    if str_len(tn) > 0 {
+                        lc_note_call(t, f, pslots, tn, &pargs, &cur, fidx, relevant, out, id);
                     }
                 }
             }
@@ -609,6 +763,13 @@ pub fn lockcheck_module(module: &IrModule) -> LockCheckResult {
                         if !seen {
                             cl.push(cn);
                         }
+                    }
+                }
+                Inst::CallPtr(cpv, _, _, _, _) => {
+                    // BG235: the closure a call through a value reaches
+                    val ctn: str = lc_callptr_target(&ent.func, cpv);
+                    if str_len(ctn) > 0 {
+                        cl.push(ctn);
                     }
                 }
                 _ => {

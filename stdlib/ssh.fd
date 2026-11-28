@@ -685,6 +685,9 @@ fn ssh_send_kexinit(s: &mut SshSession) -> Vec<i64> {
     s.my_kexinit = p;
     s.sent_newkeys = false;
     s.got_newkeys = false;
+    // BG477: no keys of this exchange exist before its ECDH
+    s.pending_out_key = Vec::new();
+    s.pending_in_key = Vec::new();
     return ssh_packet(s, p);
 }
 
@@ -895,6 +898,11 @@ fn ssh_on_newkeys(s: &mut SshSession) {
 
 fn ssh_kex_done(s: &mut SshSession) {
     s.state = SSH_ST_READY;
+    // BG477: the exchange's keys are installed; a NEWKEYS outside the next
+    // exchange (before its ECDH, or with no re-key) finds none and fails
+    // (RFC 4253 §7.3), instead of re-installing these as "new"
+    s.pending_out_key = Vec::new();
+    s.pending_in_key = Vec::new();
     s.kex_count = s.kex_count + 1;
     s.my_kexinit = Vec::new();
     s.peer_kexinit = Vec::new();

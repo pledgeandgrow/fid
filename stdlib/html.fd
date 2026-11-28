@@ -303,7 +303,10 @@ pub fn h_unescape(s: str) -> str {
                             if d < 0 {
                                 okh = false;
                             }
-                            cp = cp * 16 + d;
+                            // past U+10FFFF it stays past (no overflow)
+                            if cp <= 1114111 {
+                                cp = cp * 16 + d;
+                            }
                             k = k + 1;
                         }
                         if !okh {
@@ -318,12 +321,20 @@ pub fn h_unescape(s: str) -> str {
                             if d < 48 || d > 57 {
                                 okd = false;
                             }
-                            cp = cp * 10 + (d - 48);
+                            if cp <= 1114111 {
+                                cp = cp * 10 + (d - 48);
+                            }
                             k = k + 1;
                         }
                         if !okd {
                             cp = -1;
                         }
+                    }
+                    // BG351: the HTML standard's numeric character
+                    // reference rules: 0, a surrogate and a value past
+                    // U+10FFFF are U+FFFD (they gave NUL / invalid UTF-8)
+                    if cp == 0 || (cp >= 55296 && cp <= 57343) || cp > 1114111 {
+                        cp = 65533;
                     }
                 } else {
                     cp = h_named_ref(body);

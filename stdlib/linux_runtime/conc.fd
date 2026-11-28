@@ -32,6 +32,19 @@ const PE_MAX_WORKERS: i64 = 8;
 const PE_SYS_MADVISE: i64 = 233;
 const PE_MADV_GUARD_INSTALL: i64 = 102;
 var pe_guard_madv: i64 = 1;  // 0 once the kernel refused MADV_GUARD_INSTALL
+// BG249: Windows (win.fd pe_win_start sets it): the bytes of a new task's
+// stack committed when it is made; 0 elsewhere, where a mapping costs only
+// the pages touched. On Windows VirtualAlloc charged all PE_TASK_STACK +
+// PE_GUARD bytes of every stack at once (100,000 sleepers: 32.8 GB, more
+// than the system commits). Such a stack is reserved, its top
+// pe_task_stack_commit bytes committed with a PAGE_GUARD page under them,
+// and the TEB (nat_ctx_swap) describes it as a thread's: the system commits
+// the rest a page at a time as the guard page is touched, as for a fiber,
+// and raises STACK_OVERFLOW near its bottom (pe_ir's tasks, pe_runtime
+// conc.fd pe_ctx_stack, do the same).
+var pe_task_stack_commit: i64 = 0;
+// The mmap flag (MAP_NORESERVE's bit) that asks win.fd for such a mapping
+const PE_MMAP_TASK_STACK: i64 = 16384;
 
 /// A task's stack, PE_GUARD bytes of guard region at its bottom. Linux
 /// 6.13+ installs the guard without a mapping of its own: one mapping per
@@ -39,6 +52,15 @@ var pe_guard_madv: i64 = 1;  // 0 once the kernel refused MADV_GUARD_INSTALL
 /// distributions) no longer caps the tasks at half of it (competitive
 /// RT11, 1M idle connections). Elsewhere the guard is mprotect'ed.
 fn pe_task_stack_new() -> i64 {
+    if pe_task_stack_commit > 0 {
+        // BG249, Windows: reserved, its top committed (win.fd mmap with
+        // PE_MMAP_TASK_STACK), grown by the system as it is used
+        var ls: i64 = nat_syscall(PE_SYS_MMAP, 0, PE_TASK_STACK + PE_GUARD, 3, 34 | PE_MMAP_TASK_STACK, 0 - 1, 0);
+        if ls == 0 || (ls < 0 && ls > 0 - 4096) {
+            pe_oom(PE_TASK_STACK + PE_GUARD);
+        }
+        return ls;
+    }
     var stack: i64 = pe_mmap(PE_TASK_STACK + PE_GUARD);
     if pe_guard_madv != 0 {
         if pe_sys(PE_SYS_MADVISE, stack, PE_GUARD, PE_MADV_GUARD_INSTALL) == 0 {
@@ -1008,7 +1030,13 @@ fn pe_co_new_block(name: str, nargs: i64, argv: i64) -> i64 {
     // is a stack overflow the handler can run on. Elsewhere these words are
     // callee-saved registers a fresh task does not read.
     pe_st(s + 40, stack + PE_GUARD + PE_TASK_STACK);
-    pe_st(s + 48, stack + PE_GUARD);
+    // StackLimit: the lowest committed byte (BG249: on Windows only the top
+    // is committed; the system moves it down as the stack grows)
+    if pe_task_stack_commit > 0 {
+        pe_st(s + 48, stack + PE_GUARD + PE_TASK_STACK - pe_task_stack_commit);
+    } else {
+        pe_st(s + 48, stack + PE_GUARD);
+    }
     pe_st(s + 56, stack);
     pe_st(s + 96, 0);
     pe_st(s + 104, nat_ctx_tramp());
@@ -2332,6 +2360,30 @@ pub fn pert_chan_try_recv(ch: i64) -> i64 {
     pe_unlock(ch);
     pe_chan_changed(ch);
     return value;
+}
+
+/// BG241: select's receive, "a value was taken" out of band: 1 with the
+/// value (0 from a closed, empty channel) stored at `out`, 0 when nothing
+/// is ready (a value equal to the pending word is a value).
+pub fn pert_chan_try_recv_into(ch: i64, out: i64) -> i64 {
+    if ch == 0 {
+        return 0;
+    }
+    pe_lock(ch);
+    if pe_ld(ch + 40) == 0 {
+        var closed: i64 = pe_ld(ch + 56);
+        pe_unlock(ch);
+        if closed == 0 {
+            return 0;
+        }
+        pe_st(out, 0);
+        return 1;
+    }
+    var value: i64 = pe_chan_take(ch);
+    pe_unlock(ch);
+    pe_chan_changed(ch);
+    pe_st(out, value);
+    return 1;
 }
 
 pub fn pert_chan_close(ch: i64) {

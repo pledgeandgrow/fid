@@ -1069,6 +1069,13 @@ fn ark_install_git(name: str, url: str, gref: str, locked: str, update: bool) ->
 /// ark_install_git into `dest`, cloning straight from `url` (no shared
 /// cache: there is no home directory to keep one in).
 fn ark_install_git_at(dest: str, name: str, url: str, gref: str, locked: str, update: bool) -> str {
+    // BG285: the manifest's (or a dependency's) URL, branch/tag and locked
+    // commit are checked, then quoted: they were shell syntax
+    val bad: str = ark_git_args_error(name, url, gref, locked);
+    if str_len(bad) > 0 {
+        p_eprint_str(bad + "\n");
+        return "";
+    }
     if !ark_is_dir(dest) {
         var cmd: str = "git clone --quiet";
         // a locked commit may be older than a shallow clone reaches
@@ -1076,7 +1083,7 @@ fn ark_install_git_at(dest: str, name: str, url: str, gref: str, locked: str, up
             cmd = cmd + " --depth 1";
         }
         if str_len(gref) > 0 {
-            cmd = cmd + " --branch " + gref;
+            cmd = cmd + " --branch " + ark_q(gref);
         }
         if p_system(cmd + " " + ark_q(url) + " " + ark_q(dest)) != 0 {
             return "";
@@ -1087,9 +1094,9 @@ fn ark_install_git_at(dest: str, name: str, url: str, gref: str, locked: str, up
         }
     }
     if str_len(locked) > 0 && !update {
-        if p_system("git -C " + ark_q(dest) + " checkout --quiet " + locked) != 0 {
+        if p_system("git -C " + ark_q(dest) + " checkout --quiet " + ark_q(locked)) != 0 {
             p_system("git -C " + ark_q(dest) + " fetch --quiet --unshallow");
-            if p_system("git -C " + ark_q(dest) + " checkout --quiet " + locked) != 0 {
+            if p_system("git -C " + ark_q(dest) + " checkout --quiet " + ark_q(locked)) != 0 {
                 p_eprint_str("ark: the locked commit " + locked + " of '" + name + "' is not in " + url + "\n");
                 return "";
             }
@@ -1229,9 +1236,119 @@ fn ark_default_index() -> str {
     return "https://github.com/pledgeandgrow/pacts.git";
 }
 
-/// `s` in double quotes, for a path or argument in a shell command.
+/// `s` as one quoted word of a shell command (p_system: cmd.exe on
+/// Windows, sh elsewhere). BG285: it only added double quotes, so a `"`,
+/// `$(..)`, a backquote or `%VAR%` in the value was shell syntax. sh: in
+/// single quotes, each `'` written '\'' (nothing is special inside them).
+/// cmd.exe: in double quotes, where & | < > ^ are plain; a `"` (no Windows
+/// path holds one) and CR/LF are dropped, and each `%` is written outside
+/// the quotes as ^% so no %VAR% expands. Values that name a git ref,
+/// commit or URL are also checked first (ark_ref_ok, ark_commit_ok,
+/// ark_url_ok): the quoting is the second line of defence.
 fn ark_q(s: str) -> str {
-    return "\"" + s + "\"";
+    if !ark_is_windows() {
+        return "'" + str_replace(s, "'", "'\\''") + "'";
+    }
+    var t: str = str_replace(str_replace(str_replace(s, "\"", ""), "\r", ""), "\n", "");
+    return "\"" + str_replace(t, "%", "\"^%\"") + "\"";
+}
+
+/// BG285: can `s` be a git branch or tag name (or HEAD, or a commit)?
+/// Letters, digits and / . _ - + @ only (git check-ref-format allows more,
+/// but nothing a pact's ref needs), not starting with `-` (git would read
+/// an option), no `..`, `@{` or `//`, at most 255 bytes.
+fn ark_ref_ok(s: str) -> bool {
+    val n: i64 = str_len(s);
+    if n == 0 || n > 255 || str_starts_with(s, "-") || str_starts_with(s, "/") {
+        return false;
+    }
+    if str_contains(s, "..") || str_contains(s, "@{") || str_contains(s, "//") {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        val alnum: bool = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+        if !alnum && c != 47 && c != 46 && c != 95 && c != 45 && c != 43 && c != 64 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// BG285: is `s` a commit id (4 to 64 hexadecimal digits)?
+fn ark_commit_ok(s: str) -> bool {
+    val n: i64 = str_len(s);
+    if n < 4 || n > 64 {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if !((c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// BG285: can `s` be a git repository URL or path? Not empty, not starting
+/// with `-` (git would read an option, as --upload-pack=<command>), not
+/// git's `ext::` transport (it runs a command), and none of the
+/// characters a shell gives a meaning: " ' ` $ % ; | & < > ^ ! * ? and
+/// control characters (spaces, `\` and `:` are kept for local paths).
+fn ark_url_ok(s: str) -> bool {
+    val n: i64 = str_len(s);
+    if n == 0 || n > 2048 || str_starts_with(s, "-") || str_starts_with(str_to_lower(s), "ext::") {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(s, i);
+        if c < 32 || c == 127 || c == 34 || c == 39 || c == 96 || c == 36 || c == 37 || c == 59 || c == 124 || c == 38 || c == 60 || c == 62 || c == 94 || c == 33 || c == 42 || c == 63 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// BG285: the git URL `url`, ref `gref` ("" none) and commit `commit` (""
+/// none) of pact `name` checked before any of them reaches a command; ""
+/// when all can be used, else why not (printed by the caller).
+fn ark_git_args_error(name: str, url: str, gref: str, commit: str) -> str {
+    if !ark_url_ok(url) {
+        return "ark: pact '" + name + "': '" + url + "' is not a git URL ark uses (no option, ext:: or shell character)";
+    }
+    if str_len(gref) > 0 && !ark_ref_ok(gref) {
+        return "ark: pact '" + name + "': '" + gref + "' is not a branch or tag name (letters, digits and / . _ - + @)";
+    }
+    if str_len(commit) > 0 && !ark_commit_ok(commit) {
+        return "ark: pact '" + name + "': '" + commit + "' is not a commit id (hexadecimal digits)";
+    }
+    return "";
+}
+
+/// BG411: is `name` a plain pact name, one that stays a single entry of
+/// ark_modules/ (ark_modules/<name>, ark_modules/<name>.fd)? Not empty, no
+/// `/`, `\`, `:` (a drive letter), `..` or leading `.`, no control
+/// character or quote.
+fn ark_pact_name_ok(name: str) -> bool {
+    val n: i64 = str_len(name);
+    if n == 0 || n > 255 || str_starts_with(name, ".") || str_contains(name, "..") {
+        return false;
+    }
+    var i: i64 = 0;
+    while i < n {
+        val c: i64 = str_byte_at(name, i);
+        if c < 32 || c == 127 || c == 47 || c == 92 || c == 58 || c == 34 || c == 39 || c == 96 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
 }
 
 /// Where stderr of a command is thrown away on this host.
@@ -1603,6 +1720,15 @@ fn ark_install_registry(name: str, spec: str) -> str {
 /// machine), else a clone of its own. Refused when the tag no longer
 /// points at the commit the index recorded. The commit installed, or "".
 fn ark_install_registry_entry(dest: str, name: str, e: ArkIndexEntry) -> str {
+    // BG285: the index's URL, tag and commit are checked before git sees them
+    var bad: str = ark_git_args_error(name, e.git, e.tag, e.commit);
+    if str_len(bad) == 0 && str_len(e.commit) == 0 {
+        bad = "ark: pact '" + name + "': the index gives no commit";
+    }
+    if str_len(bad) > 0 {
+        p_eprint_str(bad + "\n");
+        return "";
+    }
     var mirror: str = ark_cache_repo(e.git, false);
     if str_len(mirror) > 0 {
         if ark_rev_commit(mirror, e.commit) != e.commit || ark_rev_commit(mirror, e.tag) != e.commit {
@@ -1628,7 +1754,7 @@ fn ark_install_registry_entry(dest: str, name: str, e: ArkIndexEntry) -> str {
         p_eprint_str("ark: " + name + " " + e.version + ": the tag " + e.tag + " is at " + tagc.out + ", but the index says " + e.commit + ": refusing to install\n");
         return "";
     }
-    if p_system("git -C " + ark_q(dest) + " checkout --quiet " + e.commit) != 0 {
+    if p_system("git -C " + ark_q(dest) + " checkout --quiet " + ark_q(e.commit)) != 0 {
         return "";
     }
     print("(registry " + e.version + ") ");
@@ -1868,6 +1994,11 @@ fn ark_cache_path(url: str) -> str {
 /// and the copy there is used). "" when there is no cache or the first
 /// clone fails.
 fn ark_cache_repo(url: str, fetch: bool) -> str {
+    // BG285: no option, ext:: transport or shell character reaches git
+    if !ark_url_ok(url) {
+        p_eprint_str("ark: '" + url + "' is not a git URL ark uses (no option, ext:: or shell character)\n");
+        return "";
+    }
     var dir: str = ark_cache_path(url);
     if str_len(dir) == 0 {
         return "";
@@ -1900,6 +2031,11 @@ fn ark_cache_fetch(dir: str) {
 /// The commit `rev` (a commit, branch, tag or HEAD) names in the
 /// repository `dir`, or "".
 fn ark_rev_commit(dir: str, rev: str) -> str {
+    // BG285: a branch, tag, commit or HEAD, nothing a shell or git reads
+    // as more
+    if !ark_ref_ok(rev) {
+        return "";
+    }
     var g: ArkGitOut = ark_git_out(dir, "rev-parse --verify --quiet " + ark_q(rev + "^{commit}"));
     if g.ok {
         return g.out;
@@ -1910,6 +2046,9 @@ fn ark_rev_commit(dir: str, rev: str) -> str {
 /// The text of `file` at `commit` in the repository `dir` ("" when there
 /// is none).
 fn ark_git_file(dir: str, commit: str, file: str) -> str {
+    if !ark_ref_ok(commit) {
+        return "";
+    }
     var g: ArkGitOut = ark_git_out(dir, "show " + ark_q(commit + ":" + file));
     if g.ok {
         return g.out;
@@ -1928,6 +2067,14 @@ struct ArkGitRev {
 /// updating (fetched when the cache lacks it), else the newest of `gref`
 /// (a branch or tag) or of the default branch.
 fn ark_git_resolve(url: str, gref: str, locked: str, update: bool) -> ArkGitRev {
+    // BG285: checked before the cache or git sees them
+    val bad: str = ark_git_args_error("?", url, gref, locked);
+    if str_len(bad) > 0 {
+        p_eprint_str(str_replace(bad, "pact '?': ", "") + "\n");
+        return ArkGitRev {
+            mirror: "", commit: ""
+        };
+    }
     var fresh: bool = !ark_is_dir(ark_cache_path(url));
     var mirror: str = ark_cache_repo(url, false);
     if str_len(mirror) == 0 {
@@ -2145,6 +2292,11 @@ fn ark_checkout_linked(dest: str, mirror: str, commit: str) -> str {
 /// clone that borrows the mirror's objects (`git clone --shared`), so only
 /// the working tree is copied. The commit checked out, or "".
 fn ark_checkout_own(dest: str, mirror: str, commit: str) -> str {
+    // BG285: a commit id only (it came from ark.lock or the index)
+    if !ark_commit_ok(commit) {
+        p_eprint_str("ark: '" + commit + "' is not a commit id (hexadecimal digits)\n");
+        return "";
+    }
     if !ark_is_dir(dest) {
         var slash: i64 = str_rfind(dest, "/");
         if slash > 0 {
@@ -2154,7 +2306,7 @@ fn ark_checkout_own(dest: str, mirror: str, commit: str) -> str {
             return "";
         }
     }
-    var co: str = "git -C " + ark_q(dest) + " checkout --quiet --detach " + commit;
+    var co: str = "git -C " + ark_q(dest) + " checkout --quiet --detach " + ark_q(commit);
     if p_system(co + " 2> " + ark_null()) != 0 {
         // a checkout made before the cache has objects of its own
         p_system("git -C " + ark_q(dest) + " fetch --quiet " + ark_q(mirror));
@@ -2896,6 +3048,11 @@ fn ark_cmd_add(args: Vec<str>) -> i64 {
         return 1;
     }
     var dep_name: str = args[0];
+    // BG411: a pact name is a plain name (it names ark_modules/<name>)
+    if !ark_pact_name_ok(dep_name) {
+        p_eprint_str("ark: invalid pact name '" + dep_name + "': a pact name is a plain name, with no / \\ : or .., not starting with a dot\n");
+        return 1;
+    }
     var path_val: str = "";
     var git_val: str = "";
     var branch_val: str = "";
@@ -3076,12 +3233,55 @@ fn ark_cmd_remove(args: Vec<str>) -> i64 {
     // L5E: its binary interface would still answer `use <name>`
     ark_bin_drop_iface(ark_base(false) + "/" + dep_name + ".fd");
     ark_bin_drop_iface(ark_base(true) + "/" + dep_name + ".fd");
+    // BG482: its installed copy and its ark.lock entry go too, or `use
+    // <name>;` still builds here and fails on a clean checkout (in a
+    // workspace member the shared copy is left: other members may use it)
+    if str_len(g_ark_ws_root) == 0 && ark_pact_name_ok(dep_name) {
+        ark_drop_installed(MODULES_DIR, dep_name);
+        ark_drop_installed(ark_dev_dir(), dep_name);
+        var lock: Vec<LockEntry> = lock_load();
+        var kept: Vec<LockEntry> = Vec::new();
+        var li: i64 = 0;
+        while li < lock.len() {
+            if lock[li].name != dep_name {
+                kept.push(lock[li]);
+            }
+            li = li + 1;
+        }
+        if kept.len() != lock.len() {
+            lock_save(kept);
+        }
+    }
     print("Removed pact '");
     print(dep_name);
     print("' from ");
     print(MANIFEST_FILE);
     print("\n");
     return 0;
+}
+
+/// BG482: remove the installed copy of pact `name` under the directory of
+/// pacts `base`: the file ark_modules/<name>.fd, and the directory
+/// ark_modules/<name>/ (a link to the cache's checkout is unlinked, never
+/// what it points at). `name` is a plain name (ark_pact_name_ok).
+fn ark_drop_installed(base: str, name: str) {
+    if !ark_pact_name_ok(name) {
+        return;
+    }
+    val file: str = base + "/" + name + ".fd";
+    if ark_exists(file) {
+        p_file_delete(file);
+    }
+    val dir: str = base + "/" + name;
+    if ark_is_link(dir) {
+        ark_unlink(dir);
+    } else if ark_is_dir(dir) {
+        if ark_is_windows() {
+            p_system("rmdir /S /Q " + ark_q(ark_win_path(dir)) + " 2> nul");
+        } else {
+            p_system("rm -rf " + ark_q(dir));
+        }
+    }
 }
 
 fn ark_cmd_list(args: Vec<str>) -> i64 {
@@ -3217,6 +3417,21 @@ fn ark_install_all_dev(update: bool, only: str, with_dev: bool) -> i64 {
 /// ark.lock and ark_modules/.features written -- one project's, or (L5F)
 /// a workspace's, at its root.
 fn ark_install_picks(m: Manifest, picks: Vec<ArkPick>, old_lock: Vec<LockEntry>, update: bool, only: str, with_dev: bool) -> i64 {
+    // BG411: a pact name is a plain name: a dependency's own ark.toml could
+    // name one `../../x` and be copied outside ark_modules/; checked for
+    // every pact before anything is written
+    var ni: i64 = 0;
+    while ni < picks.len() {
+        if !ark_pact_name_ok(picks[ni].name) {
+            var why: str = "";
+            if str_len(picks[ni].via) > 0 {
+                why = " (for " + picks[ni].via + ")";
+            }
+            p_eprint_str("ark: invalid pact name '" + picks[ni].name + "'" + why + ": a pact name is a plain name, with no / \\ : or .., not starting with a dot\n");
+            return 1;
+        }
+        ni = ni + 1;
+    }
     var lock_entries: Vec<LockEntry> = Vec::new();
     var installed: i64 = 0;
     var i: i64 = 0;

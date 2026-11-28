@@ -1,0 +1,87 @@
+// BG404 (docs/roadmap/bugs-roadmap.md): dlms_decode checks every A-XDR value
+// against the buffer (a value cut short is ok=false, not a panic), an
+// element count larger than the bytes left fails at once instead of looping,
+// a bad element makes its structure/array fail, and nesting deeper than the
+// decoder's limit (64) is ok=false.
+//
+// Expected output:
+// octet-string 10, 2 present: ok=false
+// array count 2^62: ok=false
+// structure with unknown tag 99: ok=false
+// array with bad 2nd element: ok=false
+// uint32 cut: ok=false
+// uint16 cut: ok=false
+// uint8 missing: ok=false
+// date-time cut: ok=false
+// length bytes cut: ok=false
+// indefinite length 0x80: ok=false
+// long-form octet-string 3: ok=true tag=9 count=0 bytes=3 next=6
+// struct of 3: ok=true tag=2 count=3 bytes=0 next=15
+// nested 3 deep: ok=true tag=2 count=1 bytes=0 next=7
+// nested 100 deep: ok=false
+// null: ok=true tag=0 count=0 bytes=0 next=1
+use dlms;
+
+fn show(name: str, b: &Vec<i64>) {
+    val v: AxdrValue = dlms_decode(b, 0);
+    if v.ok {
+        println(name + ": ok=true tag=" + int_to_str(v.tag) + " count=" + int_to_str(v.count) + " bytes=" + int_to_str(v.bytes.len()) + " next=" + int_to_str(v.next));
+    } else {
+        println(name + ": ok=false");
+    }
+}
+
+fn bytes(s: str) -> Vec<i64> {
+    // space-separated decimal bytes
+    var out: Vec<i64> = Vec::new();
+    var cur: i64 = 0;
+    var have: bool = false;
+    var i: i64 = 0;
+    while i < str_len(s) {
+        val c: i64 = str_byte_at(s, i);
+        if c == 32 {
+            if have {
+                out.push(cur);
+            }
+            cur = 0;
+            have = false;
+        } else {
+            cur = cur * 10 + (c - 48);
+            have = true;
+        }
+        i = i + 1;
+    }
+    if have {
+        out.push(cur);
+    }
+    return out;
+}
+
+fn main() {
+    // the entry's three triggers
+    show("octet-string 10, 2 present", &bytes("9 10 1 2"));
+    show("array count 2^62", &bytes("1 136 63 255 255 255 255 255 255 255"));
+    show("structure with unknown tag 99", &bytes("2 1 99"));
+    // edge cases
+    show("array with bad 2nd element", &bytes("1 2 17 5 99"));
+    show("uint32 cut", &bytes("6 0 1"));
+    show("uint16 cut", &bytes("18 1"));
+    show("uint8 missing", &bytes("17"));
+    show("date-time cut", &bytes("25 7 232 11 17 255"));
+    show("length bytes cut", &bytes("9 130 1"));
+    show("indefinite length 0x80", &bytes("9 128 1 2"));
+    show("long-form octet-string 3", &bytes("9 129 3 1 2 3"));
+    // structure { long-unsigned 0x1234, octet-string "AB", array [5, 6] }
+    show("struct of 3", &bytes("2 3 18 18 52 9 2 65 66 1 2 17 5 17 6"));
+    show("nested 3 deep", &bytes("2 1 2 1 2 1 0"));
+    var deep: Vec<i64> = Vec::new();
+    var d: i64 = 0;
+    while d < 100 {
+        deep.push(2);
+        deep.push(1);
+        d = d + 1;
+    }
+    deep.push(0);
+    show("nested 100 deep", &deep);
+    show("null", &bytes("0"));
+}

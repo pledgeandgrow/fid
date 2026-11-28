@@ -198,6 +198,10 @@ pub fn dnp3_link_parse(f: &Vec<i64>) -> Dnp3LinkFrame {
         return d_err_link("bad start octets");
     }
     val length: i64 = f.get(2);
+    // IEEE 1815 §9.2.4.1.3: LENGTH counts control+dest+src+data, 5..255
+    if length < 5 {
+        return d_err_link("bad length");
+    }
     val hcrc: i64 = dnp3_crc(f, 0, 8);
     if (f.get(8) | (f.get(9) << 8)) != hcrc {
         return d_err_link("header CRC mismatch");
@@ -406,18 +410,41 @@ pub struct Dnp3ObjHeaderAt {
     pub ok: bool,
 }
 
+fn d_objhdr_bad(pos: i64) -> Dnp3ObjHeaderAt {
+    return Dnp3ObjHeaderAt {
+        hdr: Dnp3ObjHeader {
+            group: 0, variation: 0, qualifier: 0, start: 0, stop: 0, count: 0
+        }, next: pos, ok: false,
+    };
+}
+
+/// ok is false when the header is cut short, the qualifier is not one this
+/// module knows (0x00, 0x01, 0x06, 0x07, 0x08, 0x17, 0x28), or a range has
+/// start > stop.
 pub fn dnp3_objhdr_decode(b: &Vec<i64>, pos: i64) -> Dnp3ObjHeaderAt {
-    if pos + 3 > b.len() {
-        return Dnp3ObjHeaderAt {
-            hdr: Dnp3ObjHeader {
-                group: 0, variation: 0, qualifier: 0, start: 0, stop: 0, count: 0
-            }, next: pos, ok: false,
-        };
+    if pos < 0 || pos + 3 > b.len() {
+        return d_objhdr_bad(pos);
     }
     val group: i64 = b.get(pos);
     val variation: i64 = b.get(pos + 1);
     val qual: i64 = b.get(pos + 2);
     var p: i64 = pos + 3;
+    // bytes of range/count field that follow the qualifier
+    var need: i64 = -1;
+    if qual == 0x00 {
+        need = 2;
+    } else if qual == 0x01 {
+        need = 4;
+    } else if qual == 0x06 {
+        need = 0;
+    } else if qual == 0x07 || qual == 0x17 {
+        need = 1;
+    } else if qual == 0x08 || qual == 0x28 {
+        need = 2;
+    }
+    if need < 0 || p + need > b.len() {
+        return d_objhdr_bad(pos);
+    }
     var start: i64 = 0;
     var stop: i64 = 0;
     var count: i64 = 0;
@@ -425,11 +452,17 @@ pub fn dnp3_objhdr_decode(b: &Vec<i64>, pos: i64) -> Dnp3ObjHeaderAt {
         start = b.get(p);
         stop = b.get(p + 1);
         p = p + 2;
+        if start > stop {
+            return d_objhdr_bad(pos);
+        }
         count = stop - start + 1;
     } else if qual == 0x01 {
         start = b.get(p) | (b.get(p + 1) << 8);
         stop = b.get(p + 2) | (b.get(p + 3) << 8);
         p = p + 4;
+        if start > stop {
+            return d_objhdr_bad(pos);
+        }
         count = stop - start + 1;
     } else if qual == 0x06 {
         count = 0;

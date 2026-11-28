@@ -1,0 +1,93 @@
+// BG407 (docs/roadmap/bugs-roadmap.md): an RTPS reader applies a GAP range
+// and a HEARTBEAT's firstSN by moving `next` (delivering what is pending on
+// the way), not one loop step per skipped sequence number, so a datagram
+// with a far sequence number (2^40) is handled at once; a GAP range ahead
+// of `next` is kept as one range and applied when `next` reaches it.
+//
+// Expected output:
+// gap to 2^40: next=1099511627776 pending=0
+// data at 2^40: delivered=1 next=1099511627777
+// heartbeat first 2^40+5: next=1099511627781
+// pending inside heartbeat range: delivered=3 next=10
+// gap ahead of next: next=1 pending=1
+// data 1..4: delivered=1,2,3,4 next=1099511627776
+// data at 2^40 after range: delivered=5 next=1099511627777
+// gap 3..6 with 4 pending: delivered=1,2,4 next=6
+use dds;
+
+fn cat(a: Vec<i64>, b: Vec<i64>) -> Vec<i64> {
+    var out: Vec<i64> = a;
+    var i: i64 = 0;
+    while i < b.len() {
+        out.push(b.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn sns(r: &RtpsReader) -> str {
+    var s: str = "";
+    var i: i64 = 0;
+    while i < r.delivered_sn.len() {
+        if i > 0 {
+            s = s + ",";
+        }
+        s = s + int_to_str(r.delivered_sn.get(i));
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() {
+    val pa: Vec<i64> = rtps_prefix(0x01020304, 0x0a0b0c0d, 1);
+    val pb: Vec<i64> = rtps_prefix(0x01020304, 0x0a0b0c0d, 2);
+    val wid: i64 = rtps_entity(1, RTPS_KIND_WRITER_NO_KEY);
+    val rid: i64 = rtps_entity(1, RTPS_KIND_READER_NO_KEY);
+    val far: i64 = 1099511627776;
+    val none: Vec<i64> = Vec::new();
+    var pl: Vec<i64> = Vec::new();
+    pl.push(0);
+    pl.push(1);
+    pl.push(0);
+    pl.push(0);
+
+    // the entry's trigger
+    var r: RtpsReader = rtps_reader_new(pb, rid);
+    rtps_reader_add_writer(&mut r, pa, wid);
+    rtps_reader_receive(&mut r, &cat(rtps_header(&pa, 0x01ff), rtps_sub_gap(rid, wid, 1, far, &none)));
+    println("gap to 2^40: next=" + int_to_str(r.next) + " pending=" + int_to_str(r.pend_sn.len()));
+    rtps_reader_receive(&mut r, &cat(rtps_header(&pa, 0x01ff), rtps_sub_data(rid, wid, far, &pl)));
+    println("data at 2^40: delivered=" + int_to_str(r.delivered.len()) + " next=" + int_to_str(r.next));
+    rtps_reader_receive(&mut r, &cat(rtps_header(&pa, 0x01ff), rtps_sub_heartbeat(rid, wid, far + 5, far + 6, 1, false, false)));
+    println("heartbeat first 2^40+5: next=" + int_to_str(r.next));
+
+    // a pending sample below the heartbeat's firstSN is still delivered
+    var r2: RtpsReader = rtps_reader_new(pb, rid);
+    rtps_reader_add_writer(&mut r2, pa, wid);
+    rtps_reader_receive(&mut r2, &cat(rtps_header(&pa, 0x01ff), rtps_sub_data(rid, wid, 3, &pl)));
+    rtps_reader_receive(&mut r2, &cat(rtps_header(&pa, 0x01ff), rtps_sub_heartbeat(rid, wid, 10, 12, 1, false, false)));
+    println("pending inside heartbeat range: delivered=" + sns(&r2) + " next=" + int_to_str(r2.next));
+
+    // a GAP [5, 2^40) that arrives before 1..4
+    var r3: RtpsReader = rtps_reader_new(pb, rid);
+    rtps_reader_add_writer(&mut r3, pa, wid);
+    rtps_reader_receive(&mut r3, &cat(rtps_header(&pa, 0x01ff), rtps_sub_gap(rid, wid, 5, far, &none)));
+    println("gap ahead of next: next=" + int_to_str(r3.next) + " pending=" + int_to_str(r3.pend_sn.len() + r3.gap_lo.len()));
+    var k: i64 = 1;
+    while k <= 4 {
+        rtps_reader_receive(&mut r3, &cat(rtps_header(&pa, 0x01ff), rtps_sub_data(rid, wid, k, &pl)));
+        k = k + 1;
+    }
+    println("data 1..4: delivered=" + sns(&r3) + " next=" + int_to_str(r3.next));
+    rtps_reader_receive(&mut r3, &cat(rtps_header(&pa, 0x01ff), rtps_sub_data(rid, wid, far, &pl)));
+    println("data at 2^40 after range: delivered=" + int_to_str(r3.delivered.len()) + " next=" + int_to_str(r3.next));
+
+    // GAP [3, 6) while 4 is pending: 4 is delivered, 3 and 5 skipped
+    var r4: RtpsReader = rtps_reader_new(pb, rid);
+    rtps_reader_add_writer(&mut r4, pa, wid);
+    rtps_reader_receive(&mut r4, &cat(rtps_header(&pa, 0x01ff), rtps_sub_data(rid, wid, 1, &pl)));
+    rtps_reader_receive(&mut r4, &cat(rtps_header(&pa, 0x01ff), rtps_sub_data(rid, wid, 2, &pl)));
+    rtps_reader_receive(&mut r4, &cat(rtps_header(&pa, 0x01ff), rtps_sub_data(rid, wid, 4, &pl)));
+    rtps_reader_receive(&mut r4, &cat(rtps_header(&pa, 0x01ff), rtps_sub_gap(rid, wid, 3, 6, &none)));
+    println("gap 3..6 with 4 pending: delivered=" + sns(&r4) + " next=" + int_to_str(r4.next));
+}

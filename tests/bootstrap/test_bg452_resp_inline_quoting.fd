@@ -1,0 +1,52 @@
+// BG452 (docs/roadmap/bugs-roadmap.md): resp_encode_inline quotes an
+// argument that Redis's inline parser (sdssplitargs) would split, unquote
+// or end the line at: whitespace, CR/LF, quotes, control bytes and the
+// empty string go inside "..." with \" \\ \n \r \t \xHH escapes, so a
+// value can no longer add arguments or inject a second command. Shown
+// with <CR><LF> for the real line end.
+//
+// Expected output:
+// SET greeting "hello world\r\nFLUSHALL"<CR><LF> (40 bytes)
+// PING<CR><LF> (6 bytes)
+// SET k ""<CR><LF> (10 bytes)
+// SET k "a b"<CR><LF> (13 bytes)
+// SET k "a\"b\\c"<CR><LF> (17 bytes)
+// SET k "it's"<CR><LF> (14 bytes)
+// SET k "tab\there"<CR><LF> (19 bytes)
+// SET k "x\x01y\x7f"<CR><LF> (20 bytes)
+// GET back\slash<CR><LF> (16 bytes)
+use redis;
+
+fn show(args: Vec<str>) -> void {
+    val b: Vec<i64> = resp_encode_inline(args);
+    var s: str = "";
+    var i: i64 = 0;
+    while i < b.len() {
+        if b.get(i) == 13 {
+            s = s + "<CR>";
+        } else if b.get(i) == 10 {
+            s = s + "<LF>";
+        } else {
+            s = s + char_to_str(b.get(i));
+        }
+        i = i + 1;
+    }
+    println(s + " (" + int_to_str(b.len()) + " bytes)");
+}
+
+fn main() -> i64 {
+    // the entry's trigger: a space and a CR LF in one argument
+    show(redis_cmd3("SET", "greeting", "hello world\r\nFLUSHALL"));
+    // plain words stay as they are
+    show(redis_cmd1("PING"));
+    // empty, space, quotes, backslash, tab, control bytes
+    show(redis_cmd3("SET", "k", ""));
+    show(redis_cmd3("SET", "k", "a b"));
+    show(redis_cmd3("SET", "k", "a\"b\\c"));
+    show(redis_cmd3("SET", "k", "it's"));
+    show(redis_cmd3("SET", "k", "tab\there"));
+    show(redis_cmd3("SET", "k", "x" + char_to_str(1) + "y" + char_to_str(127)));
+    // a backslash alone does not need quotes (sdssplitargs keeps it)
+    show(redis_cmd2("GET", "back\\slash"));
+    return 0;
+}

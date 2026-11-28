@@ -1,0 +1,128 @@
+// BG396 and BG440 (docs/roadmap/bugs-roadmap.md): grpc_server_handle
+// gunzips a compressed message with the size limit applied to the
+// decompressed bytes (max_message), so a small gzip bomb is
+// RESOURCE_EXHAUSTED and never reaches the handler (BG396), and gzip data
+// that does not decompress (junk, a bad CRC-32, a forged ISIZE) is
+// INTERNAL instead of an empty message (BG440). A valid compressed message
+// up to the limit, the empty message included, still gets through. The
+// server's limit is set to 1000 bytes here so that the interpreter does
+// not have to compress megabytes; the check is the same at the default
+// 4 MiB.
+//
+// Expected output:
+// limit 1000
+// 800 bytes: OK, handler got 800
+// 1000 bytes: OK, handler got 1000
+// empty: OK, handler got 0
+// identity 1500 bytes: RESOURCE_EXHAUSTED, handler not called
+// bomb 5000 bytes: RESOURCE_EXHAUSTED, handler not called
+// 1001 bytes: RESOURCE_EXHAUSTED, handler not called
+// bomb, ISIZE forged to 10: INTERNAL, handler not called
+// junk: INTERNAL, handler not called
+// bad crc: INTERNAL, handler not called
+// cut: INTERNAL, handler not called
+// header only: INTERNAL, handler not called
+// calls run 3
+use grpc;
+use compress;
+use protobuf;
+
+var GOT: i64 = 0 - 1;
+var RUNS: i64 = 0;
+
+fn take(call: &GrpcCall, reply: &mut GrpcReply) -> bool {
+    GOT = call.message.len();
+    RUNS = RUNS + 1;
+    grpc_reply_ok(reply, pb_writer_new());
+    return true;
+}
+
+fn filler(n: i64) -> Vec<i64> {
+    var v: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        v.push(i % 7);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn send(s: &mut GrpcServer, label: str, payload: Vec<i64>, compressed: bool) -> void {
+    var names: Vec<str> = Vec::new();
+    var vals: Vec<str> = Vec::new();
+    names.push(":method");
+    vals.push("POST");
+    names.push(":path");
+    vals.push("/t.Svc/Take");
+    names.push("content-type");
+    vals.push("application/grpc");
+    if compressed {
+        names.push("grpc-encoding");
+        vals.push("gzip");
+    }
+    GOT = 0 - 1;
+    val r: GrpcServerResponse = grpc_server_handle(s, names, vals, grpc_frame(payload, compressed));
+    if GOT >= 0 {
+        println(label + ": " + grpc_status_name(r.status) + ", handler got " + int_to_str(GOT));
+    } else {
+        println(label + ": " + grpc_status_name(r.status) + ", handler not called");
+    }
+}
+
+fn main() -> i64 {
+    var s: GrpcServer = grpc_server_new();
+    grpc_server_add(&mut s, "t.Svc", "Take", take);
+    s.max_message = 1000;
+    println("limit " + int_to_str(s.max_message));
+    // under and at the limit, and the empty message
+    send(&mut s, "800 bytes", gzip_compress_level(filler(800), 9), true);
+    send(&mut s, "1000 bytes", gzip_compress_level(filler(1000), 9), true);
+    send(&mut s, "empty", gzip_compress_bytes(Vec::new()), true);
+    // the framed-size limit still applies to uncompressed messages
+    send(&mut s, "identity 1500 bytes", filler(1500), false);
+    // BG396: small on the wire, larger than the limit once inflated
+    val bomb: Vec<i64> = gzip_compress_level(filler(5000), 9);
+    send(&mut s, "bomb 5000 bytes", bomb, true);
+    send(&mut s, "1001 bytes", gzip_compress_level(filler(1001), 9), true);
+    // an ISIZE trailer that lies about the size
+    var forged: Vec<i64> = bomb;
+    val n: i64 = forged.len();
+    forged.set(n - 4, 10);
+    forged.set(n - 3, 0);
+    forged.set(n - 2, 0);
+    forged.set(n - 1, 0);
+    send(&mut s, "bomb, ISIZE forged to 10", forged, true);
+    // BG440: the entry's trigger (40 junk bytes), a bad CRC-32, damaged data
+    var junk: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 40 {
+        junk.push((i * 37 + 11) & 255);
+        i = i + 1;
+    }
+    send(&mut s, "junk", junk, true);
+    var badcrc: Vec<i64> = gzip_compress_level(filler(800), 9);
+    val m: i64 = badcrc.len();
+    badcrc.set(m - 8, (badcrc.get(m - 8) + 1) & 255);
+    send(&mut s, "bad crc", badcrc, true);
+    // five bytes of the DEFLATE data taken out, header and trailer kept
+    val whole: Vec<i64> = gzip_compress_level(filler(800), 9);
+    var cut: Vec<i64> = Vec::new();
+    i = 0;
+    while i < whole.len() {
+        if i < 12 || i >= 17 {
+            cut.push(whole.get(i));
+        }
+        i = i + 1;
+    }
+    send(&mut s, "cut", cut, true);
+    // shorter than any gzip member
+    var tiny: Vec<i64> = Vec::new();
+    i = 0;
+    while i < 10 {
+        tiny.push(whole.get(i));
+        i = i + 1;
+    }
+    send(&mut s, "header only", tiny, true);
+    println("calls run " + int_to_str(RUNS));
+    return 0;
+}

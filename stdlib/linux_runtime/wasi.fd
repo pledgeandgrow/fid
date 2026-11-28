@@ -7,8 +7,10 @@
 // those imports, compiler/wasm.fd passes each argument as the import's
 // type (pointers and sizes as i32). The process's arguments and
 // environment are laid out as Linux starts a process (nat_start_sp: argc,
-// argv, NULL, envp, NULL). Memory: mmap grows the linear memory, munmap
-// keeps the region for the next mmap of its size. Paths go to the
+// argv, NULL, envp, NULL). Memory: mmap takes from the free regions munmap
+// gave back, else grows the linear memory (XT31, "free regions" below); a
+// file's mmap is a copy read with fd_read. The builtins, their system
+// calls and WASI functions: docs/reference/wasi.md (XT32). Paths go to the
 // preopened directories as wasi-libc sends them (scripts/wasm-run.mjs
 // preopens ".", "/" and "/tmp"). Errors are -errno as
 // on Linux. A task switches stacks (compiler/wasm.fd "Tasks": the WASM
@@ -41,6 +43,7 @@ extern "C" {
     fn wasi_fd_prestat_get(fd: i64, buf: i64) -> i64;
     fn wasi_fd_prestat_dir_name(fd: i64, path: i64, len: i64) -> i64;
     fn nat_wasm_grow(pages: i64) -> i64;
+    fn nat_wasm_size() -> i64;
     fn nat_wasm_zero(addr: i64, n: i64);
 }
 
@@ -56,7 +59,7 @@ var pe_wasi_dir_cookie: i64 = 0;
 var pe_wasi_dir_buf: i64 = 0;
 
 /// A page of its own (not the heap: a system call may run with the heap's
-/// lock held): scratch words at 0, the unmapped regions at 1024
+/// lock held): scratch words at 0, the free regions at 1024
 fn pe_wasi_scratch() -> i64 {
     if pe_wasi_tmp == 0 {
         pe_wasi_tmp = nat_wasm_grow(1) * 65536;
@@ -64,22 +67,92 @@ fn pe_wasi_scratch() -> i64 {
     return pe_wasi_tmp;
 }
 
-const PE_WASI_REGIONS: i64 = 64;
+// XT31: the linear memory's free regions. WASM memory grows (memory.grow)
+// and never shrinks, so munmap gives a region back to this list and mmap
+// takes from it before it grows the memory: [start, size] pairs of whole
+// 64 KB pages at scratch + 1024, sorted by start, neighbours merged (a
+// region never touches the next one). mmap takes the smallest region that
+// fits (split: the rest stays free), zeroed as fresh pages are; when none
+// fits and the last region ends where the memory does, the memory grows
+// by what that region lacks. Freed blocks of any size are thus reused by
+// blocks of any other (the allocator's chunks, large blocks, task stacks),
+// and a program that frees what it allocates does not grow the memory
+// again. Out of memory (memory.grow refuses: past 4 GB, or the host's
+// limit) is -ENOMEM: the allocator stops the program with "out of memory
+// (<n> bytes requested)" (base.fd pe_oom).
+const PE_WASI_REGIONS: i64 = 4032;  // (65536 - 1024) / 16
+var pe_wasi_nreg: i64 = 0;
 
-/// mmap: an unmapped region of the same size again (task and thread
-/// stacks, large blocks), zeroed; else new pages
+/// Region i out of the list
+fn pe_wasi_reg_del(tab: i64, i: i64) {
+    var j: i64 = i;
+    while j + 1 < pe_wasi_nreg {
+        pe_st(tab + j * 16, pe_ld(tab + j * 16 + 16));
+        pe_st(tab + j * 16 + 8, pe_ld(tab + j * 16 + 24));
+        j = j + 1;
+    }
+    pe_wasi_nreg = pe_wasi_nreg - 1;
+}
+
+/// A region [a, a + size) into the list at index i
+fn pe_wasi_reg_ins(tab: i64, i: i64, a: i64, size: i64) {
+    var j: i64 = pe_wasi_nreg;
+    while j > i {
+        pe_st(tab + j * 16, pe_ld(tab + j * 16 - 16));
+        pe_st(tab + j * 16 + 8, pe_ld(tab + j * 16 - 8));
+        j = j - 1;
+    }
+    pe_st(tab + i * 16, a);
+    pe_st(tab + i * 16 + 8, size);
+    pe_wasi_nreg = pe_wasi_nreg + 1;
+}
+
+/// mmap: a free region (the smallest that fits, zeroed), else the last
+/// free region grown at the end of the memory, else new pages
 fn pe_wasi_mmap(len: i64) -> i64 {
+    if len <= 0 {
+        return 0 - 22;
+    }  // EINVAL
+    // more than wasm32's 4 GB (65536 pages): no page count to ask for
+    if len > 4294967296 {
+        return 0 - 12;
+    }
     var size: i64 = ((len + 65535) / 65536) * 65536;
     var tab: i64 = pe_wasi_scratch() + 1024;
+    var best: i64 = 0 - 1;
+    var bs: i64 = 0;
     var i: i64 = 0;
-    while i < PE_WASI_REGIONS {
-        if pe_ld(tab + i * 16 + 8) == size {
-            var a: i64 = pe_ld(tab + i * 16);
-            pe_st(tab + i * 16 + 8, 0);
-            nat_wasm_zero(a, size);
-            return a;
+    while i < pe_wasi_nreg {
+        var s: i64 = pe_ld(tab + i * 16 + 8);
+        if s >= size && (best < 0 || s < bs) {
+            best = i;
+            bs = s;
         }
         i = i + 1;
+    }
+    if best >= 0 {
+        var a: i64 = pe_ld(tab + best * 16);
+        if bs == size {
+            pe_wasi_reg_del(tab, best);
+        } else {
+            pe_st(tab + best * 16, a + size);
+            pe_st(tab + best * 16 + 8, bs - size);
+        }
+        nat_wasm_zero(a, size);
+        return a;
+    }
+    if pe_wasi_nreg > 0 {
+        var last: i64 = pe_wasi_nreg - 1;
+        var la: i64 = pe_ld(tab + last * 16);
+        var ls: i64 = pe_ld(tab + last * 16 + 8);
+        if la + ls == nat_wasm_size() * 65536 {
+            if nat_wasm_grow((size - ls) / 65536) < 0 {
+                return 0 - 12;
+            }
+            pe_wasi_reg_del(tab, last);
+            nat_wasm_zero(la, ls);
+            return la;
+        }
     }
     var old: i64 = nat_wasm_grow(size / 65536);
     if old < 0 {
@@ -88,20 +161,95 @@ fn pe_wasi_mmap(len: i64) -> i64 {
     return old * 65536;
 }
 
-/// munmap: the region kept for an mmap of its size (WASM memory does not
-/// shrink)
-fn pe_wasi_munmap(addr: i64, len: i64) -> i64 {
-    var size: i64 = ((len + 65535) / 65536) * 65536;
-    var tab: i64 = pe_wasi_scratch() + 1024;
-    var i: i64 = 0;
-    while i < PE_WASI_REGIONS {
-        if pe_ld(tab + i * 16 + 8) == 0 {
-            pe_st(tab + i * 16, addr);
-            pe_st(tab + i * 16 + 8, size);
-            return 0;
+/// mmap of a file (XT32: WASI has no mappings): `len` new pages holding
+/// the file's bytes from `off` (zero past its end), read with fd_read; the
+/// descriptor's offset is put back. A private copy: a write to the pages
+/// does not reach the file, as MAP_PRIVATE; munmap frees it as any region.
+fn pe_wasi_mmap_file(len: i64, fd: i64, off: i64) -> i64 {
+    var a: i64 = pe_wasi_mmap(len);
+    if a < 0 {
+        return a;
+    }
+    var t: i64 = pe_wasi_scratch();
+    if wasi_fd_seek(fd, 0, 1, t) != 0 {
+        pe_wasi_munmap(a, len);
+        return 0 - 19;
+    }  // ENODEV: not a file
+    var pos: i64 = pe_ld(t);
+    if wasi_fd_seek(fd, off, 0, t) != 0 {
+        pe_wasi_munmap(a, len);
+        return 0 - 22;
+    }
+    var got: i64 = 0;
+    while got < len {
+        var r: i64 = pe_wasi_rw(false, fd, a + got, len - got);
+        if r <= 0 {
+            break;
         }
+        got = got + r;
+    }
+    wasi_fd_seek(fd, pos, 0, pe_wasi_scratch());
+    return a;
+}
+
+/// sysinfo (sysconf's _SC_PHYS_PAGES, _SC_AVPHYS_PAGES): the generic Linux
+/// struct (totalram at 32, freeram at 40, mem_unit at 104) of the linear
+/// memory: wasm32's 4 GB in all, free what it has not grown to yet
+fn pe_wasi_sysinfo(si: i64) -> i64 {
+    pe_zero(si, 112);
+    pe_st(si + 32, 4294967296);
+    pe_st(si + 40, 4294967296 - nat_wasm_size() * 65536);
+    pe_st(si + 104, 1);
+    return 0;
+}
+
+/// munmap: the whole pages of [addr, addr + len) back to the free list,
+/// merged with the regions next to them (the length to the next 64 KB, as
+/// mmap rounded it). A range already free, in part or whole, is left alone.
+fn pe_wasi_munmap(addr: i64, len: i64) -> i64 {
+    if len <= 0 {
+        return 0 - 22;
+    }
+    var start: i64 = ((addr + 65535) / 65536) * 65536;
+    var end: i64 = ((addr + len + 65535) / 65536) * 65536;
+    if end <= start || start <= 0 {
+        return 0;
+    }
+    var tab: i64 = pe_wasi_scratch() + 1024;
+    // the first region after start
+    var i: i64 = 0;
+    while i < pe_wasi_nreg && pe_ld(tab + i * 16) < start {
         i = i + 1;
     }
+    var join_prev: bool = false;
+    if i > 0 {
+        var pa: i64 = pe_ld(tab + i * 16 - 16);
+        var pend: i64 = pa + pe_ld(tab + i * 16 - 8);
+        if pend > start {
+            return 0;
+        }  // freed twice
+        join_prev = pend == start;
+    }
+    var join_next: bool = false;
+    if i < pe_wasi_nreg {
+        var na: i64 = pe_ld(tab + i * 16);
+        if na < end {
+            return 0;
+        }  // freed twice
+        join_next = na == end;
+    }
+    if join_prev && join_next {
+        pe_st(tab + i * 16 - 8, pe_ld(tab + i * 16) + pe_ld(tab + i * 16 + 8) - pe_ld(tab + i * 16 - 16));
+        pe_wasi_reg_del(tab, i);
+    } else if join_prev {
+        pe_st(tab + i * 16 - 8, end - pe_ld(tab + i * 16 - 16));
+    } else if join_next {
+        pe_st(tab + i * 16 + 8, pe_ld(tab + i * 16) + pe_ld(tab + i * 16 + 8) - start);
+        pe_st(tab + i * 16, start);
+    } else if pe_wasi_nreg < PE_WASI_REGIONS {
+        pe_wasi_reg_ins(tab, i, start, end - start);
+    }
+    // (a full list keeps the region out: it stays mapped, unused)
     return 0;
 }
 
@@ -297,8 +445,15 @@ fn pe_wasi_openat(path: i64, flags: i64) -> i64 {
     pe_wasi_path(path);
     var out: i64 = pe_wasi_scratch();
     // Rights: every one but sock_shutdown (bits 0..27; Node refuses a file
-    // the bit 28 asks for with ENOTCAPABLE)
-    var e: i64 = wasi_path_open(pe_wasi_pfd, 1, pe_wasi_pptr, pe_wasi_plen, oflags, 268435455, 268435455, fdflags, out);
+    // the bit 28 asks for with ENOTCAPABLE). A directory asks for none of
+    // the write rights (fd_datasync 0, fd_write 6, fd_allocate 8,
+    // fd_filestat_set_size 22): wasmtime refuses a directory opened with
+    // them with EISDIR, and the listing came back empty (XT32)
+    var base: i64 = 268435455;
+    if (oflags & 2) != 0 {
+        base = 264240830;
+    }
+    var e: i64 = wasi_path_open(pe_wasi_pfd, 1, pe_wasi_pptr, pe_wasi_plen, oflags, base, 268435455, fdflags, out);
     if e != 0 {
         return pe_wasi_err(e);
     }
@@ -493,8 +648,12 @@ pub fn pe_wasi_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -
         return pe_wasi_rw(false, a, b, c);
     }  // read
     if n == 222 {  // mmap
+        // a file (p_fs_map): its bytes read into new pages
         if e >= 0 {
-            return 0 - 38;
+            if (d & 16) != 0 {
+                return 0 - 38;
+            }
+            return pe_wasi_mmap_file(b, e, f);
         }
         // MAP_FIXED (RT7's decommit, base.fd pe_decommit): WASM memory
         // cannot give pages back
@@ -590,6 +749,9 @@ pub fn pe_wasi_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -
         wasi_sched_yield();
         return 0;
     }  // sched_yield
+    if n == 179 {
+        return pe_wasi_sysinfo(a);
+    }  // sysinfo
     if n == 123 {  // sched_getaffinity
         pe_zero(c, 8);
         pe_stb(c, 1);
@@ -606,4 +768,68 @@ pub fn pe_wasi_syscall(n: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -
         return 0;
     }
     return 0 - 38;
+}
+
+// XT28: a fused multiply-add for math.fd (exp, log, pow are musl's FMA
+// variants: pe_fma calls nat_fma). WebAssembly has no fused multiply-add,
+// and nat_fma written as a * b + c rounds twice: pow(2, 10) printed
+// 1024.0000000000002 (test_ffi). This override of the extern (wasm.fd
+// wg_gen_call: pert_c_<C name>) computes a * b exactly as hi + lo
+// (Dekker's product over Veltkamp's split), adds c to hi exactly
+// (TwoSum) and rounds once at the end: exact where musl relies on it,
+// `fma(x, y, -(x * y))` (the product's error) and `fma(z, invc, -1.0)`
+// (cancellation), and within one rounding of the fused result otherwise.
+// Outside the range where the split is exact (an operand that is not
+// finite or is zero, |a| or |b| at 2^995 or more, a product near the
+// overflow or the underflow), a * b + c.
+pub fn pert_c_nat_fma(ab: i64, bb: i64, cb: i64) -> i64 {
+    var a: f64 = p_f64_from_bits(ab);
+    var b: f64 = p_f64_from_bits(bb);
+    var c: f64 = p_f64_from_bits(cb);
+    var ea: i64 = (ab >> 52) & 2047;
+    var eb: i64 = (bb >> 52) & 2047;
+    var ec: i64 = (cb >> 52) & 2047;
+    if ea == 2047 || eb == 2047 || ec == 2047 || ea == 0 || eb == 0 || ea >= 2018 || eb >= 2018 || ea + eb < 1023 + 100 || ea + eb >= 1023 + 2040 {
+        return p_f64_to_bits(a * b + c);
+    }
+    // Veltkamp: x = xh + xl, each half 26 bits or fewer
+    var split: f64 = 134217729.0;  // 2^27 + 1
+    var ta: f64 = split * a;
+    var ah: f64 = ta - (ta - a);
+    var al: f64 = a - ah;
+    var tb: f64 = split * b;
+    var bh: f64 = tb - (tb - b);
+    var bl: f64 = b - bh;
+    // Dekker: a * b = p + e exactly
+    var p: f64 = a * b;
+    var e: f64 = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
+    // TwoSum: p + c = s + t exactly
+    var s: f64 = p + c;
+    var v: f64 = s - p;
+    var t: f64 = (p - (s - v)) + (c - v);
+    return p_f64_to_bits(s + (t + e));
+}
+
+// XT28: the 16-bit volatile accesses (stdlib regbus, test_std_cortex_m and
+// test_std_aarch64_sys), which the C backend has (codegen_c.fd) and this
+// runtime's sys.fd does not: under WASI a plain 2-byte load or store (no
+// device memory; one thread). If sys.fd gets them for every target, these
+// two go.
+pub fn pert_volatile_load16(addr: i64) -> i64 {
+    var p: *mut u16 = addr;
+    var v: i64 = 0;
+    // SAFETY: NOT checked: a raw-address API (MMIO, buffers the caller
+    // made), as pert_volatile_load32; the address is the caller's.
+    unsafe {
+        v = *p;
+    }
+    return v;
+}
+
+pub fn pert_volatile_store16(addr: i64, val: i64) {
+    var p: *mut u16 = addr;
+    // SAFETY: NOT checked: a raw 2-byte store, as pert_volatile_store32.
+    unsafe {
+        *p = val;
+    }
 }

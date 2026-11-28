@@ -1,0 +1,73 @@
+// Bugs roadmap BG203: `Option::Some(x)` built from a `for x in v` loop
+// variable leaked its payload. The loop variable over a Vec<str> has no AST
+// type, so the literal was typed Option<i64> (owns nothing) and never
+// dropped, while its payload was counted as a string (from its IR type).
+// The literal's temporary is now typed from what its payload was owned as
+// (lower.fd Lowerer_enum_lit_temp_type). Leak gate:
+//   fid run tests/bootstrap/test_bg203_for_var_some.fd --leaks
+//
+// Expected output:
+// 15
+// first: alpha1
+// kept: 3
+// some
+// done
+
+fn show(o: Option<str>) -> i64 {
+    match o {
+        Option::Some(s) => {
+            return str_len(s);
+        }
+        Option::None => {
+            return 0;
+        }
+    }
+}
+
+fn first(v: Vec<str>) -> Option<str> {
+    for x in v {
+        return Option::Some(x);
+    }
+    return Option::None;
+}
+
+fn main() -> i64 {
+    var v: Vec<str> = Vec::new();
+    v.push("alpha" + int_to_str(1));
+    v.push("beta" + int_to_str(2));
+    v.push("gam" + int_to_str(3));
+    var total: i64 = 0;
+    var round: i64 = 0;
+    while round < 100 {
+        total = 0;
+        for x in v {
+            total = total + show(Option::Some(x));
+        }
+        round = round + 1;
+    }
+    println(total);
+    match first(v) {
+        Option::Some(f) => {
+            println("first: " + f);
+        }
+        Option::None => {
+            println("none");
+        }
+    }
+    var kept: Vec<Option<str>> = Vec::new();
+    for y in v {
+        val o = Option::Some(y);
+        kept.push(o);
+    }
+    println("kept: " + int_to_str(kept.len()));
+    match kept.get(1) {
+        Option::Some(_) => {
+            println("some");
+        }
+        Option::None => {
+            println("none");
+        }
+    }
+    println("done");
+    return 0;
+}

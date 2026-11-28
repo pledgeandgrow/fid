@@ -1,0 +1,88 @@
+// BG436 (docs/roadmap/bugs-roadmap.md): `fid run` never gave back the
+// memory of replaced strings: the copy of each new string in the
+// interpreter's memory stayed allocated, so a loop that keeps reassigning
+// a string ran out of the 127 MB heap ("Out of memory: the interpreter
+// holds at most 133169152 bytes") at a few KB of live data: `s = s + "xyz"`
+// 8,000 times (a 24 KB string, ~96 MB of copies in all), or `s = base +
+// "y"` with a 3 KB `base` under 60,000 times (50,000 here). The compiled
+// backends free the old values. A replaced string's copy is now given back once it is dropped
+// and its variable no longer holds it (compiler/interp.fd
+// Interpreter_own_*). The values that are kept (a Vec, a copy in another
+// variable) must stay intact.
+//
+// Expected output:
+// 30000
+// 3001 50000
+// 2400
+// keep abcabc 6
+// v 3 x0 x1 x2
+// f 20000
+
+fn grow(n: i64) -> str {
+    var t: str = "";
+    var i: i64 = 0;
+    while i < n {
+        t = t + "x";
+        i = i + 1;
+    }
+    return t;
+}
+
+fn main() {
+    // 1. append in place: about 450 MB of copies in all before the fix
+    var s: str = "";
+    var i: i64 = 0;
+    while i < 10000 {
+        s = s + "xyz";
+        i = i + 1;
+    }
+    println(f"{str_len(s)}");
+    // 2. a new value from a long base each time: two 3 KB strings live
+    var base: str = "";
+    var k: i64 = 0;
+    while k < 300 {
+        base = base + "0123456789";
+        k = k + 1;
+    }
+    var r: str = "";
+    var n: i64 = 0;
+    while n < 50000 {
+        r = base + "y";
+        n = n + 1;
+    }
+    println(f"{str_len(r)} {n}");
+    // 3. a string kept by a second variable is not given back
+    var kept: str = "";
+    var j: i64 = 0;
+    while j < 800 {
+        kept = kept + "abc";
+        j = j + 1;
+    }
+    val copy: str = kept;
+    kept = "";
+    println(f"{str_len(copy)}");
+    var q: str = "abc";
+    q = q + "abc";
+    val q2: str = q;
+    q = "zz";
+    println(f"keep {q2} {str_len(q2)}");
+    // 4. strings kept in a Vec, their variables replaced
+    var v: Vec<str> = Vec::new();
+    var e: str = "";
+    var m: i64 = 0;
+    while m < 3 {
+        e = "x" + int_to_str(m);
+        v.push(e);
+        m = m + 1;
+    }
+    e = "gone";
+    println(f"v {v.len()} {v.get(0)} {v.get(1)} {v.get(2)}");
+    // 5. each call's local: given back when the call returns
+    var total: i64 = 0;
+    var c: i64 = 0;
+    while c < 2000 {
+        total = total + str_len(grow(10));
+        c = c + 1;
+    }
+    println(f"f {total}");
+}

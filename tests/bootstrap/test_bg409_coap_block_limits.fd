@@ -1,0 +1,91 @@
+// BG409 (docs/roadmap/bugs-roadmap.md): Block1/Block2 values are limited as
+// RFC 7959 §2.2 says (0-3 bytes, NUM < 2^20, SZX 7 reserved): an over-long
+// Block2 option from the wire is reported by coap_block_option_ok, and
+// coap_block2_respond / coap_block_asm_add / coap_block_slice return
+// false / empty for a bad block instead of panicking on `num * size` or
+// indexing with a negative NUM.
+//
+// Expected output:
+// decoded: ok=true block2 option ok=false
+// respond to 8-byte Block2: false
+// respond NUM 2^20: false
+// respond NUM 2^20-1 (past the end): false
+// respond SZX 7: false
+// respond NUM -2: false
+// slice NUM -2: 0 bytes
+// option 0x07 (SZX 7) ok=false, 0x0d ok=true, 3-byte ok=true
+// respond 1/0/64: true payload 64 block 1/1/64
+// asm with 8-byte Block2: false ok=false
+// asm with SZX 7: false ok=false
+// asm 3 blocks: done=true ok=true 150 bytes
+use coap;
+use encoding;
+
+fn bs(b: bool) -> str {
+    if b {
+        return "true";
+    }
+    return "false";
+}
+
+fn main() {
+    var body: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < 150 {
+        body.push(i & 255);
+        i = i + 1;
+    }
+    // the entry's trigger: CON GET, Block2 = 8 bytes of 0x7F
+    val d: CoapDecoded = coap_decode(hex_decode_bytes("40010001d80a7f7f7f7f7f7f7f7f"));
+    println("decoded: ok=" + bs(d.ok) + " block2 option ok=" + bs(coap_block_option_ok(&d.msg, COAP_O_BLOCK2)));
+    val v: i64 = coap_get_uint(&d.msg, COAP_O_BLOCK2, 0);
+    var resp: CoapMsg = coap_msg(COAP_ACK, COAP_CONTENT, 1);
+    println("respond to 8-byte Block2: " + bs(coap_block2_respond(&mut resp, &body, coap_block_num(v), coap_block_szx(v))));
+    println("respond NUM 2^20: " + bs(coap_block2_respond(&mut resp, &body, 1048576, 2)));
+    println("respond NUM 2^20-1 (past the end): " + bs(coap_block2_respond(&mut resp, &body, 1048575, 6)));
+    println("respond SZX 7: " + bs(coap_block2_respond(&mut resp, &body, 0, 7)));
+    println("respond NUM -2: " + bs(coap_block2_respond(&mut resp, &body, -2, 6)));
+    println("slice NUM -2: " + int_to_str(coap_block_slice(&body, -2, 6).len()) + " bytes");
+
+    var m7: CoapMsg = coap_msg(COAP_CON, COAP_GET, 2);
+    coap_add_uint(&mut m7, COAP_O_BLOCK2, 0x07);
+    var md: CoapMsg = coap_msg(COAP_CON, COAP_GET, 3);
+    coap_add_uint(&mut md, COAP_O_BLOCK2, 0x0d);
+    var m3: CoapMsg = coap_msg(COAP_CON, COAP_GET, 4);
+    coap_add_uint(&mut m3, COAP_O_BLOCK2, coap_block_value(1048575, false, 2));
+    println("option 0x07 (SZX 7) ok=" + bs(coap_block_option_ok(&m7, COAP_O_BLOCK2)) + ", 0x0d ok=" + bs(coap_block_option_ok(&md, COAP_O_BLOCK2)) + ", 3-byte ok=" + bs(coap_block_option_ok(&m3, COAP_O_BLOCK2)));
+
+    var r1: CoapMsg = coap_msg(COAP_ACK, COAP_CONTENT, 5);
+    val ok1: bool = coap_block2_respond(&mut r1, &body, 1, 2);
+    println("respond 1/0/64: " + bs(ok1) + " payload " + int_to_str(r1.payload.len()) + " block " + coap_block_str(coap_get_uint(&r1, COAP_O_BLOCK2, 0)));
+
+    // client side: a server's response with a bad Block2
+    var bad: CoapMsg = coap_msg(COAP_ACK, COAP_CONTENT, 6);
+    var raw: Vec<i64> = Vec::new();
+    var k: i64 = 0;
+    while k < 8 {
+        raw.push(0x7f);
+        k = k + 1;
+    }
+    coap_add_option(&mut bad, COAP_O_BLOCK2, raw);
+    var a: CoapBlockAsm = coap_block_asm_new();
+    val ra: bool = coap_block_asm_add(&mut a, &bad);
+    println("asm with 8-byte Block2: " + bs(ra) + " ok=" + bs(a.ok));
+    var bad7: CoapMsg = coap_msg(COAP_ACK, COAP_CONTENT, 7);
+    coap_add_uint(&mut bad7, COAP_O_BLOCK2, 0x0f);
+    var a7: CoapBlockAsm = coap_block_asm_new();
+    val r7: bool = coap_block_asm_add(&mut a7, &bad7);
+    println("asm with SZX 7: " + bs(r7) + " ok=" + bs(a7.ok));
+
+    var asm: CoapBlockAsm = coap_block_asm_new();
+    var ask: i64 = 0;
+    var n: i64 = 0;
+    while !asm.done && asm.ok && n < 10 {
+        var rr: CoapMsg = coap_msg(COAP_ACK, COAP_CONTENT, 10 + n);
+        coap_block2_respond(&mut rr, &body, coap_block_num(ask), 2);
+        coap_block_asm_add(&mut asm, &rr);
+        ask = asm.next;
+        n = n + 1;
+    }
+    println("asm 3 blocks: done=" + bs(asm.done) + " ok=" + bs(asm.ok) + " " + int_to_str(asm.data.len()) + " bytes");
+}

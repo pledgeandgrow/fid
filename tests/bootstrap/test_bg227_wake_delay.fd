@@ -1,0 +1,75 @@
+// Bugs roadmap BG227: in native Windows executables (pe_runtime) a worker
+// read how a task had left (its done flag, `t + 80`) after the switch back,
+// when a task that blocked may already have been woken, run to its end on
+// another worker and finished: the first worker then finished it a second
+// time (pert_live counted down twice, so task_run returned with tasks
+// still running; its context freed twice; its stack cached twice; for a
+// detached task, its freed block read). The fix (stdlib/pe_runtime/
+// conc.fd): a task writes how it left (2 finished, 1 runnable, 0 blocked)
+// and whoever resumes it reads that.
+//
+// test_bg227_task_wake_race.fd, a stress run, passes with the bug put back:
+// the window is a few instructions. Here the runtime's test hook
+// FIDES_TEST_WAKE_DELAY makes a worker wait 3 ms after a task came back to
+// it blocked, before it looks at how the task left, so the task is woken
+// (the mutex holder unlocks), run and finished on another worker
+// meanwhile. With the old read the program dies ("Panic: Double free":
+// the detached task's block freed twice); with the fix the delay changes
+// nothing. (Checked Nov 27 by putting the old read into pert_worker_main of
+// a copy of stdlib/ and building this test from that copy: "Panic: Double
+// free" 3 runs of 3 with the delay, the right output 3 of 3 without it.)
+//@ backends: emit
+//@ env: FIDES_TEST_WAKE_DELAY=3
+//@ env: FIDES_WORKERS=4
+//
+// Expected output:
+// rounds 12
+// short 0
+// total 384
+
+use task;
+
+var M: i64 = 0;
+var TOTAL: i64 = 0;
+var DONE: i64 = 0;
+
+fn worker(id: i64) -> i64 {
+    p_mutex_lock(M);
+    val v = p_atomic_load(TOTAL);
+    // the holder gives the other workers time to find the mutex held and
+    // park on it
+    task_yield();
+    p_atomic_store(TOTAL, v + 1);
+    p_mutex_unlock(M);
+    p_atomic_add(DONE, 1);
+    return id;
+}
+
+fn main() -> i64 {
+    M = p_mutex_init();
+    TOTAL = p_shared_alloc(8);
+    DONE = p_shared_alloc(8);
+    p_atomic_store(TOTAL, 0);
+    val n: i64 = 32;
+    var short: i64 = 0;
+    var r: i64 = 0;
+    while r < 12 {
+        p_atomic_store(DONE, 0);
+        var k: i64 = 0;
+        while k < n {
+            val t = task_go("worker", r * n + k);
+            task_detach(t);
+            k = k + 1;
+        }
+        task_run();
+        // every task of the round has finished when task_run returns
+        if p_atomic_load(DONE) != n {
+            short = short + 1;
+        }
+        r = r + 1;
+    }
+    println("rounds " + int_to_str(r));
+    println("short " + int_to_str(short));
+    println("total " + int_to_str(p_atomic_load(TOTAL)));
+    return 0;
+}

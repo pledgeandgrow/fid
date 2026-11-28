@@ -610,7 +610,11 @@ pub fn lw_data_encode(nwk_skey: &Vec<i64>, app_skey: &Vec<i64>, fr: &LwFrame) ->
 }
 
 /// Decode a data frame and decrypt its payload with the full counter
-/// fcnt32 (from lw_fcnt_extend). mic_ok tells whether the MIC matched.
+/// fcnt32 (from lw_fcnt_extend). mic_ok tells whether the MIC matched. The
+/// MIC covers the full 32-bit counter (LoRaWAN replay protection), so a
+/// fcnt32 that is not a 32-bit value ending in the frame's 16-bit FCnt
+/// (lw_fcnt_extend's -1 for a replay included) gives ok=false and
+/// mic_ok=false, with fcnt the frame's 16-bit FCnt.
 pub fn lw_data_decode(nwk_skey: &Vec<i64>, app_skey: &Vec<i64>, f: &Vec<i64>, fcnt32: i64) -> LwFrame {
     var fr: LwFrame = lw_frame(0, 0, 0, 0 - 1, Vec::new());
     fr.ok = false;
@@ -632,10 +636,11 @@ pub fn lw_data_decode(nwk_skey: &Vec<i64>, app_skey: &Vec<i64>, f: &Vec<i64>, fc
     if 8 + folen + 4 > f.len() {
         return fr;
     }
-    fr.fcnt = fcnt32;
-    if (fcnt32 & 0xFFFF) != lw_get_le(f, 6, 2) {
+    if fcnt32 < 0 || fcnt32 > 0xFFFFFFFF || (fcnt32 & 0xFFFF) != lw_get_le(f, 6, 2) {
         fr.fcnt = lw_get_le(f, 6, 2);
+        return fr;
     }
+    fr.fcnt = fcnt32;
     fr.fopts = lw_slice(f, 8, 8 + folen);
     val n: i64 = f.len();
     fr.mic_ok = lw_eq(&lw_data_mic(nwk_skey, dir, fr.dev_addr, fr.fcnt, &lw_slice(f, 0, n - 4)), &lw_slice(f, n - 4, n));

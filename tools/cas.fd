@@ -11,8 +11,14 @@
 // contain ".." so a client can only ever name flat files under the root.
 // Plain HTTP, no auth: run it on a LAN/VPN, or put a TLS proxy in front.
 //
-//   fid run tools/cas.fd -- [root] [port]      (defaults ./fidcas, 7331)
+//   fid ccompile tools/cas.fd -o fidcas.exe    (or `fid emit`)
+//   ./fidcas.exe [root] [port]                 (defaults ./fidcas, 7331)
 //   FIDES_CAS=http://host:7331 fidesc ccompile hello.fd -o hello.exe
+//
+// Build it first: `fid run tools/cas.fd` cannot serve (BG363): the
+// interpreter has no p_co_accept, the accept task of http.fd's server, so
+// every client was refused while the banner said it was serving. Under
+// `fid run` it says so and exits 1.
 
 use http;
 use args;
@@ -75,8 +81,15 @@ fn cas_handler(req: HttpRequest) -> str {
     return build_response(405, "text/plain", "method not allowed\n");
 }
 
-fn main() {
+fn main() -> i64 {
     var av: Vec<str> = args_all();
+    // BG363: under `fid run` the program's name is the .fd file (a built
+    // server's is its executable), and the interpreter cannot accept
+    // connections
+    if av.len() > 0 && str_ends_with(av.get(0), ".fd") {
+        p_eprint_str("fidcas: `fid run` cannot serve: the interpreter has no p_co_accept (http.fd's accept task). Build the server: fid ccompile tools/cas.fd -o fidcas.exe, then run fidcas.exe [root] [port]\n");
+        return 1;
+    }
     var port: i64 = 7331;
     if av.len() > 1 && str_len(av.get(1)) > 0 { g_root = av.get(1); }
     if av.len() > 2 { port = str_parse_int(av.get(2)); }
@@ -86,5 +99,7 @@ fn main() {
     print("fidcas: serving " + g_root + " on http://0.0.0.0:" + int_to_str(port) + "\n");
     if !http_serve(port, cas_handler) {
         print("fidcas: failed to listen on port " + int_to_str(port) + "\n");
+        return 1;
     }
+    return 0;
 }

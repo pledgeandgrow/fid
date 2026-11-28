@@ -11,8 +11,10 @@ Output (read by tests/nattools/rl9_rewrite.fd), decimal numbers:
             -1 for what the image has not (no data split, static)
     then one line per function symbol of .text: "<name> <start> <end>"
             (image offsets), in address order
-The image's length is .text's size (nat_elf_debug_sections makes .text the
-loaded image, so bytes appended after it, .eh_frame, are left out).
+The image's length is .text's size, plus .data's when section 2 is a .data
+right after it (nat_elf_debug_sections makes .text the loaded image, or,
+BG234, .text the code segment's part and .data the data segment's; bytes
+appended after the image, .eh_frame, are left out).
 """
 import struct
 import sys
@@ -45,6 +47,9 @@ def main():
     secs = [struct.unpack_from("<IIQQQQIIQQ", d, e_shoff + 64 * i) for i in range(e_shnum)] if e_shnum else []
     if len(secs) > 1 and secs[1][3] == base and secs[1][4] == 0x1000:
         img_len = secs[1][5]
+        # BG234: the data segment's own section, adjoining .text
+        if len(secs) > 2 and secs[2][1] == 1 and secs[2][3] == base + img_len and secs[2][4] == 0x1000 + img_len:
+            img_len += secs[2][5]
     if img_len is None:
         img_len = max(p[2] + p[5] for p in loads) - 0x1000
     data_off = loads[1][2] - 0x1000 if len(loads) > 1 else -1

@@ -30,6 +30,12 @@ pub const HPACK_NEVER_INDEX: i64 = 2;  // literal never indexed
 
 /// The static table has 61 entries (Appendix A); dynamic entries follow.
 pub const HPACK_STATIC_LEN: i64 = 61;
+
+/// The header list size hpack_decode allows (RFC 9113 §6.5.2: each
+/// field's name and value lengths plus 32): a larger list is an error, so
+/// a block of one-byte references to a large table entry (an HPACK bomb)
+/// cannot make the decoder copy more than this.
+pub const HPACK_MAX_HEADER_LIST: i64 = 1048576;
 /// The largest integer a decoder accepts (bigger ones are an error: no
 /// table, string or size in HTTP/2 comes near it).
 const HP_INT_MAX: i64 = 2147483647;
@@ -59,6 +65,7 @@ pub struct HpackHeaders {
     pub names: Vec<str>,
     pub vals: Vec<str>,
     pub never: Vec<bool>,  // field was "never indexed" (6.2.3)
+    pub too_large: bool,  // hpack_decode_limit: the list passed its limit
 }
 
 /// Encoder and decoder state with a dynamic table of `max_size` bytes
@@ -1086,18 +1093,43 @@ pub fn hpack_table_dump(h: &Hpack) -> str {
 
 fn hp_fail(r: HpackHeaders, why: str) -> HpackHeaders {
     return HpackHeaders {
-        ok: false, error: why, names: r.names, vals: r.vals, never: r.never
+        ok: false, error: why, names: r.names, vals: r.vals, never: r.never, too_large: r.too_large
     };
 }
 
-/// Decode a header block, updating the dynamic table.
+/// Decode a header block, updating the dynamic table. A header list
+/// larger than HPACK_MAX_HEADER_LIST is an error ("header list too
+/// large"); use hpack_decode_limit to set the limit and keep the
+/// connection.
 pub fn hpack_decode(h: &mut Hpack, block: Vec<i64>) -> HpackHeaders {
+    val r: HpackHeaders = hpack_decode_limit(h, block, HPACK_MAX_HEADER_LIST);
+    if r.ok && r.too_large {
+        return hp_fail(r, "header list too large");
+    }
+    return r;
+}
+
+/// The list size of one field (RFC 9113 §6.5.2).
+fn hp_field_size(name: str, value: str) -> i64 {
+    return str_len(name) + str_len(value) + 32;
+}
+
+/// Decode a header block with a limit on the header list size (RFC 9113
+/// §6.5.2: each field's name and value lengths plus 32; our
+/// SETTINGS_MAX_HEADER_LIST_SIZE). The whole block is still decoded, so
+/// the dynamic table stays in step with the peer's encoder (RFC 9113
+/// §10.5.1), but once the list passes `max_list` no field is copied out
+/// any more: `too_large` is set and names/vals come back empty. The work
+/// and memory are bounded by the block's length and the table size, not
+/// by how often the block refers to a large entry.
+pub fn hpack_decode_limit(h: &mut Hpack, block: Vec<i64>, max_list: i64) -> HpackHeaders {
     hp_init();
     var r: HpackHeaders = HpackHeaders {
-        ok: true, error: "", names: Vec::new(), vals: Vec::new(), never: Vec::new(),
+        ok: true, error: "", names: Vec::new(), vals: Vec::new(), never: Vec::new(), too_large: false,
     };
     var pos: i64 = 0;
     var fields: i64 = 0;
+    var list: i64 = 0;
     while pos < block.len() {
         val b: i64 = block.get(pos);
         if (b & 128) != 0 {
@@ -1106,9 +1138,21 @@ pub fn hpack_decode(h: &mut Hpack, block: Vec<i64>) -> HpackHeaders {
             if pos < 0 || idx == 0 || !hpack_index_valid(h, idx) {
                 return hp_fail(r, "bad index");
             }
-            r.names.push(hpack_name_at(h, idx));
-            r.vals.push(hpack_value_at(h, idx));
-            r.never.push(false);
+            if !r.too_large {
+                val iname: str = hpack_name_at(h, idx);
+                val ivalue: str = hpack_value_at(h, idx);
+                list = list + hp_field_size(iname, ivalue);
+                if list > max_list {
+                    r.too_large = true;
+                    r.names = Vec::new();
+                    r.vals = Vec::new();
+                    r.never = Vec::new();
+                } else {
+                    r.names.push(iname);
+                    r.vals.push(ivalue);
+                    r.never.push(false);
+                }
+            }
             fields = fields + 1;
         } else if (b & 224) == 32 {
             // Dynamic table size update (6.3): only before the first field
@@ -1157,9 +1201,19 @@ pub fn hpack_decode(h: &mut Hpack, block: Vec<i64>) -> HpackHeaders {
             if mode == HPACK_INDEX {
                 hpack_table_add(h, name, value);
             }
-            r.names.push(name);
-            r.vals.push(value);
-            r.never.push(mode == HPACK_NEVER_INDEX);
+            if !r.too_large {
+                list = list + hp_field_size(name, value);
+                if list > max_list {
+                    r.too_large = true;
+                    r.names = Vec::new();
+                    r.vals = Vec::new();
+                    r.never = Vec::new();
+                } else {
+                    r.names.push(name);
+                    r.vals.push(value);
+                    r.never.push(mode == HPACK_NEVER_INDEX);
+                }
+            }
             fields = fields + 1;
         }
     }

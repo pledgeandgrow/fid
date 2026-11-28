@@ -1,0 +1,56 @@
+// XT32 clocks and random: clock_time_get (realtime in ms and us, the
+// monotonic clock), poll_oneoff on a relative clock (a sleep), random_get
+// (p_os_random_u64), and getpid / sysconf (no WASI call: constants, and
+// sysinfo from the linear memory's size). tests/wasm/wasi-check.sh runs it
+// under Node and compares the output with wasi_clock_random.expected.
+use task;
+
+extern "C" {
+    fn sysconf(name: i64) -> i64;
+}
+
+fn b(x: bool) -> str {
+    if x { return "t"; }
+    return "f";
+}
+
+fn main() -> i64 {
+    val now: i64 = p_clock_now_ms();
+    // after 2020-01-01, before 2100
+    println("c1 " + b(now > 1577836800000 && now < 4102444800000));
+    val us: i64 = p_clock_now_us();
+    println("c2 " + b(us / 1000 >= now - 1000 && us / 1000 <= now + 1000));
+    val m0: i64 = p_clock_mono_ms();
+    task_sleep(30);
+    val m1: i64 = p_clock_mono_ms();
+    println("s1 " + b(m1 - m0 >= 25) + " " + b(m1 - m0 < 5000));
+    // 16 random words: not all the same, both signs seen
+    val first: i64 = p_os_random_u64();
+    var differ: i64 = 0;
+    var neg: i64 = 0;
+    var i: i64 = 0;
+    while i < 16 {
+        val r: i64 = p_os_random_u64();
+        if r != first {
+            differ = differ + 1;
+        }
+        if r < 0 {
+            neg = neg + 1;
+        }
+        i = i + 1;
+    }
+    println("r1 " + b(differ >= 15) + " " + b(neg > 0 && neg < 16));
+    println("p1 " + b(p_getpid() > 0));
+    // _SC_PAGESIZE; _SC_PHYS_PAGES, _SC_AVPHYS_PAGES
+    var page: i64 = 0;
+    var phys: i64 = 0;
+    var avail: i64 = 0;
+    // SAFETY: sysconf takes any name and reads nothing of the program's
+    unsafe {
+        page = sysconf(30);
+        phys = sysconf(85);
+        avail = sysconf(86);
+    }
+    println("y1 " + b(page == 4096) + " " + b(phys > 0) + " " + b(avail > 0));
+    return 0;
+}

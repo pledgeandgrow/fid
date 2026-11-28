@@ -1,0 +1,90 @@
+// BG449 (docs/roadmap/bugs-roadmap.md): dlms_hdlc_parse checks the frame's
+// size before reading addresses, control and HCS (a short frame is
+// ok=false, not a panic), requires each address to end in a byte with its
+// low bit set (ISO 13239), and compares the format field's 11-bit frame
+// length with the bytes between the flags (IEC 62056-46).
+//
+// Expected output:
+// SNRM without FCS: ok=false
+// 5 bytes: ok=false
+// HCS cut by flag: ok=false
+// SNRM 7E A0 07 03 21 93 0F 01 7E: ok=true len=7 control=0x93 info=0
+// I-frame: ok=true len=12 control=0x10 info=3
+// length field +1, CRCs fixed: ok=false
+// length field -1, CRCs fixed: ok=false
+// unterminated address: ok=false
+// bad FCS: ok=false
+use dlms;
+
+fn show(name: str, b: &Vec<i64>) {
+    val f: HdlcFrame = dlms_hdlc_parse(b);
+    if f.ok {
+        println(name + ": ok=true len=" + int_to_str(f.frame_len) + " control=0x" + int_to_hex(f.control) + " info=" + int_to_str(f.info.len()));
+    } else {
+        println(name + ": ok=false");
+    }
+}
+
+fn vb(a: Vec<i64>, n: i64) -> Vec<i64> {
+    // the first n bytes of a
+    var out: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i < n {
+        out.push(a.get(i));
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Recompute HCS (after `hdr_end`, the index past control) and FCS of a
+/// frame whose bytes were changed, so only the change is wrong.
+fn fix_crcs(f: &mut Vec<i64>, hdr_end: i64) {
+    val hcs: i64 = dlms_crc(f, 1, hdr_end - 1);
+    f.set(hdr_end, hcs & 255);
+    f.set(hdr_end + 1, (hcs >> 8) & 255);
+    val fe: i64 = f.len() - 3;
+    val fcs: i64 = dlms_crc(f, 1, fe - 1);
+    f.set(fe, fcs & 255);
+    f.set(fe + 1, (fcs >> 8) & 255);
+}
+
+fn main() {
+    // the entry's trigger: SNRM with its FCS missing
+    var t: Vec<i64> = Vec::new();
+    t.push(0x7E); t.push(0xA0); t.push(0x07); t.push(0x03); t.push(0x21); t.push(0x93); t.push(0x7E);
+    show("SNRM without FCS", &t);
+    var t5: Vec<i64> = Vec::new();
+    t5.push(0x7E); t5.push(0xA0); t5.push(0x05); t5.push(0x03); t5.push(0x7E);
+    show("5 bytes", &t5);
+    var t8: Vec<i64> = Vec::new();
+    t8.push(0x7E); t8.push(0xA0); t8.push(0x06); t8.push(0x03); t8.push(0x21); t8.push(0x93); t8.push(0x01); t8.push(0x7E);
+    show("HCS cut by flag", &t8);
+    // a real SNRM (no information field: only the FCS)
+    var sn: Vec<i64> = Vec::new();
+    sn.push(0x7E); sn.push(0xA0); sn.push(0x07); sn.push(0x03); sn.push(0x21); sn.push(0x93); sn.push(0x0F); sn.push(0x01); sn.push(0x7E);
+    show("SNRM 7E A0 07 03 21 93 0F 01 7E", &sn);
+
+    var info: Vec<i64> = Vec::new();
+    info.push(0xE6); info.push(0xE6); info.push(0x00);
+    val good: Vec<i64> = dlms_hdlc_frame(1, 1, 0x10, 1, 0x10, &info);
+    show("I-frame", &good);
+    var longer: Vec<i64> = vb(good, good.len());
+    longer.set(2, longer.get(2) + 1);
+    fix_crcs(&mut longer, 6);
+    show("length field +1, CRCs fixed", &longer);
+    var shorter: Vec<i64> = vb(good, good.len());
+    shorter.set(2, shorter.get(2) - 1);
+    fix_crcs(&mut shorter, 6);
+    show("length field -1, CRCs fixed", &shorter);
+
+    // destination 02 02 02 02: four bytes, none with the end bit
+    var ua: Vec<i64> = Vec::new();
+    ua.push(0x7E); ua.push(0xA0); ua.push(0x0C); ua.push(0x02); ua.push(0x02); ua.push(0x02); ua.push(0x02);
+    ua.push(0x03); ua.push(0x13); ua.push(0); ua.push(0); ua.push(0); ua.push(0); ua.push(0x7E);
+    fix_crcs(&mut ua, 9);
+    show("unterminated address", &ua);
+
+    var bad: Vec<i64> = vb(good, good.len());
+    bad.set(good.len() - 2, bad.get(good.len() - 2) ^ 1);
+    show("bad FCS", &bad);
+}

@@ -691,6 +691,25 @@ fn wg_prim_params(name: str) -> i64 {
     return 0 - 1;
 }
 
+/// XT39: runtime functions whose work cannot happen under WASI, compiled
+/// as `return 0` (what they already come to here), so that what only they
+/// reach is left out of the module: FID_PROF's sampler (SIGPROF and a
+/// watcher thread; it returns at once without nat_sig_handler, which is 0
+/// here), SP16's stack limit (prlimit is ENOSYS), the signal stack and
+/// handlers (no signals: rt_sigaction is 0 and sigaltstack ENOSYS in
+/// wasi.fd), and CE8's frame values at a panic (nat_frame_fp is 0: no
+/// frame to read). FID_NAT_OFF=wnoop compiles them as they are.
+fn wg_wasi_noop(name: str) -> bool {
+    if name != "pe_prof_start" && name != "pe_main_stack_raise" && name != "pe_altstack_on" && name != "pe_sig_install" && name != "pe_dbg_frame_print" {
+        return false;
+    }
+    var off: str = p_getenv("FID_NAT_OFF");
+    if (off as i64) == 0 || str_len(off) == 0 {
+        return true;
+    }
+    return !str_contains("," + off + ",", ",wnoop,");
+}
+
 /// The WASI preview-1 functions the runtime's `wasi_<name>` externs name,
 /// with their signatures (i: i32, I: i64; after '>' the result).
 fn wg_wasi_sig(name: str) -> str {
@@ -1354,7 +1373,11 @@ fn wg_call_import(g: &mut WasmGen, ix: i64, args: &Vec<i64>) {
 /// interpreter's), -1 when it is not one (or the program or its runtime
 /// defines it)
 fn wg_bare_value(g: &WasmGen, name: str) -> i64 {
-    if wg_has_fn(g, name) || wg_has_fn(g, wg_resolve(g, name)) {
+    // XT28: only the program's own definition wins. The Linux runtime's
+    // pert_hlt, pert_inb, ... (base.fd, BG251) stop a native process with
+    // "Illegal instruction"; under WASI they do nothing, as in `fid run`
+    // (test_kernel_hello)
+    if wg_has_fn(g, name) {
         return 0 - 1;
     }
     if name == "p_cli" || name == "p_sti" || name == "p_lidt" || name == "p_idt_set_entry" || name == "p_hlt" || name == "p_outb" || name == "p_cr3_write" || name == "p_cr0_write" || name == "p_cr4_write" || name == "p_invlpg" || name == "p_page_map" || name == "p_page_unmap" || name == "p_phys_write64" || name == "p_lgdt" || name == "p_gdt_set_entry" || name == "p_serial_init" || name == "p_serial_write" {
@@ -1905,9 +1928,43 @@ fn wg_gen_binop(g: &mut WasmGen, id: i64, op: BinOp, left: i64, right: i64, ty: 
         }
         match op {
             BinOp::Mod => {
-                // WASM has no fmod: a - trunc(a / b) * b, which is C's fmod
-                // while a / b's integer part is exact (2g.13; it gave 0).
-                // A zero b or an infinite a gives NaN, as fmod does; an
+                // MI17 / XT28: C's fmod, the exact remainder: the runtime's
+                // pert_c_fmod (stdlib/linux_runtime/math.fd), as nat_ir
+                // calls it (env 0, the f64 bits of a and b; an f32 widened
+                // first, the result narrowed: the f64 remainder is exact).
+                // a - trunc(a / b) * b was wrong for a large quotient
+                // (1e300 % 7.0 gave 0, test_float_rem_exact).
+                if wg_has_fn(g, "pert_c_fmod") {
+                    wi64(g, 0);
+                    if mixed {
+                        wget_fx(g, func, left, false, narrow_res);
+                        wf_bits(g, false);
+                        wget_fx(g, func, right, false, narrow_res);
+                        wf_bits(g, false);
+                    } else if is32 {
+                        wget_f(g, left, true);
+                        w(g, 0xBB);
+                        wf_bits(g, false);
+                        wget_f(g, right, true);
+                        w(g, 0xBB);
+                        wf_bits(g, false);
+                    } else {
+                        wget(g, left);
+                        wget(g, right);
+                    }
+                    wg_call_named(g, "pert_c_fmod", 3);
+                    if narrow_res || is32 {
+                        // f64.reinterpret_i64, f32.demote_f64, as bits
+                        w(g, 0xBF);
+                        w(g, 0xB6);
+                        wf_bits(g, true);
+                    }
+                    wset(g, id);
+                    return;
+                }
+                // Without the runtime: a - trunc(a / b) * b, which is C's
+                // fmod while a / b's integer part is exact (2g.13; it gave
+                // 0). A zero b or an infinite a gives NaN, as fmod does; an
                 // infinite b gives NaN where fmod gives a.
                 if mixed {
                     // BG137: both as f64 bits
@@ -2146,6 +2203,366 @@ fn wg_epilogue(g: &mut WasmGen) {
     }
 }
 
+// ─── Allocas in locals (XT39) ──────────────────────────────────────────
+// An Alloca of a word or less whose address only Loads and Stores use (it
+// is never passed, stored, offset, compared or returned), every one of
+// them at the same width, keeps its value in its own local rather than in
+// a frame slot: a load is a local.get (extended as the memory load would
+// extend the bytes the stores wrote), a store a local.set. A function
+// whose Allocas all go has no frame: no stack-pointer update and no
+// stack-overflow check either. Smaller code, and no memory traffic.
+// FID_NAT_OFF=wpromote keeps every Alloca in the frame (as before).
+
+fn wg_promote_on() -> bool {
+    var off: str = p_getenv("FID_NAT_OFF");
+    if (off as i64) == 0 || str_len(off) == 0 {
+        return true;
+    }
+    return !str_contains("," + off + ",", ",wpromote,");
+}
+
+/// The bytes a Load of type `ty` reads (1, 2, 4 or 8)
+fn wg_load_width(module: &IrModule, ty: IrType) -> i64 {
+    var size: i64 = IrModule_type_size(module, ty);
+    if size <= 1 {
+        return 1;
+    }
+    if size == 2 || size == 4 {
+        return size;
+    }
+    return 8;
+}
+
+/// The value on the stack as a load of `width` bytes gives it back
+/// (sign- or zero-extended to 64 bits)
+fn wg_extend(g: &mut WasmGen, width: i64, unsigned: bool) {
+    if width >= 8 {
+        return;
+    }
+    if unsigned {
+        if width == 1 {
+            wi64(g, 255);
+        } else if width == 2 {
+            wi64(g, 65535);
+        } else {
+            wi64(g, 4294967295);
+        }
+        w(g, 0x83);
+        return;
+    }
+    if width == 1 {
+        w(g, 0xC2);
+    } else if width == 2 {
+        w(g, 0xC3);
+    } else {
+        w(g, 0xC4);
+    }
+}
+
+/// A Store's type: the explicit store type, else the pointee type, else
+/// the value's type (as the C backend, pe_ir and nat_ir)
+fn wg_store_type(func: &IrFunction, ptr: i64, value: i64, explicit_ty: OptIrType) -> IrType {
+    match explicit_ty {
+        OptIrType::Some(t0) => {
+            return t0;
+        }
+        OptIrType::None => {
+        }
+    }
+    match wg_meta_ty(func, ptr) {
+        IrType::Ptr(inner) => {
+            return box_ir_type_unbox(inner);
+        }
+        _ => {
+        }
+    }
+    return wg_meta_ty(func, value);
+}
+
+/// The bytes a Store of type `ty` writes: 1, 2, 4 or 8; 0 for a struct
+/// (copied with memory.copy)
+fn wg_store_width(module: &IrModule, ty: IrType) -> i64 {
+    match ty {
+        IrType::Struct(_) => {
+            return 0;
+        }
+        IrType::Array(_, _) => {
+            return 8;
+        }
+        IrType::Ptr(_) => {
+            return 8;
+        }
+        IrType::Opaque(_) => {
+            return 8;
+        }
+        IrType::Generic(_, _) => {
+            return 8;
+        }
+        _ => {
+        }
+    }
+    var s0: i64 = IrModule_type_size(module, ty);
+    if s0 == 1 || s0 == 2 || s0 == 4 {
+        return s0;
+    }
+    return 8;
+}
+
+/// The width of promoted Alloca `id`, 0 when it is not one
+fn wg_promoted_w(g: &WasmGen, id: i64) -> i64 {
+    if id < 0 || id >= g.alloca_off.len() {
+        return 0;
+    }
+    var off: i64 = g.alloca_off.get(id);
+    if off <= 0 - 100 {
+        return 0 - 100 - off;
+    }
+    return 0;
+}
+
+/// Every value id `inst` names (block ids too, which only makes the
+/// promotion more careful)
+fn wg_inst_ids(inst: Inst, out: &mut Vec<i64>) {
+    match inst {
+        Inst::BinOp(_, l, r, _) => {
+            out.push(l);
+            out.push(r);
+        }
+        Inst::UnaryOp(_, v, _) => {
+            out.push(v);
+        }
+        Inst::Load(p, _) => {
+            out.push(p);
+        }
+        Inst::Store(p, v, _) => {
+            out.push(p);
+            out.push(v);
+        }
+        Inst::StructCopy(d, s, _) => {
+            out.push(d);
+            out.push(s);
+        }
+        Inst::GetFieldPtr(p, _, _) => {
+            out.push(p);
+        }
+        Inst::GetElemPtr(p, ix, _) => {
+            out.push(p);
+            out.push(ix);
+        }
+        Inst::Branch(c, _, _) => {
+            out.push(c);
+        }
+        Inst::Switch(sv, _, _, _) => {
+            out.push(sv);
+        }
+        Inst::Return(rv) => {
+            match rv {
+                OptValueId::Some(v) => {
+                    out.push(v);
+                }
+                OptValueId::None => {
+                }
+            }
+        }
+        Inst::Call(_, args, _, _) => {
+            var i: i64 = 0;
+            while i < args.len() {
+                out.push(args.get(i));
+                i = i + 1;
+            }
+        }
+        Inst::CallPtr(fp, args, _, _, _) => {
+            out.push(fp);
+            var j: i64 = 0;
+            while j < args.len() {
+                out.push(args.get(j));
+                j = j + 1;
+            }
+        }
+        Inst::DynCall(_, _, args, _, _) => {
+            var k: i64 = 0;
+            while k < args.len() {
+                out.push(args.get(k));
+                k = k + 1;
+            }
+        }
+        Inst::MakeDyn(v, _, _) => {
+            out.push(v);
+        }
+        Inst::BitCast(v, _, _) => {
+            out.push(v);
+        }
+        Inst::IntExtend(v, _, _) => {
+            out.push(v);
+        }
+        Inst::IntTrunc(v, _, _) => {
+            out.push(v);
+        }
+        Inst::IntToFloat(v, _, _) => {
+            out.push(v);
+        }
+        Inst::FloatToInt(v, _, _) => {
+            out.push(v);
+        }
+        Inst::TryUnwrap(a, b, c, d) => {
+            out.push(a);
+            out.push(b);
+            out.push(c);
+            out.push(d);
+        }
+        Inst::Print(v, _) => {
+            out.push(v);
+        }
+        Inst::Asm(_, inputs, outputs, _) => {
+            var m: i64 = 0;
+            while m < inputs.len() {
+                out.push(inputs.get(m).id);
+                m = m + 1;
+            }
+            var o: i64 = 0;
+            while o < outputs.len() {
+                out.push(outputs.get(o).id);
+                o = o + 1;
+            }
+        }
+        Inst::PersistLoad(_, dv, _) => {
+            out.push(dv);
+        }
+        Inst::PersistSave(_, pv) => {
+            out.push(pv);
+        }
+        Inst::Backward(bv) => {
+            out.push(bv);
+        }
+        _ => {
+        }
+    }
+}
+
+/// Per value id of `func`: the width of each Alloca kept in its local, 0
+/// for every other id (see "Allocas in locals")
+fn wg_promote_widths(func: &IrFunction, module: &IrModule, maxid: i64) -> Vec<i64> {
+    // 0: not an Alloca; -1: one that stays in the frame; 9: one no Load or
+    // Store has used yet; else the width its uses have
+    var pw: Vec<i64> = Vec::new();
+    var i: i64 = 0;
+    while i <= maxid {
+        pw.push(0);
+        i = i + 1;
+    }
+    if !wg_promote_on() {
+        return pw;
+    }
+    var any: bool = false;
+    i = 0;
+    while i < func.insts.len() {
+        var ve: ValueIdInst = func.insts.get(i);
+        match ve.inst {
+            Inst::Alloca(aty, _) => {
+                var word: bool = true;
+                match aty {
+                    IrType::Struct(_) => {
+                        word = false;
+                    }
+                    IrType::Array(_, _) => {
+                        word = false;
+                    }
+                    _ => {
+                    }
+                }
+                var sz: i64 = IrModule_type_size(module, aty);
+                if word && sz >= 1 && sz <= 8 && ve.id >= 0 && ve.id <= maxid {
+                    pw.set(ve.id, 9);
+                    any = true;
+                }
+            }
+            _ => {
+            }
+        }
+        i = i + 1;
+    }
+    if !any {
+        return pw;
+    }
+    i = 0;
+    while i < func.insts.len() {
+        var ue: ValueIdInst = func.insts.get(i);
+        var other: bool = false;
+        match ue.inst {
+            Inst::Load(p, lty) => {
+                if p >= 0 && p <= maxid && pw.get(p) > 0 {
+                    var lw: i64 = wg_load_width(module, lty);
+                    match lty {
+                        IrType::Struct(_) => {
+                            lw = 0 - 1;
+                        }
+                        IrType::Array(_, _) => {
+                            lw = 0 - 1;
+                        }
+                        _ => {
+                        }
+                    }
+                    wg_promote_note(&mut pw, p, lw);
+                }
+            }
+            Inst::Store(p, v, ety) => {
+                if v >= 0 && v <= maxid && pw.get(v) != 0 {
+                    pw.set(v, 0 - 1);
+                }
+                if p >= 0 && p <= maxid && pw.get(p) > 0 {
+                    var sw: i64 = wg_store_width(module, wg_store_type(func, p, v, ety));
+                    if sw == 0 {
+                        sw = 0 - 1;
+                    }
+                    wg_promote_note(&mut pw, p, sw);
+                }
+            }
+            _ => {
+                other = true;
+            }
+        }
+        if other {
+            var ids: Vec<i64> = Vec::new();
+            wg_inst_ids(ue.inst, &mut ids);
+            var k: i64 = 0;
+            while k < ids.len() {
+                var x: i64 = ids.get(k);
+                if x >= 0 && x <= maxid && pw.get(x) != 0 {
+                    pw.set(x, 0 - 1);
+                }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    // what stays in the frame is no promotion; one never used is promoted
+    i = 0;
+    while i <= maxid {
+        if pw.get(i) < 0 {
+            pw.set(i, 0);
+        } else if pw.get(i) == 9 {
+            pw.set(i, 8);
+        }
+        i = i + 1;
+    }
+    return pw;
+}
+
+/// Alloca p used at width `wd` (-1: a use that keeps it in the frame)
+fn wg_promote_note(pw: &mut Vec<i64>, p: i64, wd: i64) {
+    var cur: i64 = pw.get(p);
+    if cur <= 0 {
+        return;
+    }
+    if wd < 0 {
+        pw.set(p, 0 - 1);
+    } else if cur == 9 {
+        pw.set(p, wd);
+    } else if cur != wd {
+        pw.set(p, 0 - 1);
+    }
+}
+
 fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFunction, module: &IrModule) {
     match inst {
         Inst::ConstInt(value, _) => {
@@ -2239,7 +2656,6 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
             }
         }
         Inst::Load(ptr, ty) => {
-            var size: i64 = IrModule_type_size(module, ty);
             var unsigned: bool = false;
             match ty {
                 IrType::U8 => {
@@ -2257,64 +2673,33 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
                 _ => {
                 }
             }
-            var lsize: i64 = 8;
-            if size <= 1 {
-                lsize = 1;
-            } else if size == 2 {
-                lsize = 2;
-            } else if size == 4 {
-                lsize = 4;
+            var lsize: i64 = wg_load_width(module, ty);
+            if wg_promoted_w(g, ptr) > 0 {
+                // XT39: a promoted Alloca's value is in its local; the
+                // load's extension as memory would give it
+                wget(g, ptr);
+                wg_extend(g, lsize, unsigned);
+                wset(g, id);
+                return;
             }
             wget(g, ptr);
             wload(g, lsize, !unsigned, 0);
             wset(g, id);
         }
         Inst::Store(ptr, value, explicit_ty) => {
-            // The explicit store type, else the pointee type, else the
-            // value's type (as the C backend, pe_ir and nat_ir)
-            var store_ty: IrType = IrType::I64;
-            var have: bool = false;
-            match explicit_ty {
-                OptIrType::Some(t0) => {
-                    store_ty = t0;
-                    have = true;
+            var store_ty: IrType = wg_store_type(func, ptr, value, explicit_ty);
+            var sz: i64 = wg_store_width(module, store_ty);
+            var is_struct: bool = sz == 0;
+            if wg_promoted_w(g, ptr) > 0 {
+                // XT39: into the promoted Alloca's local (its loads cut it
+                // to the width the stores have)
+                if ir_type_eq(store_ty, IrType::F32) {
+                    wget_f32bits(g, func, value);
+                } else {
+                    wget(g, value);
                 }
-                OptIrType::None => {
-                }
-            }
-            if !have {
-                match wg_meta_ty(func, ptr) {
-                    IrType::Ptr(inner) => {
-                        store_ty = box_ir_type_unbox(inner);
-                        have = true;
-                    }
-                    _ => {
-                    }
-                }
-            }
-            if !have {
-                store_ty = wg_meta_ty(func, value);
-            }
-            var sz: i64 = 8;
-            var is_struct: bool = false;
-            match store_ty {
-                IrType::Struct(_) => {
-                    is_struct = true;
-                }
-                IrType::Array(_, _) => {
-                }
-                IrType::Ptr(_) => {
-                }
-                IrType::Opaque(_) => {
-                }
-                IrType::Generic(_, _) => {
-                }
-                _ => {
-                    var s0: i64 = IrModule_type_size(module, store_ty);
-                    if s0 == 1 || s0 == 2 || s0 == 4 {
-                        sz = s0;
-                    }
-                }
+                wset(g, ptr);
+                return;
             }
             if is_struct {
                 wget_addr(g, ptr);
@@ -2484,6 +2869,12 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
                 IrType::Struct(_) => {
                     cp_sret = args.len() > 0;
                 }
+                // BG421: a fixed array result has its result pointer in
+                // args[0] too (lower.fd BG126; pe_ir peir_callptr_sret and
+                // nat_ir ng_callptr_sret treat Struct and Array alike)
+                IrType::Array(_, _) => {
+                    cp_sret = args.len() > 0;
+                }
                 _ => {
                 }
             }
@@ -2638,26 +3029,26 @@ fn wg_gen_inst(g: &mut WasmGen, id: i64, inst: Inst, last: bool, func: &IrFuncti
         }
         Inst::IntTrunc(value, _, to) => {
             wget(g, value);
+            // BG419: a signed target is sign-extended from its width
+            // (i64.extend8_s / 16_s / 32_s), as IntExtend's signed sources
+            // and M7's pe_ir / nat_ir movsx; masking gave `(-3) as i8` 253
             match to {
                 IrType::I8 => {
-                    wi64(g, 0xFF);
-                    w(g, 0x83);
+                    w(g, 0xC2);
                 }
                 IrType::U8 => {
                     wi64(g, 0xFF);
                     w(g, 0x83);
                 }
                 IrType::I16 => {
-                    wi64(g, 0xFFFF);
-                    w(g, 0x83);
+                    w(g, 0xC3);
                 }
                 IrType::U16 => {
                     wi64(g, 0xFFFF);
                     w(g, 0x83);
                 }
                 IrType::I32 => {
-                    wi64(g, 0xFFFFFFFF);
-                    w(g, 0x83);
+                    w(g, 0xC4);
                 }
                 IrType::U32 => {
                     wi64(g, 0xFFFFFFFF);
@@ -3632,7 +4023,10 @@ fn wg_gen_function(g: &mut WasmGen, name: str, func: &IrFunction, module: &IrMod
     g.t3 = nloc + 3;
     g.fp = nloc + 4;
     g.cur = nloc + 5;
-    // The frame: every Alloca's data, then the varargs area of spawns
+    // The frame: every Alloca's data, then the varargs area of spawns. XT39:
+    // an Alloca only loaded from and stored to is no frame slot: its value
+    // is its local (alloca_off -100 - width, wg_promote_widths)
+    var pw: Vec<i64> = wg_promote_widths(func, module, maxid);
     var cur: i64 = 0;
     g.va_off = 0 - 1;
     i = 0;
@@ -3640,13 +4034,17 @@ fn wg_gen_function(g: &mut WasmGen, name: str, func: &IrFunction, module: &IrMod
         var ve: ValueIdInst = func.insts.get(i);
         match ve.inst {
             Inst::Alloca(aty, _) => {
-                var dsize: i64 = IrModule_type_size(module, aty);
-                if dsize < 8 {
-                    dsize = 8;
+                if ve.id >= 0 && ve.id < pw.len() && pw.get(ve.id) > 0 {
+                    aoff.set(ve.id, 0 - 100 - pw.get(ve.id));
+                } else {
+                    var dsize: i64 = IrModule_type_size(module, aty);
+                    if dsize < 8 {
+                        dsize = 8;
+                    }
+                    dsize = (dsize + 7) & (0 - 8);
+                    aoff.set(ve.id, cur);
+                    cur = cur + dsize;
                 }
-                dsize = (dsize + 7) & (0 - 8);
-                aoff.set(ve.id, cur);
-                cur = cur + dsize;
             }
             Inst::Call(vname, _, _, _) => {
                 if vname == "p_thread_spawn" || vname == "p_co_async" || vname == "p_executor_spawn" {
@@ -4014,8 +4412,10 @@ fn wg_gen_primitive(g: &mut WasmGen, name: str) {
         // start: tasks run on the thread that waits for them. A task switch
         // within the thread (see "Tasks") unwinds through here with the
         // starter's thread pointer (local 9) saved, and rewinds through
-        // here.
-        if wg_has_fn(g, "pe_worker_main") {
+        // here. XT39: written after every other function (wasm_generate),
+        // so the table holds pe_worker_main exactly when the program names
+        // it (pe_co_workers): only then can it be the entry
+        if HashMap_contains(g.table_index, "pe_worker_main") {
             wlget(g, 0);
             wi64(g, wg_table_ref(g, "pe_worker_main"));
             w(g, 0x51);
@@ -4974,7 +5374,7 @@ fn wm_emit_inst(g: &mut WasmGen, rec: &NatFnRec, m: MInst, module: &IrModule) {
         wm_rget(g, m.r2);
         wm_rget(g, m.r0);
         wm_rget(g, m.r1);
-        wi64(g, 0); w(g, 0x52);
+        if m.i0 == 0 { wi64(g, 0); w(g, 0x52); } else { w(g, 0x50); }
         w(g, 0x1B);
         wm_rset(g, m.r0); return;
     }
@@ -5011,8 +5411,8 @@ fn wm_emit_inst(g: &mut WasmGen, rec: &NatFnRec, m: MInst, module: &IrModule) {
     if op == MO_SLOTADDR { wlget(g, g.fp); wi64(g, m.i0); w(g, 0x7C); wm_rset(g, m.r0); return; }
     if op == MO_LDSLOT { wlget(g, g.fp); wload(g, 8, false, m.i0); wm_rset(g, m.r0); return; }
     if op == MO_STSLOT { wlget(g, g.fp); wwrap(g); wm_rget(g, m.r0); wstore(g, 8, m.i0); return; }
-    if op == MO_LOAD { wm_rget(g, m.r1); wload(g, m.i0, m.i1 != 0, m.i2); wm_rset(g, m.r0); return; }
-    if op == MO_STORE { wm_rget(g, m.r0); wwrap(g); wm_rget(g, m.r1); wstore(g, m.i0, m.i1); return; }
+    if op == MO_LOAD { wm_rget(g, m.r1); wload(g, m.i1, m.i2 != 0, m.i0); wm_rset(g, m.r0); return; }
+    if op == MO_STORE { wm_rget(g, m.r0); wwrap(g); wm_rget(g, m.r1); wstore(g, m.i1, m.i0); return; }
     if op == MO_ADDR { wm_addr(g, m.i0, module); wm_rset(g, m.r0); return; }
     if op == MO_CALL {
         wm_call_mir(g, rec, m.i0);
@@ -5081,7 +5481,12 @@ fn wm_emit_inst(g: &mut WasmGen, rec: &NatFnRec, m: MInst, module: &IrModule) {
         wm_rset(g, m.r0); return;
     }
     if op == MO_F32BITS {
-        wm_push_float(g, m.r1, false); w(g, 0xB6); wm_set_float_bits(g, m.r0, true); return;
+        if m.i0 == 0 {
+            wm_push_float(g, m.r1, false); w(g, 0xB6); wm_set_float_bits(g, m.r0, true);
+        } else {
+            wm_push_float(g, m.r1, true); w(g, 0xBB); wm_set_float_bits(g, m.r0, false);
+        }
+        return;
     }
     if op == MO_LDIN {
         wlget(g, g.fp); wi64(g, g.frame); w(g, 0x7C); wload(g, 8, false, m.i0 * 8); wm_rset(g, m.r0); return;
@@ -5089,6 +5494,28 @@ fn wm_emit_inst(g: &mut WasmGen, rec: &NatFnRec, m: MInst, module: &IrModule) {
     if op == MO_STOUT {
         wlget(g, g.fp); wwrap(g); wm_rget(g, m.r0); wstore(g, 8, m.i0 * 8); return;
     }
+    if op == MO_VLD || op == MO_VST {
+        // WASM has no vector registers in this backend yet. Vector values live
+        // only inside one memory primitive with no call between load and store,
+        // so the 128 bytes after the main context record are enough scratch.
+        var vw: i64 = m.i1;
+        var voff: i64 = g.main_rec + 128 + m.i2 * 32;
+        var vo: i64 = 0;
+        while vo < vw {
+            if op == MO_VLD {
+                wi64(g, voff + vo); wwrap(g);
+                wm_rget(g, m.r1); wload(g, 1, false, m.i0 + vo);
+                wstore(g, 1, 0);
+            } else {
+                wm_rget(g, m.r0); wwrap(g);
+                wi64(g, voff + vo); wload(g, 1, false, 0);
+                wstore(g, 1, m.i0 + vo);
+            }
+            vo = vo + 1;
+        }
+        return;
+    }
+    if op == MO_VEND { return; }
     if op == MO_COPY { wm_copy(g, m.i0, m.r0, m.r1); return; }
     wm_badop(g, rec, op);
 }
@@ -5330,11 +5757,8 @@ fn wm_term(g: &mut WasmGen, rec: &NatFnRec, m: MInst, b: i64, nb: i64, labmap: i
     if b + 1 < nb { wm_jump_mir(g, b + 1); } else { wi64(g, 0); wm_epilogue(g); }
 }
 
-fn m_i1_entries(m: MInst) -> i64 {
-    return m.i1;
-}
-
 fn wm_gen_function(g: &mut WasmGen, name: str, module: &IrModule) {
+    g.b = Vec::new();
     var ri: i64 = HashMap_get(g.mir_rec_index, name) - 1;
     if ri < 0 {
         wu(g, 0);
@@ -5344,7 +5768,6 @@ fn wm_gen_function(g: &mut WasmGen, name: str, module: &IrModule) {
     }
     var rec0: NatFnRec = g.mir_recs.get(ri);
     g.cur_name = name;
-    g.b = Vec::new();
     g.extra = 0;
     g.as_here = false;
     g.as_fn = HashMap_contains(g.as_set, name);
@@ -5483,10 +5906,7 @@ fn wm_gen_function(g: &mut WasmGen, name: str, module: &IrModule) {
         while ii <= last {
             var mi: MInst = rec.mir.get(ii);
             var is_term: bool = ii == last && (mi.op == MO_JMP || mi.op == MO_BNEZ || mi.op == MO_BEQZ || mi.op == MO_BRCC || mi.op == MO_TBNZ || mi.op == MO_JTAB || mi.op == MO_JTE || mi.op == MO_EPILOGUE || mi.op == MO_TRAP);
-            if mi.op == MO_JTAB {
-                wm_term(g, &rec, mi, g.k, nb, labmap, ii);
-                ii = ii + m_i1_entries(mi);
-            } else if !is_term && mi.op != MO_JTE { wm_emit_inst(g, &rec, mi, module); }
+            if !is_term { wm_emit_inst(g, &rec, mi, module); }
             ii = ii + 1;
         }
         wm_term(g, &rec, rec.mir.get(last), g.k, nb, labmap, last);
@@ -5587,7 +6007,7 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
     wg_data_align(&mut g);
     g.main_rec = WG_DATA_BASE + g.data.len();
     var mr: i64 = 0;
-    while mr < 128 {
+    while mr < 256 {
         g.data.push(0);
         mr = mr + 1;
     }
@@ -5616,11 +6036,28 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
         wg_table_ref(&mut g, g.named_fns.get(nfi));
         nfi = nfi + 1;
     }
-    // Compile what _start reaches, as calls are met
+    // Compile what _start reaches, as calls are met. XT39: nat_clone_thread
+    // is written last (its place in the code kept), when every function
+    // that names pe_worker_main has been compiled: it refers to the
+    // scheduler's workers only when one does, so a program without tasks
+    // does not carry them (wg_gen_primitive).
     var qi: i64 = 0;
+    var clone_at: i64 = 0 - 1;
     while qi < g.queue.len() {
         var name: str = g.queue.get(qi);
-        if wg_has_fn(&g, name) {
+        if name == "nat_clone_thread" && !wg_has_fn(&g, name) {
+            clone_at = code.len();
+            nbodies = nbodies + 1;
+            qi = qi + 1;
+            continue;
+        }
+        if wg_has_fn(&g, name) && wg_wasi_noop(name) {
+            // XT39: runtime work WASI cannot do (wg_wasi_noop): returns 0
+            g.b = Vec::new();
+            wu(&mut g, 0);
+            wi64(&mut g, 0);
+            wend(&mut g);
+        } else if wg_has_fn(&g, name) {
             match IrModule_get_function(&module, name) {
                 OptIrFunction::Some(func) => {
                     if g.mir_mode {
@@ -5643,6 +6080,22 @@ pub fn wasm_generate(module: IrModule) -> ResultBytes {
         wb_append(&mut code, &g.b);
         nbodies = nbodies + 1;
         qi = qi + 1;
+    }
+    if clone_at >= 0 {
+        wg_gen_primitive(&mut g, "nat_clone_thread");
+        var spliced: Vec<i64> = Vec::new();
+        var ci: i64 = 0;
+        while ci < clone_at {
+            spliced.push(code.get(ci));
+            ci = ci + 1;
+        }
+        wb_uleb(&mut spliced, g.b.len());
+        wb_append(&mut spliced, &g.b);
+        while ci < code.len() {
+            spliced.push(code.get(ci));
+            ci = ci + 1;
+        }
+        code = spliced;
     }
     if g.mir_bad.len() > 0 {
         return ResultBytes::Err(c_vec1("wasm MIR backend: unsupported machine operations: " + str_join(g.mir_bad, ", ")));

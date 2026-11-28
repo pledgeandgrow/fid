@@ -65,7 +65,7 @@ Self-compile (`fid dump-c compiler/main.fd`, the compiler built through C):
 | macOS, ARM64, RISC-V and WASM are partial | F |
 | Safety annotations are not certified or fully enforced | K, L |
 | Safe code can still corrupt memory | M, K |
-| The package index is not public; VS Code Marketplace listing is external | N; external-roadmap N3 |
+| The package index is not public | N |
 
 ## Release gates
 

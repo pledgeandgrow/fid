@@ -1,0 +1,131 @@
+// BG437 (docs/roadmap/bugs-roadmap.md): x509_verify_chain tries every
+// trust anchor whose name matches the last certificate's issuer, so a
+// chain to one of two roots with the same subject (a re-keyed root next
+// to the old one) verifies whatever the anchor order;
+// x509_verify_chain_crl checks the CRL with the key of the anchor that
+// signed the certificate. Two self-signed P-256 roots "/CN=Same Root" and
+// a leaf signed by root2, made with openssl 3.5 (`openssl verify -CAfile
+// root1+root2` accepts the leaf; with the CRL that revokes it, rejects it).
+// Not on run: the ECDSA verifications take minutes in the interpreter.
+//@ backends: ccompile,emit
+//
+// Expected output:
+// parsed true true true true true
+// [root1, root2]: ok true
+// [root2, root1]: ok true
+// [root1]: ok false, bad signature
+// []: ok false, no trust anchor
+// chain [leaf, root2], [root1, root2]: ok true
+// crl [root1, root2] empty CRL: ok true
+// crl [root1, root2] revoking CRL: ok false, certificate revoked
+// crl [root2, root1] revoking CRL: ok false, certificate revoked
+use x509;
+use string;
+
+fn root1_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+        "MIIBbzCCARSgAwIBAgIUZ5u8glbXFDgKTbwyZHgCNNLF+e0wCgYIKoZIzj0EAwIw\n" +
+        "FDESMBAGA1UEAwwJU2FtZSBSb290MCAXDTI2MTEyNzE5MzUxNloYDzIxMjYxMTAz\n" +
+        "MTkzNTE2WjAUMRIwEAYDVQQDDAlTYW1lIFJvb3QwWTATBgcqhkjOPQIBBggqhkjO\n" +
+        "PQMBBwNCAATCd5UWPvvj5TU4KjfJ+sTvubzvv3UTJEl47n5ptJHkIYq/mRqiLBcW\n" +
+        "WVdSVomXNN8W8JLCicTJ2G778BEvOuQ4o0IwQDAPBgNVHRMBAf8EBTADAQH/MA4G\n" +
+        "A1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQUV5EWNjZGU6rfdyEtxTHkMLmMUwcwCgYI\n" +
+        "KoZIzj0EAwIDSQAwRgIhAOqhdwzObMKgWc6CTrNKxHWN0HoEbJ024RT53Gs3zjM6\n" +
+        "AiEAupOeu7n5hx1PuyJtvJFJTBnYgYdBlIFIFRBmJIs0a9Q=\n" +
+        "-----END CERTIFICATE-----\n";
+}
+
+fn root2_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+        "MIIBbzCCARSgAwIBAgIUNPjq10Plg6BBzhw9OA6avvuOg/AwCgYIKoZIzj0EAwIw\n" +
+        "FDESMBAGA1UEAwwJU2FtZSBSb290MCAXDTI2MTEyNzE5MzUxNloYDzIxMjYxMTAz\n" +
+        "MTkzNTE2WjAUMRIwEAYDVQQDDAlTYW1lIFJvb3QwWTATBgcqhkjOPQIBBggqhkjO\n" +
+        "PQMBBwNCAAR/nlnv9sP4LrVIPF7QXqj/eP3EFFb79/6xxt2bcUHCTRG4B/xIV3Dv\n" +
+        "wlKvsYY5be27Y0kd0Lo1JB9b473kqscNo0IwQDAPBgNVHRMBAf8EBTADAQH/MA4G\n" +
+        "A1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQU6EvpYEA96J4SI0QlNZ+6UIGy4CEwCgYI\n" +
+        "KoZIzj0EAwIDSQAwRgIhANgt8/KKD8cR843caXCI6FZ7zezWctjwfFOLQ8xu5kvK\n" +
+        "AiEArr+yyogsmNj8M69S9kWXDxTgFNtMSrsIENDtxr3qlX8=\n" +
+        "-----END CERTIFICATE-----\n";
+}
+
+fn leaf_pem() -> str {
+    return "-----BEGIN CERTIFICATE-----\n" +
+        "MIIBjDCCATKgAwIBAgIBAjAKBggqhkjOPQQDAjAUMRIwEAYDVQQDDAlTYW1lIFJv\n" +
+        "b3QwIBcNMjYxMTI3MTkzNTE2WhgPMjEyNTA2MjExOTM1MTZaMBwxGjAYBgNVBAMM\n" +
+        "EWxlYWYuZXhhbXBsZS50ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE32Cc\n" +
+        "CQJhKrmd9jx2nyI00d/ZztMHrAqhejhL8usm8hbqXE7dWWaYRkIWfLfiNhOsM8hh\n" +
+        "a01l9HQec4Uw285+YaNrMGkwCQYDVR0TBAIwADAcBgNVHREEFTATghFsZWFmLmV4\n" +
+        "YW1wbGUudGVzdDAdBgNVHQ4EFgQUX0ztI+A6FBLSRJR5I8b9klml4j4wHwYDVR0j\n" +
+        "BBgwFoAU6EvpYEA96J4SI0QlNZ+6UIGy4CEwCgYIKoZIzj0EAwIDSAAwRQIhAL5Q\n" +
+        "sEoTGjIVtCmVXHNb7LV6+yIZo9rAyWhdLpklt1LTAiB/eIZinIXJqFPWNt92wNWj\n" +
+        "ngqCOQxzS3puRS8JykQ9+g==\n" +
+        "-----END CERTIFICATE-----\n";
+}
+
+fn crl_empty_pem() -> str {
+    return "-----BEGIN X509 CRL-----\n" +
+        "MIGuMFUCAQEwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJU2FtZSBSb290Fw0yNjEx\n" +
+        "MjcxOTM1MzlaGA8yMTI1MDYyMTE5MzUzOVqgDjAMMAoGA1UdFAQDAgEBMAoGCCqG\n" +
+        "SM49BAMCA0kAMEYCIQC0eC6BiEPR2eIM9JW+6w7JiS1CkaMwV1Tgx8DCskkb8AIh\n" +
+        "AP9w+HpjgHIFUs1RJ/WCoW+Hm9G1836K1t8cRze4fnDT\n" +
+        "-----END X509 CRL-----\n";
+}
+
+fn crl_revoked_pem() -> str {
+    return "-----BEGIN X509 CRL-----\n" +
+        "MIHCMGsCAQEwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJU2FtZSBSb290Fw0yNjEx\n" +
+        "MjcxOTM1MzlaGA8yMTI1MDYyMTE5MzUzOVowFDASAgECFw0yNjExMjcxOTM1Mzla\n" +
+        "oA4wDDAKBgNVHRQEAwIBAjAKBggqhkjOPQQDAgNHADBEAiBU1YvExEbdAFwPhe0F\n" +
+        "Fz8AH8JyAuReY7A9jaSMwQ1eQgIgaVDiYPuX0A4Bf4+LR8dQmJW4qUMQkrGrwdw3\n" +
+        "pTTXAyA=\n" +
+        "-----END X509 CRL-----\n";
+}
+
+fn show(label: str, r: X509ChainResult) -> void {
+    if r.ok {
+        println(label + ": ok true");
+    } else {
+        println(label + ": ok false, " + r.err);
+    }
+}
+
+fn main() -> i64 {
+    val r1: X509Cert = x509_parse_pem(root1_pem());
+    val r2: X509Cert = x509_parse_pem(root2_pem());
+    val leaf: X509Cert = x509_parse_pem(leaf_pem());
+    val crl0: X509Crl = x509_crl_parse_pem(crl_empty_pem());
+    val crl1: X509Crl = x509_crl_parse_pem(crl_revoked_pem());
+    println("parsed " + bool_to_str(r1.ok) + " " + bool_to_str(r2.ok) + " " + bool_to_str(leaf.ok) + " " + bool_to_str(crl0.ok) + " " + bool_to_str(crl1.ok));
+    val now: i64 = 1800000000;
+    var chain: Vec<X509Cert> = Vec::new();
+    chain.push(leaf);
+    var a12: Vec<X509Cert> = Vec::new();
+    a12.push(r1);
+    a12.push(r2);
+    var a21: Vec<X509Cert> = Vec::new();
+    a21.push(r2);
+    a21.push(r1);
+    var a1: Vec<X509Cert> = Vec::new();
+    a1.push(r1);
+    var none: Vec<X509Cert> = Vec::new();
+    // the entry's trigger and its reverse order
+    show("[root1, root2]", x509_verify_chain(chain, a12, now));
+    show("[root2, root1]", x509_verify_chain(chain, a21, now));
+    // only the wrong root, and no root
+    show("[root1]", x509_verify_chain(chain, a1, now));
+    show("[]", x509_verify_chain(chain, none, now));
+    // the root sent in the chain too
+    var with_root: Vec<X509Cert> = Vec::new();
+    with_root.push(leaf);
+    with_root.push(r2);
+    show("chain [leaf, root2], [root1, root2]", x509_verify_chain(with_root, a12, now));
+    // CRLs of root2: the issuer for the CRL check is the anchor that signed
+    var c0: Vec<X509Crl> = Vec::new();
+    c0.push(crl0);
+    var c1: Vec<X509Crl> = Vec::new();
+    c1.push(crl1);
+    show("crl [root1, root2] empty CRL", x509_verify_chain_crl(chain, a12, now, c0, true));
+    show("crl [root1, root2] revoking CRL", x509_verify_chain_crl(chain, a12, now, c1, true));
+    show("crl [root2, root1] revoking CRL", x509_verify_chain_crl(chain, a21, now, c1, true));
+    return 0;
+}

@@ -189,6 +189,39 @@ pub fn semver_to_str(v: SemVer) -> str {
 
 // ─── Comparison (SemVer 2.0.0 §11; build metadata ignored) ──────────────
 
+// Compare two all-digit identifiers as numbers of any size: -1, 0 or 1.
+fn sv_num_compare(a: str, b: str) -> i64 {
+    var ia: i64 = 0;
+    while ia + 1 < str_len(a) && str_byte_at(a, ia) == 48 {
+        ia = ia + 1;
+    }
+    var ib: i64 = 0;
+    while ib + 1 < str_len(b) && str_byte_at(b, ib) == 48 {
+        ib = ib + 1;
+    }
+    var la: i64 = str_len(a) - ia;
+    var lb: i64 = str_len(b) - ib;
+    if la < lb {
+        return -1;
+    }
+    if la > lb {
+        return 1;
+    }
+    var k: i64 = 0;
+    while k < la {
+        var da: i64 = str_byte_at(a, ia + k);
+        var db: i64 = str_byte_at(b, ib + k);
+        if da < db {
+            return -1;
+        }
+        if da > db {
+            return 1;
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
 // Compare two pre-release identifier lists.
 // Numeric identifiers compare numerically and are lower than alphanumeric.
 fn sv_pre_compare(a: str, b: str) -> i64 {
@@ -215,22 +248,26 @@ fn sv_pre_compare(a: str, b: str) -> i64 {
         var na: bool = sv_all_digits(xa);
         var nb: bool = sv_all_digits(xb);
         if na && nb {
-            var va: i64 = str_parse_int(xa);
-            var vb: i64 = str_parse_int(xb);
-            if va < vb {
-                return -1;
-            }
-            if va > vb {
-                return 1;
+            // BG347: numerically at any size (str_parse_int gave 0 past
+            // i64, so two large identifiers compared equal): without leading
+            // zeros, the longer digit string is the larger number
+            var c: i64 = sv_num_compare(xa, xb);
+            if c != 0 {
+                return c;
             }
         } else if na && !nb {
             return -1;
         } else if !na && nb {
             return 1;
         } else {
+            // BG347: the sign only (str_compare is a byte difference, -31
+            // for "Beta" vs "alpha"); semver_compare promises -1/0/1
             var c: i64 = str_compare(xa, xb);
-            if c != 0 {
-                return c;
+            if c < 0 {
+                return -1;
+            }
+            if c > 0 {
+                return 1;
             }
         }
         i = i + 1;
@@ -352,6 +389,21 @@ fn sv_pad(version_text: str) -> str {
         n = n + 1;
     }
     return core + tail;
+}
+
+// How many of major.minor.patch `version_text` writes (1, 2 or 3), before
+// any pre-release or build suffix: "1" -> 1, "1.2" -> 2, "1.2.3-rc" -> 3.
+fn sv_field_count(version_text: str) -> i64 {
+    var core: str = version_text;
+    var plus: i64 = str_find(core, "+");
+    if plus >= 0 {
+        core = str_slice(core, 0, plus);
+    }
+    var dash: i64 = str_find(core, "-");
+    if dash >= 0 {
+        core = str_slice(core, 0, dash);
+    }
+    return str_split(core, ".").len();
 }
 
 /// True if version `v` satisfies range expression `range`.
@@ -479,19 +531,23 @@ fn sv_match_token(v: SemVer, t: str) -> bool {
 
     if c0 == 94 {
         // '^'
-        var c: SemVer = semver_parse(sv_pad(str_slice(t, 1, str_len(t))));
+        var ctext: str = str_slice(t, 1, str_len(t));
+        var c: SemVer = semver_parse(sv_pad(ctext));
         if !semver_is_valid(c) {
             return false;
         }
         if semver_compare(v, c) < 0 {
             return false;
         }
-        // Upper bound: bump left-most non-zero component.
+        // Upper bound: bump left-most non-zero component among the fields
+        // written; a missing field is a prefix bound (npm, Cargo: ^0 <1.0.0,
+        // ^0.0 <0.1.0, ^1.2 <2.0.0; BG312).
+        var nf: i64 = sv_field_count(ctext);
         var hi: SemVer = SemVer {
             major: c.major + 1, minor: 0, patch: 0, pre: "", build: ""
         };
-        if c.major == 0 {
-            if c.minor > 0 {
+        if c.major == 0 && nf >= 2 {
+            if c.minor > 0 || nf == 2 {
                 hi = SemVer {
                     major: 0, minor: c.minor + 1, patch: 0, pre: "", build: ""
                 };
@@ -505,7 +561,8 @@ fn sv_match_token(v: SemVer, t: str) -> bool {
     }
     if c0 == 126 {
         // '~'
-        var c2: SemVer = semver_parse(sv_pad(str_slice(t, 1, str_len(t))));
+        var c2text: str = str_slice(t, 1, str_len(t));
+        var c2: SemVer = semver_parse(sv_pad(c2text));
         if !semver_is_valid(c2) {
             return false;
         }
@@ -515,6 +572,12 @@ fn sv_match_token(v: SemVer, t: str) -> bool {
         var hi2: SemVer = SemVer {
             major: c2.major, minor: c2.minor + 1, patch: 0, pre: "", build: ""
         };
+        if sv_field_count(c2text) == 1 {
+            // ~1 := >=1.0.0 <2.0.0 (npm, Cargo; BG312)
+            hi2 = SemVer {
+                major: c2.major + 1, minor: 0, patch: 0, pre: "", build: ""
+            };
+        }
         return semver_compare(v, hi2) < 0;
     }
     // Longest-first operator prefix match.

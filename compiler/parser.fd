@@ -2015,7 +2015,9 @@ impl Parser {
                     init = Expr::IntLit(0);
                 }
                 Type::Bool => {
-                    init = Expr::IntLit(0);
+                    // a bool literal, so the BG262 initializer check sees
+                    // a bool (an IntLit(0) here read as "i8 to bool")
+                    init = Expr::BoolLit(false);
                 }
                 Type::F64 => {
                     init = Expr::FloatLit(0.0);
@@ -5215,6 +5217,11 @@ impl Parser {
             // once so the inner fallthrough matches never re-evaluate it.
             var vstmts: Vec<Stmt> = Vec::new();
             vstmts.push(Stmt::Let("__ms", OptType::None, expr, false, false, Vec::new(), line));
+            // BG264: the original arms' exhaustiveness (pd_np_probe_stmt)
+            var probe: Vec<Stmt> = pd_np_probe_stmt("__ms", arms, nests, line);
+            if probe.len() > 0 {
+                vstmts.push(probe.get(0));
+            }
             arms = self.pd_desugar_arms("__ms", arms, nests, marks, 0, line, false);
             vstmts.push(Stmt::Match(Expr::Ident("__ms"), arms, line));
             return ParseResultStmt::Ok(Stmt::If(Expr::BoolLit(true), vstmts, OptStmts::None, line));
@@ -5458,7 +5465,7 @@ impl Parser {
                 }
             }
             self.match_tok(TokenKind::Semicolon);
-            return ParseResultStmt::Ok(Stmt::LetTuple(names, expr, line));
+            return ParseResultStmt::Ok(Stmt::LetTuple(names, expr, line, is_mut));
         }
 
         var name: str = "";
@@ -7897,7 +7904,22 @@ impl Parser {
             if scrut2 == "" {
                 return ParseResultExpr::Err("Parse error at " + int_to_str(pat_line) + ": nested patterns in match expressions need a variable scrutinee\n    Fix: bind the value first, `val v = expr;`, then `match v { ... }`");
             }
+            // BG264: the original arms' exhaustiveness (pd_np_probe_stmt),
+            // checked at the start of the first arm unless its pattern
+            // binds the scrutinee's name
+            var probe2: Vec<Stmt> = pd_np_probe_stmt(scrut2, arms, nests, pat_line);
             arms = self.pd_desugar_arms(scrut2, arms, nests, marks, 0, pat_line, true);
+            if probe2.len() > 0 && arms.len() > 0 && !pd_np_binds(arms.get(0).pattern, scrut2) {
+                var a0: MatchArm = arms.get(0);
+                var nb: Vec<Stmt> = Vec::new();
+                nb.push(probe2.get(0));
+                var bi: i64 = 0;
+                while bi < a0.body.len() {
+                    nb.push(a0.body.get(bi));
+                    bi = bi + 1;
+                }
+                arms.set(0, MatchArm_new(a0.pattern, a0.guard, nb));
+            }
             return ParseResultExpr::Ok(Expr::Match(Box::new(Expr::Ident(scrut2)), arms));
         }
         return ParseResultExpr::Ok(Expr::Match(Box::new(expr), arms));
@@ -9434,53 +9456,40 @@ impl Parser {
 
         while i < len {
             var c: i64 = str_byte_at(raw, i);
-            if c == 123 {
+            if c == 92 && i + 1 < len {
+                // BG209: a `\` marks a text byte the lexer decoded from an
+                // escape (`\x7B`, `\u{7d}`, `\\`): text, not a brace
+                current = current + byte_to_str(str_byte_at(raw, i + 1));
+                i = i + 2;
+            } else if c == 123 {
                 // '{' -- start of interpolation
                 if str_len(current) > 0 {
                     parts.push(FStringPart::Literal(current));
                     current = "";
                 }
-                // Read expression until matching '}'
+                // The expression runs to the matching '}'; a string or
+                // char literal in it is skipped whole (BG210, BG211)
                 i = i + 1;
-                var expr_src: str = "";
-                var depth: i64 = 1;
-                while i < len {
-                    var c2: i64 = str_byte_at(raw, i);
-                    if c2 == 123 {
-                        depth = depth + 1;
-                        expr_src = expr_src + byte_to_str(c2);
-                        i = i + 1;
-                    } else if c2 == 125 {
-                        depth = depth - 1;
-                        if depth == 0 {
-                            i = i + 1;
-                            break;
-                        }
-                        expr_src = expr_src + byte_to_str(c2);
-                        i = i + 1;
-                    } else {
-                        expr_src = expr_src + byte_to_str(c2);
-                        i = i + 1;
-                    }
-                }
+                var e_end: i64 = lex_fstr_expr_end(raw, len, i);
+                var expr_src: str = str_slice(raw, i, e_end);
+                i = e_end + 1;
                 // A ':' at brace depth 0 (not a `::` path, not inside
-                // brackets or a nested string) splits the expression from a
-                // format specifier (`{x:.2}`, `{n:5}`, `{x:#x}`, §1.8)
+                // brackets or a nested string or char literal) splits the
+                // expression from a format specifier (`{x:.2}`, `{n:5}`,
+                // `{x:#x}`, §1.8)
                 var spec_at: i64 = -1;
                 var sd: i64 = 0;
                 var sj: i64 = 0;
-                var sin: bool = false;
                 var es_len: i64 = str_len(expr_src);
                 while sj < es_len {
                     var sc: i64 = str_byte_at(expr_src, sj);
-                    if sin {
-                        if sc == 92 {
-                            sj = sj + 1;
-                        } else if sc == 34 {
-                            sin = false;
-                        }
-                    } else if sc == 34 {
-                        sin = true;
+                    var lit_end: i64 = sj + 1;
+                    if sc == 34 || sc == 39 || sc == 102 || sc == 114 {
+                        lit_end = lex_fstr_lit_end(expr_src, es_len, sj);
+                    }
+                    if lit_end > sj + 1 {
+                        // a literal: a `:` or bracket in it is its own
+                        sj = lit_end - 1;
                     } else if sc == 123 || sc == 91 || sc == 40 {
                         sd = sd + 1;
                     } else if sc == 125 || sc == 93 || sc == 41 {
@@ -9514,6 +9523,11 @@ impl Parser {
                 // (0, the shared one, otherwise)
                 sub_lexer.own_kw = self.own_kw;
                 var sub_tokens: Vec<Token> = sub_lexer.tokenize();
+                // BG210: an error of the expression's own lexing (`'` with
+                // no character, `"\q"`) is the program's, not dropped
+                if sub_lexer.errors.len() > 0 {
+                    return ParseResultExpr::Err("Parse error at " + int_to_str(line) + ":" + int_to_str(col) + ": in the f-string expression `{" + expr_src + "}`: " + parse_fstr_lex_fix(sub_lexer.errors.get(0)));
+                }
                 var sub_parser: Parser = Parser::new(sub_tokens);
                 // SP9: a parse on a worker thread: the expression's parse
                 // reads and adds to this parse's import set, calls and
@@ -9573,6 +9587,31 @@ impl Parser {
 }
 // close impl Parser block
 
+/// BG210: a lexer error of an f-string's expression (`Error:L:C: text`,
+/// placed in the expression alone) as the f-string's error: its text and
+/// its Fix line, without the expression's own position.
+fn parse_fstr_lex_fix(e: str) -> str {
+    var n: i64 = str_len(e);
+    var k: i64 = 0;
+    var colons: i64 = 0;
+    if str_starts_with(e, "Error:") {
+        while k < n && colons < 3 {
+            if str_byte_at(e, k) == 58 {
+                colons = colons + 1;
+            }
+            k = k + 1;
+        }
+        while k < n && str_byte_at(e, k) == 32 {
+            k = k + 1;
+        }
+    }
+    var msg: str = str_slice(e, k, n);
+    if str_find(msg, "Fix:") < 0 {
+        msg = msg + "\n    Fix: write the expression in the braces as it would be written outside the f-string";
+    }
+    return msg;
+}
+
 pub fn Parser_with_names(tokens: Vec<Token>, struct_names: Vec<str>, enum_names: Vec<str>) -> Parser {
     // Build HashMaps for O(1) name lookup (string interning)
     var sn_set: i64 = HashMap_new();
@@ -9602,6 +9641,302 @@ pub fn vec_str_join(v: Vec<str>, sep: str) -> str {
         i = i + 1;
     }
     return result;
+}
+
+// BG264: the exhaustiveness probe of a match with nested patterns. The
+// desugaring (pd_desugar_arms) ends every inner match with a `_` arm that
+// re-matches the rest, so the type checker's one-level check sees only
+// complete matches: `Some(Ok(x))` + `None` passed and panicked on
+// `Some(Err(..))`. Before desugaring, the original arms are compiled into a
+// tree of one-level matches with empty bodies (rows specialized by each
+// constructor of a column, as a match compiler does), put under `if false`:
+// the type checker's check_exhaustive then reports the missing variant of
+// the nested position. A column's `_` arm (rows that cover every value) is
+// added without checking those rows further, so the probe can miss a case
+// but never rejects an exhaustive match. Guarded arms cover nothing, as in
+// check_exhaustive.
+fn pd_np_lookup(nests: Vec<PatNest>, name: str) -> Pattern {
+    if str_starts_with(name, "__np") {
+        var i: i64 = 0;
+        while i < nests.len() {
+            if nests.get(i).name == name {
+                return nests.get(i).pat;
+            }
+            i = i + 1;
+        }
+    }
+    return Pattern::Wildcard;
+}
+
+// A pattern's constructor: "" when it covers every value (`_`, a binding),
+// "#" when it is a literal (covers no constructor), else the variant name
+// or `true`/`false`. A bare name is a constructor only for the variants of
+// Option and Result (anything else may be a binding).
+fn pd_np_ctor(p: Pattern) -> str {
+    match p {
+        Pattern::Wildcard => {
+            return "";
+        }
+        Pattern::Ident(n) => {
+            if n == "None" || n == "Some" || n == "Ok" || n == "Err" {
+                return n;
+            }
+            return "";
+        }
+        Pattern::EnumVariant(_, v, _) => {
+            return v;
+        }
+        Pattern::BoolLit(b) => {
+            if b {
+                return "true";
+            }
+            return "false";
+        }
+        _ => {
+            return "#";
+        }
+    }
+    return "#";
+}
+
+fn pd_np_arity(p: Pattern) -> i64 {
+    match p {
+        Pattern::EnumVariant(_, _, bs) => {
+            return bs.len();
+        }
+        _ => {
+        }
+    }
+    return 0;
+}
+
+fn pd_np_subs(p: Pattern, n: i64, nests: Vec<PatNest>) -> Vec<Pattern> {
+    var out: Vec<Pattern> = Vec::new();
+    match p {
+        Pattern::EnumVariant(_, _, bs) => {
+            var i: i64 = 0;
+            while i < bs.len() {
+                out.push(pd_np_lookup(nests, bs.get(i).name));
+                i = i + 1;
+            }
+        }
+        _ => {
+        }
+    }
+    while out.len() < n {
+        out.push(Pattern::Wildcard);
+    }
+    return out;
+}
+
+fn pd_np_probe(rows: Vec<Vec<Pattern>>, cols: Vec<str>, nests: Vec<PatNest>, ctr: &mut i64, line: i64) -> Vec<Stmt> {
+    var out: Vec<Stmt> = Vec::new();
+    if cols.len() == 0 || rows.len() == 0 {
+        return out;
+    }
+    var rest_cols: Vec<str> = Vec::new();
+    var c: i64 = 1;
+    while c < cols.len() {
+        rest_cols.push(cols.get(c));
+        c = c + 1;
+    }
+    var ctors: Vec<str> = Vec::new();
+    var firsts: Vec<Pattern> = Vec::new();
+    var arity: Vec<i64> = Vec::new();
+    var has_wild: bool = false;
+    var r: i64 = 0;
+    while r < rows.len() {
+        var p: Pattern = rows.get(r).get(0);
+        var k: str = pd_np_ctor(p);
+        if k == "" {
+            has_wild = true;
+        } else if k != "#" {
+            var idx: i64 = 0 - 1;
+            var q: i64 = 0;
+            while q < ctors.len() {
+                if ctors.get(q) == k {
+                    idx = q;
+                }
+                q = q + 1;
+            }
+            var n: i64 = pd_np_arity(p);
+            if idx < 0 {
+                ctors.push(k);
+                firsts.push(p);
+                arity.push(n);
+            } else if n > arity.get(idx) {
+                arity.set(idx, n);
+            }
+        }
+        r = r + 1;
+    }
+    if ctors.len() == 0 {
+        // nothing to check in this column: the rows that cover every value
+        // go on to the next one
+        var drows: Vec<Vec<Pattern>> = Vec::new();
+        r = 0;
+        while r < rows.len() {
+            var row: Vec<Pattern> = rows.get(r);
+            if pd_np_ctor(row.get(0)) == "" {
+                var nr: Vec<Pattern> = Vec::new();
+                var j: i64 = 1;
+                while j < row.len() {
+                    nr.push(row.get(j));
+                    j = j + 1;
+                }
+                drows.push(nr);
+            }
+            r = r + 1;
+        }
+        return pd_np_probe(drows, rest_cols, nests, ctr, line);
+    }
+    var arms: Vec<MatchArm> = Vec::new();
+    var ci: i64 = 0;
+    while ci < ctors.len() {
+        var k2: str = ctors.get(ci);
+        var n2: i64 = arity.get(ci);
+        var names: Vec<str> = Vec::new();
+        var bindings: Vec<Binding> = Vec::new();
+        var j2: i64 = 0;
+        while j2 < n2 {
+            var nm: str = "__pq" + int_to_str(*ctr);
+            *ctr = *ctr + 1;
+            names.push(nm);
+            bindings.push(Binding_new(nm, ""));
+            j2 = j2 + 1;
+        }
+        var spec: Vec<Vec<Pattern>> = Vec::new();
+        r = 0;
+        while r < rows.len() {
+            var row2: Vec<Pattern> = rows.get(r);
+            var kk: str = pd_np_ctor(row2.get(0));
+            if kk == k2 || kk == "" {
+                var nr2: Vec<Pattern> = Vec::new();
+                if kk == k2 {
+                    nr2 = pd_np_subs(row2.get(0), n2, nests);
+                } else {
+                    var w: i64 = 0;
+                    while w < n2 {
+                        nr2.push(Pattern::Wildcard);
+                        w = w + 1;
+                    }
+                }
+                var j3: i64 = 1;
+                while j3 < row2.len() {
+                    nr2.push(row2.get(j3));
+                    j3 = j3 + 1;
+                }
+                spec.push(nr2);
+            }
+            r = r + 1;
+        }
+        var sub_cols: Vec<str> = names;
+        var j4: i64 = 0;
+        while j4 < rest_cols.len() {
+            sub_cols.push(rest_cols.get(j4));
+            j4 = j4 + 1;
+        }
+        var body: Vec<Stmt> = pd_np_probe(spec, sub_cols, nests, ctr, line);
+        var pat: Pattern = firsts.get(ci);
+        if n2 > 0 {
+            match firsts.get(ci) {
+                Pattern::EnumVariant(en, v, _) => {
+                    pat = Pattern::EnumVariant(en, v, bindings);
+                }
+                _ => {
+                    pat = Pattern::EnumVariant("", k2, bindings);
+                }
+            }
+        }
+        arms.push(MatchArm_new(pat, OptBoxExpr::None, body));
+        ci = ci + 1;
+    }
+    if has_wild {
+        arms.push(MatchArm_new(Pattern::Wildcard, OptBoxExpr::None, Vec::new()));
+    }
+    out.push(Stmt::Match(Expr::Ident(cols.get(0)), arms, line));
+    return out;
+}
+
+// The probe of a match on `scrut` with arms `arms` (before desugaring), as
+// one `if false { ... }` statement; none when no arm has a nested pattern
+// position worth checking.
+fn pd_np_probe_stmt(scrut: str, arms: Vec<MatchArm>, nests: Vec<PatNest>, line: i64) -> Vec<Stmt> {
+    var rows: Vec<Vec<Pattern>> = Vec::new();
+    var i: i64 = 0;
+    while i < arms.len() {
+        var a: MatchArm = arms.get(i);
+        var guarded: bool = false;
+        match a.guard {
+            OptBoxExpr::Some(_) => {
+                guarded = true;
+            }
+            OptBoxExpr::None => {
+            }
+        }
+        if !guarded {
+            var row: Vec<Pattern> = Vec::new();
+            row.push(a.pattern);
+            rows.push(row);
+        }
+        i = i + 1;
+    }
+    var cols: Vec<str> = Vec::new();
+    cols.push(scrut);
+    var ctr: i64 = 0;
+    var probe: Vec<Stmt> = pd_np_probe(rows, cols, nests, &mut ctr, line);
+    var out: Vec<Stmt> = Vec::new();
+    if probe.len() > 0 {
+        // the outer variants are the real match's to check (one error,
+        // not two): the probe's top level gets a `_` arm
+        match probe.get(0) {
+            Stmt::Match(pe, parms, pl) => {
+                var top: Vec<MatchArm> = parms;
+                var lastw: bool = false;
+                if top.len() > 0 {
+                    match top.get(top.len() - 1).pattern {
+                        Pattern::Wildcard => {
+                            lastw = true;
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                if !lastw {
+                    top.push(MatchArm_new(Pattern::Wildcard, OptBoxExpr::None, Vec::new()));
+                }
+                probe = Vec::new();
+                probe.push(Stmt::Match(pe, top, pl));
+            }
+            _ => {
+            }
+        }
+        out.push(Stmt::If(Expr::BoolLit(false), probe, OptStmts::None, line));
+    }
+    return out;
+}
+
+// Whether the outer pattern of an arm binds `name` (the probe of a match
+// expression goes into its first arm, where such a binding would hide the
+// scrutinee).
+fn pd_np_binds(p: Pattern, name: str) -> bool {
+    match p {
+        Pattern::Ident(n) => {
+            return n == name;
+        }
+        Pattern::EnumVariant(_, _, bs) => {
+            var i: i64 = 0;
+            while i < bs.len() {
+                if bs.get(i).name == name {
+                    return true;
+                }
+                i = i + 1;
+            }
+        }
+        _ => {
+        }
+    }
+    return false;
 }
 
 fn pd_has_cfg(f: Func) -> bool {

@@ -1,0 +1,87 @@
+// BG246 (docs/roadmap/bugs-roadmap.md): a call through a function value
+// (CallPtr) passes an f64 argument to an f32 parameter of the function
+// type. The direct call converts it (pe_ir from the callee's parameters);
+// the indirect one has no callee to look at, and pe_ir and --nat passed
+// the f64's bits, which the callee read as an f32 (0). Now the lowering
+// converts each float argument to the width the function type declares.
+// The functions are chosen at run time, so no pass can make the calls
+// direct.
+//
+// Expected output:
+// 2.5
+// 1.5
+// 321
+// 4.5
+// 3
+// 54321
+fn half(x: f32) -> f32 {
+    return x / 2.0;
+}
+
+fn third(x: f32) -> f32 {
+    return x / 3.0;
+}
+
+fn mix(a: f32, b: f64, c: f32) -> f64 {
+    return (a as f64) + b * 10.0 + (c as f64) * 100.0;
+}
+
+fn mix2(a: f32, b: f64, c: f32) -> f64 {
+    return (a as f64) * 2.0 + b + (c as f64);
+}
+
+fn five(a: f32, b: f32, c: f32, d: f32, e: f32) -> f64 {
+    return (a as f64) + (b as f64) * 10.0 + (c as f64) * 100.0 + (d as f64) * 1000.0 + (e as f64) * 10000.0;
+}
+
+fn five2(a: f32, b: f32, c: f32, d: f32, e: f32) -> f64 {
+    return 0.0;
+}
+
+fn pick(n: i64) -> fn(f32) -> f32 {
+    if n > 100 {
+        return third;
+    }
+    return half;
+}
+
+fn pick3(n: i64) -> fn(f32, f64, f32) -> f64 {
+    if n > 100 {
+        return mix2;
+    }
+    return mix;
+}
+
+fn pick5(n: i64) -> fn(f32, f32, f32, f32, f32) -> f64 {
+    if n > 100 {
+        return five2;
+    }
+    return five;
+}
+
+fn apply(f: fn(f32) -> f32, v: f64) -> f32 {
+    return f(v);
+}
+
+fn main() {
+    // n stays 0 unless the program is given six arguments
+    var n: i64 = 0;
+    match arg_at(5) {
+        Option::Some(_) => {
+            n = 200;
+        }
+        Option::None => {
+        }
+    }
+    val f: fn(f32) -> f32 = pick(n);
+    val d: f64 = 5.0;
+    println(f(d));
+    println(f(3.0));
+    val g: fn(f32, f64, f32) -> f64 = pick3(n);
+    println(g(1.0, 2.0, 3.0));
+    println(apply(pick(n), 9.0));
+    val k: f64 = 6.0;
+    println(apply(pick(n), k));
+    val h: fn(f32, f32, f32, f32, f32) -> f64 = pick5(n);
+    println(h(1.0, 2.0, 3.0, 4.0, 5.0));
+}

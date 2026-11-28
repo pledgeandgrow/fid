@@ -1,0 +1,118 @@
+// BG243 (docs/roadmap/bugs-roadmap.md): pe_ir's debug build keeps a line
+// row for each line of an inlined body that folding left no code
+// (compiler/pe_ir.fd peir_inl_setup / PeirGen_inl_nops: a one-byte nop per
+// line, before the first instruction kept after the body) and records the
+// call's range for its DW_TAG_inlined_subroutine (peir_inl_note). A
+// hand-made module: `main` (declared on line 2 of SRC below) into which
+// iropt.fd recorded `twice` (line 6) inlined at line 3, its body (lines 7
+// and 8) folded to the constant 42 the call left, plus a record of a
+// callee from no file of the input (skipped). The image is written to
+// $PE_INL_OUT (and the build without records to $PE_INL_OUT_PLAIN) for
+// tests/nattools/pe_inl_nops_check.py, which reads their .debug_line and
+// .debug_info.
+// Run (from the repository root):
+//   fid run tests/nattools/pe_inl_nops_unit.fd
+// Expected output:
+// built true
+// rows 7n 8n then 3
+// inlined twice true
+// range of the nops true
+// no file, no record true
+// without records: none true
+use core;
+use vec;
+use string;
+use file;
+use compiler::ast;
+use compiler::ir;
+use compiler::iropt;
+use compiler::pe_ir_stubs;
+use compiler::pe_ir;
+
+fn src() -> str {
+    return "\nfn main() {\n    var x: i64 = twice(21);\n    println(x);\n}\nfn twice(n: i64) -> i64 {\n    var d: i64 = n * 2;\n    return d;\n}\n";
+}
+
+/// main: the call's constant (line 3: the call, folded), a return.
+fn module() -> IrModule {
+    var m: IrModule = IrModule_new();
+    var f: IrFunction = IrFunction_new("main", IrType::Void);
+    var c: i64 = IrFunction_emit_line(&mut f, Inst::ConstInt(42, IrType::I64), OptU64::Some(3));
+    var r: i64 = IrFunction_emit_line(&mut f, Inst::Return(OptValueId::None), OptU64::Some(5));
+    IrModule_add_function(&mut m, f);
+    return m;
+}
+
+/// The rows of lines 7 and 8 of the last build (rows_text).
+var g_unit_rows: str = "";
+
+/// The rows [offset, line, end] the generator made, as "7n 8n then 3":
+/// the lines 7 and 8, each marked n when its byte is a nop, then the
+/// next row's line.
+fn rows_text(g: &PeirGen) -> str {
+    var out: str = "";
+    var k: i64 = 0;
+    var after: bool = false;
+    while k + 2 < g.lrows.len() {
+        var at: i64 = g.lrows.get(k);
+        var ln: i64 = g.lrows.get(k + 1);
+        if ln == 7 || ln == 8 {
+            var nop: bool = at < g.enc.code.len() && g.enc.code.get(at) == 0x90;
+            var mark: str = "?";
+            if nop {
+                mark = "n";
+            }
+            out = out + int_to_str(ln) + mark + " ";
+            after = true;
+        } else if after && ln > 0 {
+            out = out + "then " + int_to_str(ln);
+            return out;
+        }
+        k = k + 3;
+    }
+    return out;
+}
+
+/// Generates the module's code as pe_ir_generate_pe does (its unresolved
+/// runtime calls are no matter here: no runtime is merged); the inlined
+/// calls of main (g_pe_dbg_inl) and its rows; the image to $out_env.
+fn build(out_env: str) -> str {
+    var g: PeirGen = PeirGen_new();
+    var m: IrModule = module();
+    var img: Vec<i64> = PeirGen_generate(&mut g, &m);
+    g_unit_rows = rows_text(&g);
+    match env_var(out_env) {
+        Option::Some(out) => {
+            if file::file_write_bytes(out, img) != 0 {
+                println("could not write " + out);
+            }
+        }
+        Option::None => {
+        }
+    }
+    var d: str = "";
+    if g_pe_dbg_inl.len() > 0 {
+        d = g_pe_dbg_inl.get(0);
+    }
+    return d;
+}
+
+fn main() {
+    // as main.fd does for `fid emit -g`, after the mid-end
+    pe_lines_setup(src(), "pe_inl_nops_unit.fd");
+    g_iro_inl_sites = Vec::new();
+    g_iro_inl_sites.push("main\ttwice\t3\t100:7,101:7,102:8\t0,1");
+    g_iro_inl_sites.push("main\tVec_len\t3\t103:9000\t0");
+    var d: str = build("PE_INL_OUT");
+    println("built " + bool_to_str(str_len(d) > 0));
+    println("rows " + g_unit_rows);
+    // "I", callee, call line, its `fn` line, start, end (the two nops)
+    var p: Vec<str> = str_split(d, "\t");
+    println("inlined twice " + bool_to_str(p.len() == 6 && p.get(1) == "twice" && p.get(2) == "3" && p.get(3) == "6"));
+    println("range of the nops " + bool_to_str(p.len() == 6 && str_parse_int(p.get(5)) - str_parse_int(p.get(4)) == 2));
+    println("no file, no record " + bool_to_str(!str_contains(d, "Vec_len")));
+    // without records: none (the code of before)
+    g_iro_inl_sites = Vec::new();
+    var d2: str = build("PE_INL_OUT_PLAIN");
+    println("without records: none " + bool_to_str(str_len(d2) == 0 && str_len(g_unit_rows) == 0));
+}

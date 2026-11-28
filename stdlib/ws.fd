@@ -278,6 +278,66 @@ pub fn ws_connect(host: str, port: i64, path: str) -> WsConn {
     return ws_handshake(fd, 0, host, path);
 }
 
+/// BG354: whether `resp` (the server's reply headers) accepts the upgrade
+/// asked for with Sec-WebSocket-Key `key` (RFC 6455 §4.1): the status line
+/// is `HTTP/1.x 101`, Upgrade is "websocket" and Connection holds the token
+/// "upgrade" (both case-insensitive), and Sec-WebSocket-Accept, with any
+/// optional whitespace around it, is exactly the accept value (base64 is
+/// case-sensitive). Before, any "101" in the reply passed, the accept value
+/// was compared case-folded, and only the form "Accept: <v>" with one space.
+pub fn ws_handshake_reply_ok(resp: str, key: str) -> bool {
+    var lines: Vec<str> = str_lines(resp);
+    if lines.len() == 0 {
+        return false;
+    }
+    var status: str = str_trim(lines.get(0));
+    if !str_starts_with(status, "HTTP/1.") || str_len(status) < 12 {
+        return false;
+    }
+    // "HTTP/1.1 101" then the end or a reason phrase
+    if str_byte_at(status, 8) != 32 || !str_equal(str_slice(status, 9, 12), "101") {
+        return false;
+    }
+    if str_len(status) > 12 && str_byte_at(status, 12) != 32 {
+        return false;
+    }
+    val want: str = ws_accept_key(key);
+    var upgrade_ok: bool = false;
+    var conn_ok: bool = false;
+    var accept_ok: bool = false;
+    var i: i64 = 1;
+    while i < lines.len() {
+        val l: str = lines.get(i);
+        val colon: i64 = str_find(l, ":");
+        if colon > 0 {
+            val name: str = str_to_lower(str_trim(str_slice(l, 0, colon)));
+            val value: str = str_trim(str_slice(l, colon + 1, str_len(l)));
+            if str_equal(name, "upgrade") && str_equal(str_to_lower(value), "websocket") {
+                upgrade_ok = true;
+            }
+            if str_equal(name, "connection") {
+                val toks: Vec<str> = str_split(str_to_lower(value), ",");
+                var t: i64 = 0;
+                while t < toks.len() {
+                    if str_equal(str_trim(toks.get(t)), "upgrade") {
+                        conn_ok = true;
+                    }
+                    t = t + 1;
+                }
+            }
+            if str_equal(name, "sec-websocket-accept") {
+                // a second, different value fails the reply
+                accept_ok = str_equal(value, want);
+                if !accept_ok {
+                    return false;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return upgrade_ok && conn_ok && accept_ok;
+}
+
 /// The client's Upgrade handshake on a connected socket, or over the TLS
 /// session `tls` on it (module `wss`). Returns WsConn with fd<0 on failure,
 /// the socket then closed.
@@ -289,7 +349,7 @@ pub fn ws_handshake(fd: i64, tls: i64, host: str, path: str) -> WsConn {
     var req: str = "GET " + path + " HTTP/1.1\r\n" + "Host: " + host + "\r\n" + "Upgrade: websocket\r\n" + "Connection: Upgrade\r\n" + "Sec-WebSocket-Key: " + key + "\r\n" + "Sec-WebSocket-Version: 13\r\n\r\n";
     ws_io_write_str(fd, tls, req);
     var resp: str = ws_read_headers(fd, tls);
-    if !str_contains(resp, "101") || !str_contains(str_to_lower(resp), "sec-websocket-accept: " + str_to_lower(ws_accept_key(key))) {
+    if !ws_handshake_reply_ok(resp, key) {
         if tls != 0 {
             val close: fn(i64) -> i64 = ws_tls_close;
             close(tls);
@@ -488,6 +548,27 @@ pub fn ws_recv(c: WsConn) -> WsFrame {
         var op: i64 = b0 & 15;
         var masked: bool = (b1 & 128) != 0;
         var len: i64 = b1 & 127;
+        // BG474: what RFC 6455 says fails the connection: RSV1-3 set (no
+        // extension is negotiated, §5.2), a reserved opcode (3-7, 11-15),
+        // a control frame that is fragmented or longer than 125 bytes
+        // (§5.5), a client frame that is not masked or a server frame that
+        // is (§5.1), a continuation with no message open and a new data
+        // frame inside a fragmented one (§5.4)
+        if (b0 & 112) != 0 || (op >= 3 && op <= 7) || op >= 11 {
+            return dead;
+        }
+        if op >= 8 && (!fin || len > 125) {
+            return dead;
+        }
+        if masked == c.is_client {
+            return dead;
+        }
+        if op == 0 && first_op == -1 {
+            return dead;
+        }
+        if (op == 1 || op == 2) && first_op != -1 {
+            return dead;
+        }
         if len == 126 {
             var e2: Vec = ws_read_n(c.fd, c.tls, 2);
             if e2.len() < 2 {
@@ -565,6 +646,10 @@ pub fn ws_recv(c: WsConn) -> WsFrame {
             return dead;
         }
         grd = grd + 1;
+    }
+    // BG474: a text message must be UTF-8 (§8.1)
+    if first_op == 1 && !utf8_valid_bytes(acc) {
+        return dead;
     }
     return WsFrame {
         opcode: first_op, text: str_from_bytes(acc), bytes: acc, fin: fin

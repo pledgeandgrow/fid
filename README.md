@@ -1,14 +1,11 @@
 <p align="center">
   <a href="https://fid-lang.org">
-    <img src="docs/fid-logo.svg" alt="Fid" width="96">
+    <img src="docs/fid-banner.svg" alt="Fid — a systems language that checks what it promises" width="1600">
   </a>
 </p>
 
-<h1 align="center">Fid</h1>
-
 <p align="center">
-  <b>A systems language that checks what it promises.</b><br>
-  Borrow checking without lifetime annotations, capability grants on imports, effect tracking.<br>
+  <b>Borrow checking without lifetime annotations, capability grants on imports, effect tracking.</b><br>
   Its compiler, <b>Fides</b>, is written in Fid and builds itself to a byte-identical fixpoint. No LLVM. No GC.
 </p>
 

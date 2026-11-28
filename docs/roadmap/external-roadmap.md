@@ -42,10 +42,22 @@ cross-references still work. None of these blocks a release.
 
 ## Third-party publishing
 
-- [ ] **N3. Publish the VS Code extension on the Marketplace** (from
-      release-roadmap N3). The LSP integration and editor features are
-      implemented; publication depends on a publisher identity and acceptance
-      by the external Marketplace.
+- [x] **N3. Publish the VS Code extension on the Marketplace** (from
+      release-roadmap N3). Done Nov 28 2026: fid-lang 0.1.0 is live on the
+      Visual Studio Marketplace
+      (marketplace.visualstudio.com/items?itemName=pledgeandgrow.fid-lang,
+      publisher pledgeandgrow) and on Open VSX
+      (open-vsx.org/extension/pledgeandgrow/fid-lang, the registry VS Code
+      forks — VSCodium, Cursor, Windsurf — actually query; the top hit for
+      "fid" there on day one). The extension in editors/vscode/ was brought
+      up to the language first: the grammar learned raw strings, float
+      exponents and the ~25 keywords added since it was written; the dead
+      fides-lang.org links became fid-lang.org; snippets, a changelog, the
+      brand icon (docs/fid-logo.svg) and an error dialog that points at the
+      install docs were added. Left as polish, not part of this goal: the
+      Open VSX namespace verification checkmark (the claim issue for
+      pledgeandgrow is filed with Eclipse) and the editor-setup page on the
+      website, which still says the extension is not published.
 
 ## Community and adoption
 

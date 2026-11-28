@@ -1,0 +1,60 @@
+// Bugs roadmap BG230: `opt ?? <new value>` leaked the default when the
+// result was kept: the None path claimed the default, but the merged result
+// was a plain load, so `val r = ...` counted it once more and the default's
+// owner was never dropped. An Option of a str, Vec or map now gives a result
+// that owns its value on either path (the Some payload counted once more,
+// the default handed over), a temporary of the statement (lower.fd
+// Expr::Coalesce, Lowerer_coalesce_own_type). Leak gate:
+//   fid run tests/bootstrap/test_bg230_coalesce_default_owner.fd --leaks
+//
+// Expected output:
+// d9
+// some5
+// d9 d9
+// x-lit
+// 3
+// 2
+// done
+
+fn get(b: bool) -> Option<str> {
+    if b {
+        return Option::Some("some" + int_to_str(5));
+    }
+    return Option::None;
+}
+
+fn nums(b: bool) -> Option<Vec<i64>> {
+    if b {
+        var v: Vec<i64> = Vec::new();
+        v.push(1);
+        v.push(2);
+        return Option::Some(v);
+    }
+    return Option::None;
+}
+
+fn main() -> i64 {
+    val r2 = get(false) ?? ("d" + int_to_str(9));
+    println(r2);
+    val r1 = get(true) ?? ("d" + int_to_str(9));
+    println(r1);
+    var i: i64 = 0;
+    var last: str = "";
+    while i < 50 {
+        last = get(false) ?? ("d" + int_to_str(9));
+        i = i + 1;
+    }
+    println(last + " " + (get(false) ?? ("d" + int_to_str(9))));
+    val lit = get(false) ?? "x-lit";
+    println(lit);
+    var fresh: Vec<i64> = Vec::new();
+    fresh.push(7);
+    fresh.push(8);
+    fresh.push(9);
+    val a = nums(false) ?? fresh;
+    println(a.len());
+    val b = nums(true) ?? Vec::new();
+    println(b.len());
+    println("done");
+    return 0;
+}

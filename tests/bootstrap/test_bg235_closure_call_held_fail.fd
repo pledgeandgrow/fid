@@ -1,0 +1,35 @@
+// expect-error: Deadlock error: locks are taken in an inconsistent order
+// Bugs roadmap BG235: a call through a closure value added no edges: main
+// holds A while it calls the closure f, which takes B, and g takes B then
+// A, a cycle `fid check` did not see (the closure taking A itself was
+// found, as its own edges). The call of a closure bound in the function
+// now takes the closure's locks under the locks held there (typechecker.fd
+// lo_call; lockcheck.fd resolves the CallPtr to the closure's function).
+//! error: Deadlock error
+
+var A: i64 = 0;
+var B: i64 = 0;
+
+fn g() -> i64 {
+    p_mutex_lock(B);
+    p_mutex_lock(A);
+    p_mutex_unlock(A);
+    p_mutex_unlock(B);
+    return 0;
+}
+
+fn main() -> i64 {
+    A = p_mutex_init();
+    B = p_mutex_init();
+    val f = fn() -> i64 {
+        p_mutex_lock(B);
+        p_mutex_unlock(B);
+        return 0;
+    };
+    p_mutex_lock(A);
+    f();
+    p_mutex_unlock(A);
+    g();
+    println("ran");
+    return 0;
+}
