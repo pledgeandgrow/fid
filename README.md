@@ -78,9 +78,9 @@ for x in v {
 ```
 
 ```
-error: borrow error in main:
-cannot change v while a `for`
-loop iterates over it
+error[E080]: borrow error in
+main: cannot change v while a
+`for` loop iterates over it
 ```
 
 </td>
@@ -89,6 +89,8 @@ loop iterates over it
 **A module only gets what you grant**
 
 ```rust
+// logger.fd: pub fn log_line(s: str)
+// { println(s); }
 use logger with { FS };
 
 fn main() -> i64 {
@@ -98,9 +100,10 @@ fn main() -> i64 {
 ```
 
 ```
-Capability error: 'println()'
-requires 'IO' capability (not
-granted to module 'logger')
+error: Capability error:
+'println()' requires 'IO'
+capability (not granted to
+module 'logger')
 ```
 
 </td>
@@ -109,6 +112,7 @@ granted to module 'logger')
 **A pure function stays pure**
 
 ```rust
+// helper() calls println
 fn pure_sum(a: i64, b: i64)
     -> i64 !{} {
     return a + b + helper();
@@ -116,9 +120,9 @@ fn pure_sum(a: i64, b: i64)
 ```
 
 ```
-Effect error: function
-'pure_sum' has inferred
-effect '!IO'
+error[E110]: Effect error:
+function 'pure_sum' has
+inferred effect '!IO'
 ```
 
 </td>
@@ -142,7 +146,7 @@ Every message is explained on the [Compiler Errors](https://fid-lang.org/docs/er
 
 ## Install
 
-**Windows.** Download [`Fid-Setup-0.8.7.exe`](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.7-unstable) (older versions on the [releases page](https://github.com/pledgeandgrow/fid/releases)). It puts `fid.exe`, `ark`, `scribe` and `veil` on your PATH with the standard library beside them. The installer is not code-signed yet, so Windows will ask you to confirm. `fid ccompile` needs a C compiler on PATH (`zig cc`, gcc, clang or tcc); `fid run` and `fid emit` need none.
+**Windows.** Download [`Fid-Setup-0.8.7.exe`](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.7-unstable) (older versions on the [releases page](https://github.com/pledgeandgrow/fid/releases)). It puts `fid.exe`, `ark`, `scribe`, `veil` and the frozen Rust compiler `fidesc` on your PATH with the standard library beside them. The installer is not code-signed yet, so Windows will ask you to confirm. `fid ccompile` needs a C compiler on PATH (`zig cc`, gcc, clang or tcc); `fid run` and `fid emit` need none.
 
 **Linux and macOS, or from source anywhere.** You need git, Rust and a C compiler (`zig cc` 0.16 is the tested one):
 
@@ -153,7 +157,7 @@ RELEASE=1 CC="zig cc" ./scripts/bootstrap.sh   # builds fid in 3 stages and chec
 ./release/fid run tests/bootstrap/hello.fd
 ```
 
-Stage 0 is a pinned self-hosted `fid`: `bootstrap.sh` downloads it from the [`stage0` release](https://github.com/pledgeandgrow/fid/releases/tag/stage0) and checks its hash (`scripts/stage0-fetch.sh`). Binaries are published there for Windows x64 and ARM64, Linux x64 and ARM64, and macOS x64 and ARM64. The Linux ARM64 and macOS ones were cross-built and pinned on Nov 27 and have not yet built `fid` in CI. On a host with no pinned binary, it falls back to the Rust compiler, and that cold start stops at stage 2: a `fid` built by `fidesc` runs out of memory compiling the whole tree ([known bug](docs/reference/known-bugs.md) 2g.79). There, set `STAGE0` to a self-hosted `fid` built elsewhere.
+Stage 0 is a pinned self-hosted `fid`: `bootstrap.sh` downloads it from the [`stage0` release](https://github.com/pledgeandgrow/fid/releases/tag/stage0) and checks its hash (`scripts/stage0-fetch.sh`). Binaries are published there for Windows x64 and ARM64, Linux x64 and ARM64, and macOS x64 and ARM64. The Windows ARM64, Linux ARM64 and macOS ones were cross-built and pinned on Nov 26–27 and have not yet built `fid` in CI. On a host with no pinned binary, it falls back to the Rust compiler, and that cold start stops at stage 2: a `fid` built by `fidesc` runs out of memory compiling the whole tree ([known bug](docs/reference/known-bugs.md) 2g.79). There, set `STAGE0` to a self-hosted `fid` built elsewhere.
 
 **Nothing to install.** The [playground](https://fid-lang.org/playground) runs in your browser.
 
@@ -178,7 +182,7 @@ One binary, `fid`, is the compiler, interpreter, test runner, formatter, linter 
 | `fid audit file.fd` | List every `unsafe` block the program reaches |
 | `fid qualify file.fd` | Safety evidence as JSON: rules, their tests, annotated functions |
 | `fid explain file.fd` | Which run-time checks were removed or kept, and why |
-| `fid debug file.fd` | Interactive debugger (breakpoints, stepping, variables) |
+| `fid debug file.fd` | Interactive debugger (breakpoints, stepping, printing values) |
 | `fid lsp` | Language server over stdio |
 
 Beside it: `ark` (packages: a path, a git repository, or [the pacts index](https://github.com/pledgeandgrow/pacts) — `fid ark add textkit` installs the first published pact), `scribe` (documentation from `///` comments) and `veil` (coverage). The full list is in the [CLI reference](https://fid-lang.org/docs/cli).
@@ -189,13 +193,13 @@ Beside it: `ark` (packages: a path, a git repository, or [the pacts index](https
 | ----------------- | :---------: | :-------: | :-----------------: |
 | Windows x64       |     🟢      |    🟢     |         🟢          |
 | Linux x64         |     🟢      |    🟢     |         🟡          |
-| Linux ARM64       |     🟡 ¹    |    🟡     |         🟡          |
-| Linux RISC-V      |     🟡 ¹    |    🟡     |         🟡          |
-| macOS x64 + ARM64 |     🟡      |    🟡     |         ⚪          |
-| WebAssembly       |             |    🟢     |         🟡          |
-| Bare metal x86-64 |             |           |         🟢 ²        |
+| Linux ARM64       |     🟡      |   🟡 ¹    |        🟡 ¹         |
+| Linux RISC-V      |     ⚪      |   🟡 ¹    |        🟡 ¹         |
+| macOS x64 + ARM64 |     ⚪      |    🟡     |         ⚪          |
+| WebAssembly       |             |    🟡     |         🟡          |
+| Bare metal x86-64 |             |           |         🟡 ²        |
 
-¹ Under QEMU in CI. ² Multiboot kernels booted and verified under QEMU in CI (`bare-metal.yml`, last green Nov 22). macOS: Mach-O executables build from any host, and CI runs the suite on Apple runners (the `macos-arm64` lane of `tier1.yml`, and `macos-native.yml` for native executables), but neither has passed yet, so nothing has been confirmed on a Mac.
+¹ Programs built for the target and run under QEMU. ² Multiboot kernels booted and verified under QEMU in CI (`bare-metal.yml`, last green Nov 22). macOS: Mach-O executables build from any host, and CI runs the suite on Apple runners (the `macos-arm64` lane of `tier1.yml`, and `macos-native.yml` for native executables), but neither has passed yet, so nothing has been confirmed on a Mac. Only Windows x64 was checked on the 0.8.7 compiler; no CI lane has passed since Nov 21 (see [Honest status](#honest-status)).
 
 🟢 supported · 🟡 partly tested · ⚪ experimental. Details and test counts: [platforms](docs/reference/platforms.md).
 
@@ -209,7 +213,7 @@ flowchart LR
     IR --> CB[C backend<br/>fid ccompile]
     IR --> N[Native emitter<br/>fid emit]
     CB --> CC[Any C compiler]
-    N --> EXE([PE and ELF executables])
+    N --> EXE([PE, ELF and Mach-O executables])
 ```
 
 One front end and one IR, three ways out. The native emitter has its own instruction encoders and register allocator, so no assembler or linker is involved.
@@ -217,9 +221,9 @@ One front end and one IR, three ways out. The native emitter has its own instruc
 The compiler checks itself as hard as it checks your code:
 
 - **Fixpoint.** Stage 2 and stage 3 of the bootstrap must produce byte-identical output on every release build.
-- **Proved rewrites.** The optimizer's 27 integer rewrite rules and the e-graph's rewrites are proved with z3 at 8, 16, 32 and 64 bits: 253 obligations, all proved (Nov 25).
-- **Checked encoders.** The instruction encoders are compared with clang's assembler across 1,200 forms, with no mismatch (Nov 25).
-- **Conformance.** 1,621 programs each check one rule of the [language reference](docs/reference/reference.md) (§1–§13).
+- **Proved rewrites.** The optimizer's 27 integer rewrite rules and the e-graph's rewrites are proved with z3 at 8, 16, 32 and 64 bits: 253 obligations, all proved (Nov 28, with the 0.8.7 compiler).
+- **Checked encoders.** The instruction encoders are compared with clang's assembler across 1,200 forms, with no mismatch (Nov 28).
+- **Conformance.** 1,618 programs each check one rule of the [language reference](docs/reference/reference.md) (§1–§13); all 1,618 pass on `run` (Nov 28).
 
 More in [verification](docs/verification/README.md) and the [contributor walkthrough](docs/reference/compiler-walkthrough.md).
 
@@ -255,9 +259,9 @@ Fid is young and moving fast.
     - faster than Rust and Go on binary-trees;
     - 1.2x behind on hashing, 1.5x on regex, 2–4x on string building, 3x on file reading and 5x on sorting;
     - 11–18x behind on pidigits, where its big integers are slow.
-  - **Natively (`fid emit`):** slower than through C on every program. But the executables are the smallest in the table (40 KB for hello, against 123 KB for Rust), and they start as fast as Zig's.
+  - **Natively (`fid emit`):** slower than through C on every program but pidigits. Its executables were the smallest in the table (40 KB for hello, against 123 KB for Rust) and started as fast as Zig's; the runtime has grown since, and a hello from the 0.8.7 compiler is 137,629 bytes.
   - [Benchmarks, losses included](docs/benchmarks.md).
-- **The package index is just starting.** `ark` installs from a path, a git repository or [the pacts index](https://github.com/pledgeandgrow/pacts) (`fid ark add textkit`); few pacts are published yet. The CI steps that install from the index on Linux, Windows and macOS have not passed yet.
+- **The package index is just starting.** `ark` installs from a path, a git repository or [the pacts index](https://github.com/pledgeandgrow/pacts) (`fid ark add textkit`); textkit is the only pact published so far. The CI steps that install from the index on Linux, Windows and macOS have not passed yet.
 - **The fixpoint was last verified on Nov 28, 2026:** for v0.8.7-unstable, stage 2 and stage 3 emitted identical C (142,939,506 bytes) on the ~369K-line tree of e1115799. Before that, Nov 21; the builds between (Nov 25, Nov 27, v0.8.5/v0.8.6-unstable) were one stage from a self-hosted `fid`.
 - **The whole test suite on each backend.**
   - **Nov 28 compiler (v0.8.7):** the whole bootstrap suite (2,433 programs) was not rerun; several checks are stricter now, so some programs that compiled before may be rejected. What was run: the 302 BG258–BG490 regression tests on `run`, `ccompile`, `emit` and `--nat` (all pass), conformance 1,618 of 1,618 on `run`, the leak gate 11 of 11, `fid check compiler/main.fd` with no errors. Linux targets were not run.
@@ -268,10 +272,10 @@ Fid is young and moving fast.
     - Details in the [LLVM roadmap](docs/roadmap/llvm-roadmap.md), WP14.
   - **C:** not rerun.
 - **CI is red.**
-  - None of the runs GitHub still has for `ci.yml` (88), `tier1.yml` (89) or `macos-native.yml` (20), going back to Nov 21, has passed.
+  - None of the runs GitHub still has for `ci.yml` (91), `tier1.yml` (92) or `macos-native.yml` (22), going back to Nov 21, has passed (Nov 28).
   - Most jobs stop while building `fid`, on the stage-0 binaries and the memory of GitHub's runners.
   - `bare-metal.yml` and `pages.yml` last passed on Nov 22.
-  - It has not run on the v0.8.7 commit yet.
+  - On the v0.8.7 commits (e1115799, 95f10537) the workflows failed too.
   - The checks above were run by hand on a Windows machine.
 - **Bugs.** The [bugs roadmap](docs/roadmap/bugs-roadmap.md), filled by the whole-repo reviews of Nov 22, Nov 24 and Nov 27, has 490 entries (Nov 28): 453 done, 37 partly done, none open. Of the 233 from the Nov 27 reviews (BG258–BG490), 223 are fixed and verified and 10 partly done: some array copies and escaping closures still leak (BG369, BG384, BG431), and the rest are in the installer, the stage-0 pin, release.yml, a race, a failure path and a 512 MiB input that could not be exercised.
 - **Not for safety-critical use.** `fid qualify` produces evidence for review, not a certification.
@@ -330,7 +334,7 @@ No lifetime annotations: references cannot be stored or returned from a local. A
 <details>
 <summary><b>How is Fid different from Zig?</b></summary>
 
-Both have `comptime` and their own backends. Zig leaves memory safety to the engineer; Fid checks borrows and reference escapes at compile time and keeps bounds and overflow checks in every build. [Full comparison](docs/guides/from-zig.md).
+Both have `comptime` and their own backends. Zig checks bounds and overflow in its safe build modes and leaves the rest of memory safety to the engineer; Fid checks borrows and reference escapes at compile time and keeps bounds and overflow checks in every build. [Full comparison](docs/guides/from-zig.md).
 
 </details>
 
