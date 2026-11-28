@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://fid-lang.org/playground"><img alt="Try it in your browser" src="https://img.shields.io/badge/try%20it-in%20your%20browser-C2255C?style=for-the-badge"></a>
-  <a href="https://fid-lang.org/docs/install"><img alt="Install" src="https://img.shields.io/badge/install-v0.8.6--unstable-262626?style=for-the-badge"></a>
+  <a href="https://fid-lang.org/docs/install"><img alt="Install" src="https://img.shields.io/badge/install-v0.8.7--unstable-262626?style=for-the-badge"></a>
   <a href="https://fid-lang.org/docs"><img alt="Documentation" src="https://img.shields.io/badge/read-the%20docs-262626?style=for-the-badge"></a>
 </p>
 
@@ -138,11 +138,11 @@ Every message is explained on the [Compiler Errors](https://fid-lang.org/docs/er
 | **Checks that stay on** | Bounds, integer overflow and double frees panic in every build, not only in debug. |
 | **No macros** | `comptime` runs ordinary Fid code at compile time, with reflection over types. |
 | **No LLVM** | `fid emit` encodes machine code and writes Windows and Linux executables itself: no assembler, no linker, no C compiler. |
-| **Self-hosted** | About 361K lines of Fid compile themselves. The 3-stage release bootstrap checks they rebuild to byte-identical output (last reached Nov 21); a self-compile to C takes 44 s (Nov 27). |
+| **Self-hosted** | About 369K lines of Fid compile themselves. The 3-stage release bootstrap checks they rebuild to byte-identical output (last reached Nov 28, for v0.8.7-unstable); a self-compile to C takes 44 s (Nov 27). |
 
 ## Install
 
-**Windows.** Download [`Fid-Setup-0.8.6.exe`](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.6-unstable) (older versions on the [releases page](https://github.com/pledgeandgrow/fid/releases)). It puts `fid.exe`, `ark`, `scribe` and `veil` on your PATH with the standard library beside them. The installer is not code-signed yet, so Windows will ask you to confirm. `fid ccompile` needs a C compiler on PATH (`zig cc`, gcc, clang or tcc); `fid run` and `fid emit` need none.
+**Windows.** Download [`Fid-Setup-0.8.7.exe`](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.7-unstable) (older versions on the [releases page](https://github.com/pledgeandgrow/fid/releases)). It puts `fid.exe`, `ark`, `scribe` and `veil` on your PATH with the standard library beside them. The installer is not code-signed yet, so Windows will ask you to confirm. `fid ccompile` needs a C compiler on PATH (`zig cc`, gcc, clang or tcc); `fid run` and `fid emit` need none.
 
 **Linux and macOS, or from source anywhere.** You need git, Rust and a C compiler (`zig cc` 0.16 is the tested one):
 
@@ -248,7 +248,7 @@ Signatures for every module: [API reference](https://fid-lang.org/reference).
 
 Fid is young and moving fast.
 
-- **Releases:** the newest is the **[v0.8.6-unstable](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.6-unstable)** prerelease (Nov 27). Its `fid.exe` is a one-stage build from a self-hosted `fid` (all 16 C units at -O2), not a 3-stage fixpoint. The first published build, Sep 9, was tagged v1.0.0 and is now listed as 0.7. The stable 1.0 is planned for December; `fid version` reports `1.0.0+dev`.
+- **Releases:** the newest is the **[v0.8.7-unstable](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.7-unstable)** prerelease (Nov 28, commit e1115799). Its `fid.exe` comes from the 3-stage release bootstrap with the fixpoint checked, the first such package since Nov 21 (0.8.1 to 0.8.6 were one-stage builds). The first published build, Sep 9, was tagged v1.0.0 and is now listed as 0.7. The stable 1.0 is planned for December. `fid version` prints `fid 0.8.7-unstable`; earlier installers printed `fid 1.0.0+dev`. The installer is not code-signed.
 - **Generated code is slower than Rust's.** These are the Nov 17 runs on a busy Windows machine, against Rust, Zig, C++ and Go.
   - **Through C:**
     - level with the fastest on a small compiler and on JSON (within 15%);
@@ -258,8 +258,9 @@ Fid is young and moving fast.
   - **Natively (`fid emit`):** slower than through C on every program. But the executables are the smallest in the table (40 KB for hello, against 123 KB for Rust), and they start as fast as Zig's.
   - [Benchmarks, losses included](docs/benchmarks.md).
 - **The package index is just starting.** `ark` installs from a path, a git repository or [the pacts index](https://github.com/pledgeandgrow/pacts) (`fid ark add textkit`); few pacts are published yet. The CI steps that install from the index on Linux, Windows and macOS have not passed yet.
-- **The fixpoint was last verified on Nov 21, 2026:** stage 2 and stage 3 were byte-identical on that day's ~361K-line tree. Builds since (Nov 25, Nov 27, v0.8.5/v0.8.6-unstable) are one stage from a self-hosted `fid`; the Nov 25 one passes the leak gate (11 of 11).
+- **The fixpoint was last verified on Nov 28, 2026:** for v0.8.7-unstable, stage 2 and stage 3 emitted identical C (142,939,506 bytes) on the ~369K-line tree of e1115799. Before that, Nov 21; the builds between (Nov 25, Nov 27, v0.8.5/v0.8.6-unstable) were one stage from a self-hosted `fid`.
 - **The whole test suite on each backend.**
+  - **Nov 28 compiler (v0.8.7):** the whole bootstrap suite (2,433 programs) was not rerun; several checks are stricter now, so some programs that compiled before may be rejected. What was run: the 302 BG258–BG490 regression tests on `run`, `ccompile`, `emit` and `--nat` (all pass), conformance 1,618 of 1,618 on `run`, the leak gate 11 of 11, `fid check compiler/main.fd` with no errors. Linux targets were not run.
   - **Interpreter (Nov 25):** 1,897 of 1,983 pass on `run`, with `fid` as the compiler. 82 of the failures fail the same with the earlier compiler; 4 are timeouts.
   - **Native, both backends (Nov 27, the first such run):** 2,011 of the 2,056 programs in `tests/bootstrap` pass on `emit` and on `--nat`.
     - 38 fail on both: 13 don't compile, 8 hit PE generation errors, and the rest are bare-metal or boot programs and tests that need SDL2 or a C header.
@@ -270,8 +271,9 @@ Fid is young and moving fast.
   - None of the runs GitHub still has for `ci.yml` (88), `tier1.yml` (89) or `macos-native.yml` (20), going back to Nov 21, has passed.
   - Most jobs stop while building `fid`, on the stage-0 binaries and the memory of GitHub's runners.
   - `bare-metal.yml` and `pages.yml` last passed on Nov 22.
+  - It has not run on the v0.8.7 commit yet.
   - The checks above were run by hand on a Windows machine.
-- **Open bugs.** Four whole-repo reviews (Nov 22, Nov 24 and two on Nov 27) logged 489 entries in the [bugs roadmap](docs/roadmap/bugs-roadmap.md): 232 are fixed with tests, 27 partly, 230 open. Most of the open ones come from the Nov 27 reviews and are still being worked down.
+- **Bugs.** The [bugs roadmap](docs/roadmap/bugs-roadmap.md), filled by the whole-repo reviews of Nov 22, Nov 24 and Nov 27, has 490 entries (Nov 28): 453 done, 37 partly done, none open. Of the 233 from the Nov 27 reviews (BG258–BG490), 223 are fixed and verified and 10 partly done: some array copies and escaping closures still leak (BG369, BG384, BG431), and the rest are in the installer, the stage-0 pin, release.yml, a race, a failure path and a 512 MiB input that could not be exercised.
 - **Not for safety-critical use.** `fid qualify` produces evidence for review, not a certification.
 
 The details: [status](docs/reference/status.md) · [known bugs](docs/reference/known-bugs.md) · [roadmap](docs/roadmap/roadmap.md).
@@ -291,10 +293,10 @@ The details: [status](docs/reference/status.md) · [known bugs](docs/reference/k
 ## Repository layout
 
 ```
-compiler/    the compiler, in Fid: 65 modules, about 361K lines
+compiler/    the compiler, in Fid: 65 modules, about 369K lines
 stdlib/      the standard library: 403 modules
 src/         the earlier compiler in Rust, frozen; it builds stage 1 and runs the test harness
-tests/       bootstrap (2,131 programs), conformance (1,621), selfhost (47),
+tests/       bootstrap (2,433 programs), conformance (1,622), selfhost (47),
              plus projects, verify, nattools, tooling and leak checks
 examples/    twelve complete programs
 tools/       ark, scribe, veil and friends, written in Fid

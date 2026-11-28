@@ -1,5 +1,81 @@
 # Fides Language Changelog
 
+## v0.8.7-unstable, fixes for every open bugs-roadmap entry (Nov 28, 2026)
+
+v0.8.7-unstable is released from e1115799 (Fid-Setup-0.8.7.exe). Its
+`fid.exe` comes from the 3-stage release bootstrap (`RELEASE=1
+scripts/bootstrap.sh`) with the fixpoint checked: stage 2 and stage 3
+emit identical C (142,939,506 bytes). It is the first fixpoint-checked
+package since Nov 21 (0.8.1 to 0.8.6 were one-stage builds). `fid
+version` prints `fid 0.8.7-unstable`; earlier installers printed `fid
+1.0.0+dev`.
+
+- **Bugs roadmap** (docs/roadmap/bugs-roadmap.md): 490 entries, 453 done,
+  37 partly done, 0 open. BG258–BG490 (233 entries from the Nov 27
+  whole-repo reviews): 223 fixed and verified, 10 partly done with what is
+  left written in each: BG369, BG384 and BG431 are partial fixes (some
+  array copies and escaping closures still leak); BG323, BG366 (the
+  installer), BG359 (the stage-0 pin), BG485 (release.yml), BG435 (a
+  race), BG438 (a failure path) and BG475 (a 512 MiB input that could
+  not be exercised). The other 27 partly-done entries are the
+  BG183–BG256 batch, whose fixes are in this build.
+- **Type checker:** const, global and default initializers are checked;
+  a literal's fit is checked through fields, indexes and references; a
+  `-> !` function must not return; exhaustiveness of nested patterns;
+  visibility of types, methods and fields; duplicate definitions are
+  errors; unknown `p_*` builtins are errors; integer-to-function casts
+  need `unsafe`; a method's `self` must be its impl type.
+- **Safety rules:** `@no-alloc`, `@realtime`, `@no-unbounded` loops,
+  `@gas` method calls, `@constant_time` string `==`/`contains` and
+  closures, sandbox through `dyn` and generic calls, lock order with
+  `SyncMutex`; effects through `dyn` and pipes.
+- **Code generation:** f32 and narrow-integer values in payloads,
+  tuples, generic fields, map values, `??`, `?`, typed consts, Rc, spawn
+  and format specs; fixed arrays in structs, Vecs and enums; spawn with
+  struct results, struct arguments, defaults and named arguments; method
+  defaults and variadics; Vec clone and method-result leaks; pe_ir f32
+  negation; `--nat` narrow folding; C names that clash with libc macros;
+  wasm signed narrowing; Vec/HashMap printing of floats, bools and u64.
+- **Stdlib:** protocol parsers that no longer panic or loop on hostile
+  input (DNP3, IEC 104, IEC 61850, DLMS, DDS, CoAP, tar, safetensors,
+  PNG/BMP); bomb limits (HPACK, gRPC, YAML aliases, decimal exponents);
+  security (HTTP request smuggling, MAVLink signing, X.509 name
+  constraints and IP matching, Markdown URL XSS, SMTP and Redis
+  injection, QUIC CertificateVerify schemes, SRTP state, LoRaWAN frame
+  counters); correct results (J1939, OBD-II, SunSpec, Gorilla, physics,
+  semver, bigint, JWT dates, MySQL TIME, multi-member gzip).
+- **Runtimes:** file, stdin, env and process edge cases on pe_ir and
+  `--nat`.
+- **Tools:** `fid test` on Windows and POSIX, and reading `//
+  expect-error`; doc, doctest, `fmt -w`, qualify, profile, `run
+  --timeout`, `--` and `--help`; LSP UTF-16 positions, f-string rename,
+  hover with imports, shutdown; ark: no shell injection, no path
+  traversal; veil HTML lines.
+- **CI:** Cross on current macOS runners, kill switches documented,
+  tree-sitter regenerated with 0.27.2 and pinned, the ark git cache on
+  Windows, release freshness (BG284), the Linux archive's version
+  (BG365), the tier-1 expected-fail check requires the expected message.
+  Also OpenBSD/Android target work and a WASI directory-rights fix from
+  another session.
+- **Checked** with a compiler built from the source (Nov 28): all 302
+  BG258–BG490 regression tests pass on run, ccompile, emit and `--nat`;
+  conformance 1,618 of 1,618 on run; leak gate 11 of 11; `fid check
+  compiler/main.fd` no errors; the new tool checks,
+  tests/ark/ark-safety.sh and scripts/tl/lsp_bug_fixes.py pass.
+  `verify-selfhost.sh`: test_borrowck fixed (its expectations predated
+  non-lexical lifetimes); the probe_* files, test_pe_ir_gen and
+  test_spawn_gt fail as in the Nov 21 baseline; test_lex_par and
+  test_parse_par pass on C and pe_ir but exceed the interpreter's 1,200 s
+  limit (slow, not a hang; an interpreter fast path for
+  `str_byte_at`/`str_len` is in this build).
+- **Known issues:** the whole bootstrap suite (2,433 programs) was not
+  rerun on this compiler, and several checks are stricter now: some
+  programs that compiled before may be rejected. Linux targets were not
+  run. BG484's new formatter style flags 67 existing lines. GitHub
+  Actions CI has not run on this commit yet (no workflow has passed since
+  Nov 22 except Bare metal and Pages that day; the stage-0 seeds and
+  runner memory block most jobs). The installer is not code-signed.
+
 ## v0.8.6-unstable, the Nov 27 LLVM-roadmap batch (Nov 27, 2026)
 
 v0.8.6-unstable is prepared from the Nov 27 tree. Its `fid.exe` is a

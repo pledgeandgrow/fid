@@ -11,7 +11,7 @@ step runnable. -->
 ### Windows (recommended)
 
 1. Download the newest `Fid-Setup-<version>.exe` (today:
-   [`Fid-Setup-0.8.6.exe`](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.6-unstable))
+   [`Fid-Setup-0.8.7.exe`](https://github.com/pledgeandgrow/fid/releases/tag/v0.8.7-unstable))
    from the [releases page](https://github.com/pledgeandgrow/fid/releases).
 2. Run the installer.
 3. Open a new Command Prompt or PowerShell window.
@@ -124,7 +124,7 @@ Sum: 6
 
 ## Windows Installer Details
 
-The installer (`Fid-Setup-0.8.6.exe`) includes:
+The installer (`Fid-Setup-0.8.7.exe`) includes:
 
 | Component | Description | Optional |
 |-----------|-------------|----------|

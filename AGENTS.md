@@ -285,10 +285,32 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 # Manual trigger: gh workflow run release.yml -f version=1.0.0
 ```
 
-## Current Baseline (Nov 27 2026 — v0.8.5-unstable, one-stage builds from a self-hosted stage 0; whole suite on `run` Nov 25)
+## Current Baseline (Nov 28 2026 — v0.8.7-unstable, 3-stage fixpoint checked; whole suite on `run` Nov 25)
 
 > Project-wide numbers are kept in docs/reference/selfhost.md → "Numbers"
 > (CURRENT.md was removed on Nov 8); keep the two in step.
+>
+> Nov 28: v0.8.7-unstable released from e1115799 (Fid-Setup-0.8.7.exe).
+> Its fid.exe comes from the 3-stage release bootstrap (RELEASE=1
+> scripts/bootstrap.sh) with the fixpoint checked: stage 2 and stage 3
+> emit identical C (142,939,506 bytes) — the first fixpoint-checked
+> package since Nov 21 (0.8.1–0.8.6 were one-stage builds). `fid version`
+> prints `fid 0.8.7-unstable` (earlier installers: `fid 1.0.0+dev`). Bugs
+> roadmap: 490 entries, 453 done, 37 partly, 0 open; of BG258–BG490 (233,
+> the Nov 27 reviews) 223 fixed and verified, 10 partly (BG369, BG384,
+> BG431 partial leak fixes; BG323, BG366, BG359, BG485, BG435, BG438,
+> BG475). Checked with a compiler built from the source: the 302
+> BG258–BG490 regression tests pass on run, ccompile, emit and --nat;
+> conformance 1,618/1,618 on run; leak gate 11/11; `check
+> compiler/main.fd` no errors; tests/ark/ark-safety.sh and
+> scripts/tl/lsp_bug_fixes.py pass. verify-selfhost.sh: test_borrowck
+> fixed (its expectations predated NLL); probe_*, test_pe_ir_gen and
+> test_spawn_gt fail as in the Nov 21 baseline; test_lex_par and
+> test_parse_par pass on C and pe_ir but exceed the interpreter's 1,200 s
+> limit (slow, not a hang). NOT done: the whole bootstrap suite (2,433)
+> on this compiler (several checks are stricter now), Linux targets; CI
+> has not run on e1115799; BG484's formatter style flags 67 existing
+> lines; the installer is not code-signed.
 >
 > Nov 27, afternoon and evening (the LLVM roadmap): SP6, LF20, SP7, WP14,
 > LF16, LF14, LF11 and SP16 are marked done in docs/roadmap/llvm-roadmap.md
@@ -345,7 +367,7 @@ FID=release/fid.exe JOBS=4 bash scripts/cross-test.sh aarch64-linux
 
 ```
 SELF-HOSTED COMPILER (primary source):
-  compiler/*.fd:  65 modules, 361,317 lines (Nov 27 evening) — THE COMPILER. 58 are reached
+  compiler/*.fd:  65 modules, 368,955 lines (Nov 28, e1115799) — THE COMPILER. 58 are reached
                   from main.fd and all are called (export prefixes differ
                   from file names: irverify→ir_verify, iropt_me→ime_*,
                   csplit→cs_*, nat_ir→nat_*/ng_*, scribe→process_directory,
@@ -374,7 +396,10 @@ SELF-HOSTED COMPILER (primary source):
                   Mach-O), nat_thumb (Cortex-M Thumb-2 codegen), ir_ser +
                   ast_ser (binary IR/AST caches, .fidcache CS2/CS4),
                   build_info (version stamp; fid version prints 1.0.0+dev)
-  Fixpoint:       VERIFIED Nov 21 on the c082ee6+changes tree (incl. the
+  Fixpoint:       VERIFIED Nov 28 on e1115799 (v0.8.7-unstable): the 3-stage
+                  release bootstrap, stage 2 and stage 3 emit identical C
+                  (142,939,506 bytes); its fid.exe is the installer's.
+                  Before: Nov 21 on the c082ee6+changes tree (incl. the
                   558d0bc temps port): a 3-stage bootstrap from the pinned
                   release/stage0/fid.exe reached stage 3 — `FIXPOINT OK:
                   stage 2 and stage 3 emit identical C` (123,338,942 bytes
@@ -403,6 +428,8 @@ SELF-HOSTED COMPILER (primary source):
                   trees built fully with gcc -O2 (timing comparison).
                   v0.8.5-unstable (Nov 27, be36317): fid.exe is a one-stage
                   build from a self-hosted stage 0, not a 3-stage fixpoint.
+                  v0.8.7-unstable (Nov 28, e1115799): fid.exe from the
+                  3-stage release bootstrap, fixpoint checked.
   Self-compile:   `dump-c compiler/main.fd`, Nov 27: 43.5 s total (44 s
                   wall) with the Nov 27 tree's fid built fully with gcc -O2
                   (typecheck 4.9 s, mono 0.2, lower 11.8, C generation 14.9);
@@ -423,7 +450,7 @@ SELF-HOSTED COMPILER (primary source):
                   SPLIT=1 or tcc: one unit at -O0).
 
 RUST BOOTSTRAP (reference + test harness):
-  src/*.rs:       57 files, 114,899 lines (Nov 27) — bootstrap reference (frozen;
+  src/*.rs:       57 files, 114,901 lines (Nov 28) — bootstrap reference (frozen;
                   Nov 21: the CB8 ownership port in lower.rs/codegen_c.rs)
   Used when:      compiler/*.fd changes (builds stage 1); runs `fidesc test`
   Suite (Nov 2):  interp 339/339, C 343/343, PE 345/345, expected-fail 89/89
@@ -456,16 +483,18 @@ WINDOWS INSTALLER (fides.nsi's default VERSION is 0.8.0):
                  "Fides v1.0.0"), v0.8.0-unstable (Nov 10),
                  v0.8.1-unstable and v0.8.2-unstable (Nov 21),
                  v0.8.3-unstable (Nov 22), v0.8.4-unstable (Nov 23);
-                 v0.8.5-unstable being prepared Nov 27 (be36317)
+                 v0.8.5-unstable and v0.8.6-unstable (Nov 27);
+                 v0.8.7-unstable (Nov 28, e1115799): `fid version` prints
+                 `fid 0.8.7-unstable`
 
 TESTS:
-  tests/bootstrap/:  2,131 .fd (Nov 27 evening) — 2,056 at top level (586
-                     with a `// expect-error` line; 631 named *_fail.fd),
-                     75 in subdirs: at_import, baseline, capability,
+  tests/bootstrap/:  2,433 .fd (Nov 28, e1115799) — 2,356 at top level (709
+                     with a `// expect-error` line; 754 named *_fail.fd),
+                     77 in subdirs: at_import, baseline, capability,
                      decl_lib, diag_dup, diagnostics, effects, golden,
-                     nattools, race_lib, regions, safety, same_name_lib,
-                     spec_lib, trait_conflict
-  tests/conformance/: 1,617 .fd, one per rule of reference.md §1–§13
+                     impl_twice_lib, nattools, race_lib, regions, safety,
+                     same_name_lib, spec_lib, trait_conflict, vis_lib
+  tests/conformance/: 1,622 .fd, one per rule of reference.md §1–§13
                      (`//! error:` = rejected); _modules/ + known-gaps.txt
   tests/selfhost/:  47 .fd files (verify-selfhost.sh)
   tests/leaks/:     11 programs + .expected (scripts/leak-check.sh)
@@ -482,8 +511,8 @@ TESTS:
   Baseline:         tests/bootstrap/baseline/test_results.txt
 
 STDLIB:
-  stdlib/*.fd:    403 top-level modules, 283,248 lines; 414 .fd with the
-                  runtimes, 312,667 lines (Nov 27, be36317; 259,299 before
+  stdlib/*.fd:    403 top-level modules, 285,744 lines; 414 .fd with the
+                  runtimes, 316,518 lines (Nov 28, e1115799; 259,299 before
                   the formatter repair, a1bede6) — core/collections, text and
                   data formats, the HTTP/2/3+QUIC and TLS 1.3 stacks,
                   databases (postgres/mysql/mongodb/redis/sqlite),
@@ -508,7 +537,7 @@ STDLIB:
                   darwin.fd for native macOS, wasi.fd for `fid wasm`).
                   kernel/uefi moved to the fides-os project
 
-TOOLS (tools/*.fd, 42 .fd files, 40,406 lines, Nov 27; 12 on Nov 22):
+TOOLS (tools/*.fd, 42 .fd files, 40,605 lines, Nov 28; 12 on Nov 22):
                   ark, c2fd (C → Fid translator), cas (.fidcache remote
                   server), check_stdlib (import every stdlib module),
                   doctest (run /// Example: blocks), fuzz_triage,

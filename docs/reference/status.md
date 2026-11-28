@@ -2,24 +2,24 @@
 
 > Moved from the README on Nov 15, 2026; the README keeps a short summary.
 > Rebuilt Nov 27 (the file was dropped by a cleanup commit and restored
-> here). Counts: [selfhost.md → Numbers](selfhost.md#numbers). Open bugs:
+> here); updated Nov 28 for v0.8.7-unstable. Counts: [selfhost.md → Numbers](selfhost.md#numbers). Open bugs:
 > [bugs roadmap](../roadmap/bugs-roadmap.md), [known-bugs.md](known-bugs.md).
 
-## Where things stand (Nov 27, 2026 — v0.8.6-unstable, `fid version` reports `1.0.0+dev`)
+## Where things stand (Nov 28, 2026 — v0.8.7-unstable, `fid version` prints `fid 0.8.7-unstable`)
 
 **Self-hosting.** The Fides compiler compiles itself. The 3-stage
 fixpoint (stage 2 C == stage 3 C, byte-identical) was last verified
-**Nov 21** on that day's ~361K-line tree, from a pinned self-hosted
-stage 0. Everything since — the Nov 25 build, the Nov 27 build and the
-v0.8.6-unstable `fid.exe` — is a **one-stage build from a self-hosted
-fid, not a fixpoint**: faster to produce, but the byte-identical check
-has not been re-run on the current tree. A bootstrap that starts from
+**Nov 28** on the ~369K-line tree of e1115799 (142,939,506 bytes of C):
+the v0.8.7-unstable `fid.exe` comes from that 3-stage release
+bootstrap, the first fixpoint-checked package since Nov 21. The builds
+between (Nov 25, Nov 27, v0.8.1–v0.8.6-unstable) were one-stage builds
+from a self-hosted fid, not fixpoints. A bootstrap that starts from
 the frozen Rust compiler still cannot finish: a `fidesc`-built `fid`
 needs >16 GB to self-compile (known-bugs 2g.79), so `bootstrap.sh`
 takes a released `fid` as stage 0 (downloaded by
 `scripts/stage0-fetch.sh`, hash-checked).
 
-**65 self-hosted modules** (361,317 lines Nov 27; 58 reached from
+**65 self-hosted modules** (368,955 lines Nov 28; 58 reached from
 `main.fd`) in `compiler/*.fd` — lexer, parser, type checker, borrow
 checker, escape analyzer, monomorphizer, IR lowering, IR optimizer
 (SSA mid-end, rules/e-graph rewriter with translation validation),
@@ -34,28 +34,41 @@ Ark package manager. The Rust bootstrap (`src/*.rs`, 57 files,
 function that enforces it: [language reference](reference.md). The
 frozen `fidesc` checks less: [language-guide.md § 10](language-guide.md).
 
-**Tests.** The last full suite run is **Nov 25, `fid` as compiler,
-interpreter lane only**: 1,897 of 1,983 pass; 82 of the 86 failures
+**Tests.** The whole suite was **not rerun on the v0.8.7 compiler**
+(Nov 28); several checks are stricter now, so some programs that
+compiled before may be rejected. What was run on it: the 302
+BG258–BG490 regression tests on run, ccompile, emit and `--nat` (all
+pass), conformance 1,618 of 1,618 on run, the leak gate 11 of 11,
+`fid check compiler/main.fd` with no errors; `verify-selfhost.sh` as in
+the Nov 21 baseline (probe_*, test_pe_ir_gen, test_spawn_gt fail;
+test_lex_par and test_parse_par exceed the interpreter's 1,200 s limit,
+slow but not hung). Linux targets were not run. The last full suite
+run is **Nov 25, `fid` as compiler, interpreter lane only**: 1,897 of 1,983 pass; 82 of the 86 failures
 fail the same with the earlier compiler, the other 4 are 300 s
 timeouts with correct output. The C and native lanes of the whole
 suite have never completed a run; feature work is checked with its own
 tests on each backend. The last full `fidesc` (Rust) suite is Nov 2
 (interp 339/339, C 343/343, PE 345/345, expected-fail 89/89) — on a
-suite a third of today's size. The suite today: 2,131 bootstrap
-programs (586 expected-error), 1,617 conformance programs (one per
+suite a third of today's size. The suite today: 2,433 bootstrap
+programs (709 expected-error), 1,622 conformance programs (one per
 rule of reference.md §1–§13), 47 selfhost, 11 leak-gate programs
-(11/11 pass, Nov 25).
+(11/11 pass, Nov 28).
 
-**Open bugs.** Three whole-repo reviews (Nov 22, Nov 24, Nov 27)
-logged 489 entries in [bugs-roadmap.md](../roadmap/bugs-roadmap.md):
-230 fixed with tests, 27 partly, **232 open** (most from the Nov 27
-review, not yet triaged for severity in practice: 3 marked critical,
-25 high, 46 medium, 35 low). Known-bugs.md additionally lists the open
-2g.* items. The reviews read code rather than run programs; entries
+**Bugs.** The whole-repo reviews (Nov 22, Nov 24, Nov 27) fill
+[bugs-roadmap.md](../roadmap/bugs-roadmap.md): 490 entries on Nov 28,
+453 done, 37 partly done, **0 open**. Of BG258–BG490 (233 entries from
+the Nov 27 reviews), 223 are fixed and verified and 10 partly done:
+BG369, BG384 and BG431 are partial fixes (some array copies and
+escaping closures still leak); BG323, BG366 (installer), BG359 (stage-0
+pin), BG485 (release.yml), BG435 (a race), BG438 (a failure path) and
+BG475 (a 512 MiB input that could not be exercised). The other 27
+partly-done entries are the BG183–BG256 batch, whose fixes are in this
+build. Known-bugs.md additionally lists the open 2g.* items. The reviews read code rather than run programs; entries
 marked "confirmed" were reproduced.
 
 **CI.** `ci.yml`, `tier1.yml` and `macos-native.yml` have not had a
-green run since Nov 21; the checks above were run by hand on a Windows
+green run since Nov 21, and no workflow has run on the v0.8.7 commit
+yet (the stage-0 seeds and runner memory block most jobs); the checks above were run by hand on a Windows
 machine. `bare-metal.yml` last ran green Nov 22 (Multiboot kernels
 booted under QEMU). The suite lanes on macos-15 runners reached the
 suite Nov 20 but have not gone green, so **nothing is confirmed on a
@@ -129,6 +142,8 @@ Mac**.
   build but have never run.
 - **Ecosystem:** the pacts index is just starting (`ark add textkit`
   is the one published pact); few libraries exist beyond the stdlib.
+- **v0.8.7 known issues (Nov 28):** BG484's new formatter style flags
+  67 existing lines; the installer is not code-signed.
 - **Not for safety-critical use.** `fid qualify` produces evidence
   for review, not a certification; no independent security review has
   signed off (the package is ready:

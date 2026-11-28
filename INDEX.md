@@ -4,16 +4,16 @@
 > directory, with a one-line description. Use this to find anything fast.
 >
 > **Fides is self-hosted and released (v1.0.0).** The primary compiler is in `compiler/*.fd`
-> (65 modules, ~357K lines). The Rust source in `src/*.rs` (57 files, ~114K lines) is the
+> (65 modules, ~369K lines). The Rust source in `src/*.rs` (57 files, ~114K lines) is the
 > bootstrap reference implementation, frozen: it builds stage 1 and runs the test harness.
 > The self-hosted compiler is the release compiler (`release/fid.exe`,
 > shipped as `fid.exe`) and defines the language:
 > [docs/reference/reference.md](docs/reference/reference.md).
 >
-> **Stats (Nov 27 evening; exact figures in [selfhost.md → Numbers](docs/reference/selfhost.md#numbers)):** 65 self-hosted `.fd` compiler modules (~361K lines) · 57 `.rs` bootstrap files (~114K lines) ·
-> 414 stdlib modules (~313K lines) · 2,131 `.fd` tests in `tests/bootstrap/` (2,056 top level, 586 with an `// expect-error` line) + 47 in `tests/selfhost/` + 1,617 in `tests/conformance/` + hundreds more in `tests/{projects,verify,nattools,tooling,...}` · 12 examples · 42 `.fd` files in `tools/`.
-> Fixpoint: VERIFIED byte-for-byte (stage 2 == stage 3, checked by `RELEASE=1 scripts/bootstrap.sh`): Nov 8 (67 MB of C) and Nov 21 (123,338,942 bytes, from the pinned self-hosted stage 0). Since then builds are one stage from a self-hosted stage 0 (Nov 25, Nov 27); the Nov 25 fid passes the leak gate (11/11) and 1,897 of 1,983 suite tests on `run`. A 3-stage bootstrap that starts cold from `fidesc` stops at stage 2 (out of memory, known-bugs 2g.79).
-> v1.0.0 released Sep 9, 2026 with Windows installer (Fides-Setup-1.0.0.exe, 2.5 MB). v0.8.0-unstable prerelease Nov 10, 2026 (Fides-Setup-0.8.0.exe, 6.6 MB); v0.8.1- to v0.8.4-unstable Nov 21–23; v0.8.5-unstable and v0.8.6-unstable Nov 27, their `fid.exe` one-stage builds from a self-hosted stage 0, not a 3-stage fixpoint. `fid version` base is now `1.0.0` (`1.0.0+dev` on dev builds).
+> **Stats (Nov 28, e1115799; exact figures in [selfhost.md → Numbers](docs/reference/selfhost.md#numbers)):** 65 self-hosted `.fd` compiler modules (~369K lines) · 57 `.rs` bootstrap files (~114K lines) ·
+> 414 stdlib modules (~317K lines) · 2,433 `.fd` tests in `tests/bootstrap/` (2,356 top level, 709 with an `// expect-error` line) + 47 in `tests/selfhost/` + 1,622 in `tests/conformance/` + hundreds more in `tests/{projects,verify,nattools,tooling,...}` · 12 examples · 42 `.fd` files in `tools/`.
+> Fixpoint: VERIFIED byte-for-byte (stage 2 == stage 3, checked by `RELEASE=1 scripts/bootstrap.sh`): Nov 8 (67 MB of C), Nov 21 (123,338,942 bytes, from the pinned self-hosted stage 0) and Nov 28 (142,939,506 bytes, e1115799, the v0.8.7-unstable build). The builds between Nov 21 and Nov 28 (Nov 25, Nov 27, v0.8.5/v0.8.6) were one stage from a self-hosted stage 0. A 3-stage bootstrap that starts cold from `fidesc` stops at stage 2 (out of memory, known-bugs 2g.79).
+> v1.0.0 released Sep 9, 2026 with Windows installer (Fides-Setup-1.0.0.exe, 2.5 MB). v0.8.0-unstable prerelease Nov 10, 2026 (Fides-Setup-0.8.0.exe, 6.6 MB); v0.8.1- to v0.8.4-unstable Nov 21–23; v0.8.5-unstable and v0.8.6-unstable Nov 27, their `fid.exe` one-stage builds from a self-hosted stage 0, not a 3-stage fixpoint; v0.8.7-unstable Nov 28 (Fid-Setup-0.8.7.exe), its `fid.exe` from the 3-stage release bootstrap with the fixpoint checked. `fid version` prints `fid 0.8.7-unstable` on v0.8.7; earlier installers printed `1.0.0+dev`.
 
 ---
 
@@ -157,11 +157,11 @@ and `AGENTS.md` first when working on the compiler.
 
 ## Self-Hosted Compiler (compiler/) — PRIMARY
 
-> **This is the primary compiler.** 65 Fid modules (~357K lines) that compile
+> **This is the primary compiler.** 65 Fid modules (~369K lines) that compile
 > themselves to byte-identical C across generations (bootstrap fixpoint
-> verified, stage 2 == stage 3 — last verified Nov 21; the Nov 25 and Nov 27
-> builds, v0.8.5/v0.8.6-unstable's included, are one stage from a self-hosted
-> stage 0). The release build
+> verified, stage 2 == stage 3 — last verified Nov 28 for v0.8.7-unstable;
+> the Nov 25 and Nov 27 builds, v0.8.5/v0.8.6-unstable's included, were one
+> stage from a self-hosted stage 0). The release build
 > (`RELEASE=1 scripts/bootstrap.sh` → `release/fid.exe`) is what the
 > installer ships as `fid.exe`.
 > 64 of the 65 modules have a doc in `docs/file-analysis/<module>.md` (role,
@@ -425,7 +425,7 @@ verify with `./verify.sh` (bootstrap), `./verify-selfhost.sh` (selfhost),
 | Directory | Contents |
 |-----------|----------|
 | [bootstrap/](tests/bootstrap/) | The main suite: 2,002 `.fd` at top level (569 with an `// expect-error` line, which must be rejected; 613 named `*_fail.fd`) + 75 in subdirs: `at_import`, `baseline`, `capability`, `decl_lib`, `diag_dup`, `diagnostics`, `effects`, `golden`, `nattools`, `race_lib`, `regions`, `safety`, `same_name_lib`, `spec_lib`, `trait_conflict`. |
-| [conformance/](tests/conformance/) | 1,617 `.fd` — one test per rule of `docs/reference/reference.md` §1–§13; `//! error:` means the compiler must reject it. `_modules/` helpers + `known-gaps.txt`. |
+| [conformance/](tests/conformance/) | 1,622 `.fd` — one test per rule of `docs/reference/reference.md` §1–§13; `//! error:` means the compiler must reject it. `_modules/` helpers + `known-gaps.txt`. |
 | [selfhost/](tests/selfhost/) | 47 `.fd` exercising self-hosted components (`verify-selfhost.sh`). |
 | [nattools/](tests/nattools/) | 75 `.fd` + 98 `.sh` machine-layer check scripts (RA splitting, unwinding, encoders). |
 | [projects/](tests/projects/) | 52 `.fd` whole-program fixtures: cli, service, game, embed, library, workspace, dep graphs. |
@@ -491,7 +491,7 @@ API pages in [docs/examples/index.md](docs/examples/index.md)):
 
 ## Tools (tools/)
 
-Standalone tools written in Fid, 42 `.fd` files (Nov 27; 12 on Nov 22). Each
+Standalone tools written in Fid, 42 `.fd` files (Nov 28; 12 on Nov 22). Each
 tool builds to its own exe; four are helper libraries the ports import
 (`fuzz_lib`, `fuzz_programs`, `py_random`, `target_test_lib`). The ports of
 Nov 25 (AD4) each have a `tests/tools/<name>/check.sh` comparing them with
